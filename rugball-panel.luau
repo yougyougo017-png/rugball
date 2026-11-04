@@ -16,9 +16,18 @@
 	The game's own throw formula, from BallThrowConfig:
 		lands at start + dir * min(|point-start|, 4 + charge*280, 226.875)
 	so charge = (dist - 4)/280 + 0.09 and the ball lands on the picked man.
+	The remote is fired on release with the hold time as charge; the server runs
+	WindupTime + ReleaseDelay itself. So we fire immediately and fold that lag
+	into the lead solve instead of waiting before the remote.
 
 	This script also unbinds AutoTackle / AutoBlock / QBAim and deletes their
 	huds and esp folders on load, so the old scripts can stay installed but idle.
+
+	Hosted: this file is the payload. Upload it somewhere that serves raw text
+	(github raw, gist raw, any static host) and run it with
+		loadstring(game:HttpGet("<raw url>"))()
+	rugball-loader.luau in the same folder is that call with cache-busting and
+	readable errors.
 ]]
 
 local Players = game:GetService("Players")
@@ -30,27 +39,100 @@ local Workspace = game:GetService("Workspace")
 local LocalPlayer = Players.LocalPlayer
 local Camera = Workspace.CurrentCamera
 
+--// replace, not stack ---------------------------------------------------------
+-- a re-run has to take the previous run down first. without this every reload
+-- leaves a second window behind, and the newest one draws underneath the oldest.
+
+local function sweepOldWindows()
+	local containers = { game:GetService("CoreGui"), LocalPlayer:FindFirstChild("PlayerGui") }
+	local okHui, hui = pcall(function() return gethui() end)
+	if okHui and hui then
+		containers[#containers + 1] = hui
+	end
+	for _, cont in ipairs(containers) do
+		if cont then
+			local ok, list = pcall(function() return cont:GetDescendants() end)
+			if ok and list then
+				for _, inst in ipairs(list) do
+					if inst:IsA("ScreenGui") and inst.DisplayOrder == 99999 and inst:FindFirstChild("RUGBALL", true) then
+						pcall(function() inst:Destroy() end)
+					end
+				end
+			end
+		end
+	end
+end
+
+do
+	local old = _G.Slim
+	if type(old) == "table" then
+		local oldWindow = old.panel
+		pcall(function()
+			if old.stop then old.stop() end
+		end)
+		if oldWindow then
+			pcall(function() oldWindow:Unload() end)
+			pcall(function()
+				if oldWindow.screenGui then oldWindow.screenGui:Destroy() end
+			end)
+		end
+	end
+	pcall(sweepOldWindows)
+end
+
 --// config --------------------------------------------------------------------
 
 local CFG = {
 	-- aim / throw
+	autopilot   = false,  -- one switch: qb throws + defense runs itself
 	aim         = true,
 	autoThrow   = false,
 	teamOnly    = true,
 	maxDist     = 195,    -- ball range is 226.875
 	fov         = 42,     -- degrees off the crosshair
+	lead        = 0,      -- extra studs thrown ahead of the receiver, 0-100
 	hoverPick   = true,
 	hoverRelease = 1.2,
-	passType    = "Bullet",
+	passType    = "Bullet",   -- Bullet | Lob | auto
+	autoLobAt   = 65,         -- auto switches to a lob past this distance
+	openGate    = 0,          -- min separation before auto throw fires, 0 = off
+	hitPop      = true,
+	banger      = true,    -- slam text on big hits
 	chargePad   = 0.09,
+
+	-- fake / no-look throw stuff
+	pumpFake    = false,   -- E turns into a pump: fake hold, then fire
+	fakeSpike   = false,   -- spike it, then throw the fake
+	fakeFumble  = false,   -- strip bait: looks loose, fires a beat later
+	coach       = true,    -- reads the coverage and calls the throw
+	horizon     = 0.35,    -- tomorrow throw: solve this far past the catch point
+	routeLock   = true,    -- auto-lock your most-thrown man when the ball hits your hand
+	pumpDelay   = 0.85,    -- seconds the fake holds before the throw
+	noLook      = false,   -- throw off the snap dir, not the live crosshair
+	scramble    = false,   -- break the throw side to the hash
+	scrambleAmt = 6,        -- studs of side scramble
+	sepAssist   = false,   -- extra push on the deep receiver
 
 	-- tackle
 	tackle      = true,
 	pursue      = false,
+	dive        = false,  -- dive is a lunge: ~12 studs in a third of a second
 	tackleRange = 7.5,
 	diveRange   = 12.0,
 	tackleHold  = 0.55,
 	tackleCd    = 1.15,
+
+	antiFall    = true,
+	escapeJuke  = false,   -- sidestep the hit instead of eating it while holding
+
+	-- defense assist
+	intercept   = false,
+	interceptRange = 40,
+	pathing     = true,
+	guard       = false,   -- auto guard: sit the man the enemy throw is for
+	guardStand  = 3.5,     -- studs from the receiver, on the ball side
+	guardJump   = 7,       -- contest window: ball this close to the catch spot, jump
+	deepHalf    = false,   -- pre-throw: park over the top of the deepest receiver
 
 	-- block
 	block       = true,
@@ -66,12 +148,76 @@ local CFG = {
 	espCarrier  = true,
 	espThreat   = true,
 	tracers     = true,
+	passArc     = true,    -- neon beam from the release point to the landing spot
 
 	-- steering
 	steerGain   = 1.0,
 	steerHz     = 12.5,
 	steerDead   = 0.12,
+
+	-- radar
+	radarRange  = 55,
 }
+
+-- settings survive a reload: _G.SlimCfg holds the last saved build and the
+-- shutdown hook writes it back out before the sweep tears everything down
+do
+	local saved = _G.SlimCfg
+	if type(saved) == "table" then
+		for k, v in pairs(saved) do
+			if type(v) == type(CFG[k]) then CFG[k] = v end
+		end
+	end
+end
+
+-- hot routes: three saved throws (receiver name + lead + pass type). the
+-- routes table lives on _G too, so the playbook survives a reload.
+local hotRoutes = _G.SlimRoutes or {}
+_G.SlimRoutes = hotRoutes
+
+local function saveCfg()
+	local copy = {}
+	for k, v in pairs(CFG) do copy[k] = v end
+	_G.SlimCfg = copy
+	pcall(function() _G.SlimRoutes = hotRoutes end)
+end
+
+-- build share: the whole build (settings + playbook) as one paste string your
+-- friends can load. encodes via json, validates every key before applying.
+local HttpService = game:GetService("HttpService")
+
+local function buildShareString()
+	local payload = { cfg = {}, routes = {} }
+	for k, v in pairs(CFG) do payload.cfg[k] = v end
+	for i = 1, 3 do
+		if hotRoutes[i] then payload.routes[tostring(i)] = hotRoutes[i] end
+	end
+	return HttpService:JSONEncode(payload)
+end
+
+local function applyShareString(text)
+	local ok, data = pcall(function() return HttpService:JSONDecode(text) end)
+	if not ok or type(data) ~= "table" then return false end
+	local got = 0
+	if type(data.cfg) == "table" then
+		for k, v in pairs(data.cfg) do
+			if type(v) == type(CFG[k]) then
+				CFG[k] = v
+				got = got + 1
+			end
+		end
+	end
+	if type(data.routes) == "table" then
+		for i, r in pairs(data.routes) do
+			local n = tonumber(i)
+			if n and type(r) == "table" and type(r.name) == "string" then
+				hotRoutes[n] = { name = r.name, lead = tonumber(r.lead) or 0, ptype = tostring(r.ptype or "Bullet") }
+				got = got + 1
+			end
+		end
+	end
+	return got > 0
+end
 
 local COLORS = {
 	aim     = Color3.fromRGB(255, 221, 35),
@@ -87,14 +233,11 @@ task.spawn(function()
 	RugballThrow = ReplicatedStorage:WaitForChild("RugballThrow")
 end)
 
-local PlayContext = LocalPlayer:WaitForChild("PlayContext", 10)
-local Tackle = PlayContext and PlayContext:WaitForChild("Tackle", 10)
-local Dive = PlayContext and PlayContext:WaitForChild("Dive", 10)
-local Steer = PlayContext and PlayContext:WaitForChild("Steer", 10)
-if not (PlayContext and Tackle and Dive and Steer) then
-	warn("[Slim] PlayContext not found - are you in a match?")
-	return
-end
+local PlayContext = LocalPlayer:WaitForChild("PlayContext")
+local Tackle = PlayContext:WaitForChild("Tackle")
+local Dive = PlayContext:WaitForChild("Dive")
+local Steer = PlayContext:WaitForChild("Steer")
+local Jump = PlayContext:FindFirstChild("Jump")
 
 --// retire the three old scripts ----------------------------------------------
 
@@ -114,8 +257,13 @@ end
 
 local locked = nil          -- Model the aim/throw acts on
 local lockManual = false
+local lockPinned = false    -- sticky lock: hover and auto cannot steal it
+local lockDropdown
+local lockSig = ""
 local hoverLostAt = 0
 local currentEntry = nil
+local snapDir = Vector3.new(0, 0, -1)   -- throw direction captured at pick time
+local snapSet = false
 local trackers = {}         -- [Model] = {pos, t, vel}
 
 local pressing = false
@@ -123,6 +271,8 @@ local pressToken = 0
 local nextTackle = 0
 local nextDive = 0
 local nextBlock = 0
+local nextJump = 0
+local lastPickRig = nil
 
 local steerTarget = Vector2.zero
 local steerVec = Vector2.zero
@@ -130,9 +280,22 @@ local lastSteer = 0
 
 local stickyThreat = nil
 local mode = "auto"
-local tackleStatus = nil
+local rushOn = false
 
-local stats = { shots = 0, lastCharge = 0 }
+-- the table lives on _G, so a reload keeps the session's numbers instead of
+-- zeroing the dashboard every time the panel is re-run
+local stats = _G.SlimStats or {}
+_G.SlimStats = stats
+stats.shots = stats.shots or 0
+stats.lastCharge = stats.lastCharge or 0
+stats.picks = stats.picks or 0
+stats.tackles = stats.tackles or 0
+stats.intercepts = stats.intercepts or 0
+stats.completions = stats.completions or 0
+stats.drops = stats.drops or 0
+stats.picked = stats.picked or 0
+stats.distSum = stats.distSum or 0
+stats.leadSum = stats.leadSum or 0
 
 local espFolder = Instance.new("Folder")
 espFolder.Name = "SlimEsp"
@@ -249,24 +412,38 @@ local function trackVelocity(rig, pos, now)
 	return t.vel
 end
 
-local function passType()
-	if not BallThrowConfig then return CFG.passType end
-	return CFG.passType
+-- bullet is flat and quick, lob hangs and lands softer; auto lobs the deep ball
+local function passType(distance)
+	local pick = CFG.passType
+	if pick == "auto" then
+		return (distance and distance > CFG.autoLobAt) and "Lob" or "Bullet"
+	end
+	if pick == "Lob" or pick == "Bullet" then return pick end
+	return "Bullet"
 end
 
 local function flightTime(distance)
 	local cfg = BallThrowConfig
 	if not cfg then return 0.75 end
-	local p = cfg.PassTypes[passType()] or cfg.PassTypes.Lob
+	local p = cfg.PassTypes[passType(distance)] or cfg.PassTypes.Lob
 	return math.clamp(p.BaseFlightTime + distance * p.DistanceFlightTime, p.BaseFlightTime, cfg.MaxFlightTime)
 end
 
+-- the server holds the ball for WindupTime + ReleaseDelay after we fire, so the
+-- receiver keeps running for that long before the ball even exists. without this
+-- the solve leads him by flight time only and the pass lands behind a moving man.
+local function launchLag()
+	local cfg = BallThrowConfig
+	if not cfg then return 0 end
+	return (cfg.WindupTime or 0) + (cfg.ReleaseDelay or 0)
+end
+
 local function predict(origin, targetPos, vel)
-	-- doThrow waits windup + release before firing, so lead by that as well
-	local lead = BallThrowConfig and (BallThrowConfig.WindupTime + BallThrowConfig.ReleaseDelay) or 0.3
 	local point = targetPos
 	for _ = 1, 3 do
-		local t = flightTime((point - origin).Magnitude) + lead
+		-- horizon (tomorrow throw): solve this far past the catch point, so the
+		-- ball arrives ahead of the cut you know is coming
+		local t = flightTime((point - origin).Magnitude) + launchLag() + (CFG.horizon or 0)
 		point = targetPos + vel * t
 	end
 	return point
@@ -289,24 +466,69 @@ end
 
 --// aim -----------------------------------------------------------------------
 
+-- the throw solution already extrapolates the receiver by flight time; lead is
+-- a manual bias on top: how many extra studs to aim past him. a runner gets it
+-- along his own heading, a standing target gets it along the throw line so the
+-- ball still lands beyond him.
+local function applyLead(origin, pos, vel, point)
+	local bias = (tonumber(CFG.lead) or 0) + (tonumber(CFG.sepAssist) or 0)
+	if bias <= 0 then return point end
+	local heading = Vector3.new(vel.X, 0, vel.Z)
+	if heading.Magnitude < 0.6 then
+		heading = Vector3.new(pos.X - origin.X, 0, pos.Z - origin.Z)
+	end
+	if CFG.noLook and snapSet and snapDir.Magnitude > 0.01 then
+		heading = Vector3.new(snapDir.X, 0, snapDir.Z)
+	end
+	if heading.Magnitude < 0.001 then return point end
+	return point + heading.Unit * bias
+end
+
 -- no fov / range gate: the manual picker has to reach deep men
 local function entryFor(rig, origin, now, cam, allRigs)
 	if not rig or not rig.PrimaryPart or not origin then return nil end
 	local pos = chestOf(rig)
 	local vel = trackVelocity(rig, pos, now)
-	local point = predict(origin, pos, vel)
-	local offset = point - cam.CFrame.Position
+	local point = applyLead(origin, pos, vel, predict(origin, pos, vel))
+	local throwDir = (point - origin).Unit
+	if CFG.noLook and snapSet and snapDir.Magnitude > 0.01 then
+		throwDir = snapDir.Unit
+	end
+	local offset = throwDir * (point - origin)
 	local angle = math.deg(math.acos(math.clamp(cam.CFrame.LookVector:Dot(offset.Unit), -1, 1)))
 	local dist = (point - origin).Magnitude
 	local gap = allRigs and defenderGap(rig, pos, allRigs) or math.huge
 	-- shallow men are penalised: a 6-stud check-down is not a throw
 	local shallow = math.max(0, 55 - dist)
+	-- the man covering the pick: enemy nearest to the landing spot
+	local cover, coverGap
+	if allRigs then
+		local myT = myTeam()
+		local low = math.huge
+		for _, other in ipairs(allRigs) do
+			if other ~= rig and other.PrimaryPart then
+				local t = teamOf(other)
+				if myT == nil or t == nil or t ~= myT then
+					local d = (other.PrimaryPart.Position - point).Magnitude
+					if d < low then
+						low = d
+						cover = other
+					end
+				end
+			end
+		end
+	end
+	coverGap = low
 	return {
 		rig = rig,
 		point = point,
+		dir = throwDir,
 		angle = angle,
 		dist = dist,
 		vel = vel,
+		gap = gap,
+		cover = cover,
+		coverGap = low,
 		score = angle * 1.15 + shallow * 0.85 + (gap < 7 and 45 or 0),
 	}
 end
@@ -360,8 +582,85 @@ local function rigUnderCursor(cam)
 	return nil
 end
 
+--// lock-on -------------------------------------------------------------------
+
+-- everyone you could legally throw to, nearest first. the dropdown and the
+-- cycle key both read this, so they always agree on the order.
+local function lockable()
+	local mine = myRig()
+	if not (mine and mine.PrimaryPart) then return {} end
+	local myT = myTeam()
+	local out = {}
+	for _, rig in ipairs(rigs()) do
+		if rig ~= mine and rig.PrimaryPart then
+			local t = teamOf(rig)
+			local okTeam = true
+			if CFG.teamOnly and myT ~= nil then
+				okTeam = (t == nil) or (t == myT)
+			end
+			local root = rig.PrimaryPart
+			if okTeam
+				and rig:GetAttribute("Frozen") ~= true
+				and root:GetAttribute("Down") ~= true then
+				out[#out + 1] = rig
+			end
+		end
+	end
+	table.sort(out, function(a, b)
+		return (a.PrimaryPart.Position - mine.PrimaryPart.Position).Magnitude
+			< (b.PrimaryPart.Position - mine.PrimaryPart.Position).Magnitude
+	end)
+	return out
+end
+
+local function lockTo(rig)
+	if not rig then return false end
+	locked = rig
+	lockManual = true
+	lockPinned = true
+	hoverLostAt = 0
+	mode = "locked " .. label(rig)
+	if lockDropdown then
+		pcall(function() lockDropdown:Set(label(rig), true) end)
+	end
+	return true
+end
+
+local function lockClear(silent)
+	locked = nil
+	lockManual = false
+	lockPinned = false
+	hoverLostAt = 0
+	if not silent then mode = "auto" end
+	if lockDropdown then
+		pcall(function() lockDropdown:Set("none", true) end)
+	end
+end
+
+-- walk the lockable list; no lock means it starts at the nearest man
+local function lockCycle(dir)
+	local list = lockable()
+	if #list == 0 then
+		lockClear()
+		return false
+	end
+	local idx = 0
+	for i, rig in ipairs(list) do
+		if rig == locked then idx = i break end
+	end
+	idx = idx + (dir or 1)
+	if idx > #list then idx = 1 elseif idx < 1 then idx = #list end
+	return lockTo(list[idx])
+end
+
 local throwing = false
 local lastThrow = 0
+local lastManual = 0
+local myLastThrowAt = 0   -- when our own pass left, so auto guard ignores it
+local shotWatch = nil     -- accuracy: our pass in the air, waiting to land
+local routeApi = {}       -- hot route handlers, exposed on _G.QBAim.routes
+local routeMemory = {}    -- throws per receiver: who gets auto-locked
+local lastHadBall = false
 
 local function doThrow(entry)
 	if not (BallThrowConfig and RugballThrow) then return end
@@ -373,21 +672,58 @@ local function doThrow(entry)
 	end
 
 	local cfg = BallThrowConfig
-	local dist = (entry.point - origin).Magnitude
-	local charge = math.clamp((dist - cfg.InitialChargeDistance) / cfg.ChargeDistancePerSecond, 0.04, 1.6) + CFG.chargePad + (math.random() - 0.5) * 0.04
-	local pass = passType()
+	local pt = entry.point
+	if CFG.scramble and origin then
+		local dirv = (pt - origin).Unit
+		local side = Vector3.new(-dirv.Z, 0, dirv.X)
+		local s = (math.floor(stats.shots) % 2 == 0) and 1 or -1
+		pt = pt + side * ((CFG.scrambleAmt or 6) * s)
+	end
+	local dist = (pt - origin).Magnitude
+	local charge = math.clamp((dist - cfg.InitialChargeDistance) / cfg.ChargeDistancePerSecond, 0.04, 1.6) + CFG.chargePad
+	local pass = passType(dist)
 
-	task.wait(cfg.WindupTime)
-	task.wait(cfg.ReleaseDelay)
-	RugballThrow:FireServer(entry.point, charge, pass)
+	-- the game's own BallThrowClient fires the remote the instant the button is
+	-- released and lets the server run WindupTime/ReleaseDelay. waiting here
+	-- stacked a second windup on top of the server's, which is the delay you felt.
+	RugballThrow:FireServer(pt, charge, pass)
+	myLastThrowAt = os.clock()
 
 	stats.shots = stats.shots + 1
 	stats.lastCharge = charge
-	mode = string.format("threw %.0fst c=%.2f", dist, charge)
+	stats.distSum = (stats.distSum or 0) + dist
+	stats.leadSum = (stats.leadSum or 0) + (tonumber(CFG.lead) or 0)
+	shotWatch = { at = os.clock() }
+	routeMemory[label(entry.rig)] = (routeMemory[label(entry.rig)] or 0) + 1
+	mode = string.format("threw %.0fst c=%.2f %s", dist, charge, pass)
 end
 
 local function requestThrow()
-	if throwing then return false end
+	if throwing then return end
+	-- E is a tap, so without a floor a held key would fire a remote every frame
+	local now = os.clock()
+	if now - lastManual < 0.3 then return false end
+	if (CFG.pumpFake or CFG.fakeSpike or CFG.fakeFumble) and (hasBall() or canThrow()) then
+		-- pump fake: hold the fake, then let it fly. fake spike: shorter hold,
+		-- fumble bait: looks loose, fires a beat later.
+		throwing = true
+		lastManual = now
+		local hold = CFG.pumpDelay or 0.85
+		mode = "pump fake"
+		if CFG.fakeSpike then hold = 0.3 mode = "fake spike" end
+		if CFG.fakeFumble then hold = 0.45 mode = "fumble bait" end
+		task.delay(hold, function()
+			if not throwing then
+				throwing = false
+				local e = currentEntry
+				if e then
+					local ok, err = pcall(doThrow, e)
+					if not ok then mode = "err: " .. tostring(err):sub(1, 40) end
+				end
+			end
+		end)
+		return true
+	end
 	local entry = currentEntry
 	if not entry then
 		mode = "no target"
@@ -399,11 +735,10 @@ local function requestThrow()
 	end
 	throwing = true
 	local snapshot = { rig = entry.rig, point = entry.point, dist = entry.dist }
-	task.spawn(function()
-		local ok, err = pcall(doThrow, snapshot)
-		if not ok then mode = "err: " .. tostring(err):sub(1, 40) end
-		throwing = false
-	end)
+	local ok, err = pcall(doThrow, snapshot)
+	if not ok then mode = "err: " .. tostring(err):sub(1, 40) end
+	throwing = false
+	lastManual = now
 	return true
 end
 
@@ -459,12 +794,28 @@ local function newMark(name, color)
 	text.Text = ""
 	text.Parent = tag
 
-	return { hl = hl, box = box, beam = beam, tag = tag, text = text, rig = nil, lastText = 0 }
+	return { hl = hl, box = box, beam = beam, tag = tag, text = text, rig = nil, lastText = 0, color = color }
 end
 
 local aimMark = newMark("Aim", COLORS.aim)
 local carrierMark = newMark("Carrier", COLORS.carrier)
 local threatMark = newMark("Threat", COLORS.threat)
+local catchMark = newMark("Catch", Color3.fromRGB(178, 255, 64))
+
+-- pass preview: one neon beam from the release point to the landing spot,
+-- recolored by catch chance every frame
+local arcPart = Instance.new("Part")
+arcPart.Name = "SlimArc"
+arcPart.Anchored = true
+arcPart.CanCollide = false
+arcPart.CanQuery = false
+arcPart.CanTouch = false
+arcPart.CastShadow = false
+arcPart.Material = Enum.Material.Neon
+arcPart.Color = Color3.fromRGB(178, 255, 64)
+arcPart.Transparency = 1
+arcPart.Size = Vector3.new(0.14, 0.14, 1)
+arcPart.Parent = espFolder
 
 local function markOff(m)
 	if not m or not m.rig then return end
@@ -476,7 +827,7 @@ local function markOff(m)
 	m.beam.Transparency = 1
 end
 
-local function markTo(m, rig, text, origin, now)
+local function markTo(m, rig, text, origin, now, color)
 	if not rig or not rig.PrimaryPart then
 		markOff(m)
 		return
@@ -491,6 +842,14 @@ local function markTo(m, rig, text, origin, now)
 	if now - m.lastText > 0.1 then
 		m.lastText = now
 		m.text.Text = text
+	end
+	if color then
+		m.color = color
+		m.hl.FillColor = color
+		m.hl.OutlineColor = color:Lerp(Color3.new(1, 1, 1), 0.45)
+		m.box.Color3 = color
+		m.beam.Color = color
+		m.text.TextColor3 = color
 	end
 	if CFG.tracers and origin then
 		local delta = rig.PrimaryPart.Position - origin
@@ -528,33 +887,106 @@ local function releaseAction()
 	pressToken = pressToken + 1
 	if pressing then
 		pressing = false
-		pcall(function() Tackle:Fire(false) end)
-		pcall(function() Dive:Fire(false) end)
+		Tackle:Fire(false)
 	end
 end
 
--- one writer for Steer, so pursuit and block drive can never fight
-local function flatUnit(v)
-	local f = Vector3.new(v.X, 0, v.Z)
-	if f.Magnitude > 1e-3 then return f.Unit end
-	return nil
+--// hit pop + anti-fall -------------------------------------------------------
+
+-- the "hit real hard" flash when a tackle or a block lands. the knockback is
+-- server side, but a flash is the client side hit pop, so we play it ourselves.
+local popFx = false
+local function triggerPop(strength)
+	if not CFG.hitPop then return end
+	if popFx then return end
+	popFx = true
+	local gui = Instance.new("ScreenGui")
+	gui.Name = "SlimPop"
+	gui.ResetOnSpawn = false
+	gui.Parent = LocalPlayer:FindFirstChild("PlayerGui")
+	local flash = Instance.new("Frame")
+	flash.Name = "Flash"
+	flash.Size = UDim2.new(1, 0, 1, 0)
+	flash.BackgroundColor3 = Color3.fromRGB(255, 235, 200)
+	flash.BackgroundTransparency = 0.72 - math.min(0.85, strength or 0.85) * 0.5
+	flash.ZIndex = 999999
+	flash.Parent = gui
+	if (strength or 0) >= 0.75 and CFG.banger then
+		-- the slam: one word across the screen, pure energy, zero gameplay
+		local words = { "STRAPPED", "BANGED", "HIT STICK", "WRECKED", "SMOKED" }
+		local slam = Instance.new("TextLabel")
+		slam.Name = "Banger"
+		slam.AnchorPoint = Vector2.new(0.5, 0.5)
+		slam.Position = UDim2.new(0.5, 0, 0.42, 0)
+		slam.Size = UDim2.new(1, 0, 0.16, 0)
+		slam.BackgroundTransparency = 1
+		slam.Font = Enum.Font.GothamBlack
+		slam.TextSize = 72
+		slam.TextColor3 = Color3.fromRGB(255, 235, 200)
+		slam.TextStrokeTransparency = 0.2
+		slam.Rotation = -3
+		slam.Text = words[math.random(1, #words)]
+		slam.ZIndex = 999999
+		slam.Parent = gui
+		task.delay(0.55, function()
+			pcall(function() slam:Destroy() end)
+		end)
+	end
+	if (strength or 0) >= 0.7 then
+		-- the slam: a dark dip under the pop, weight without camera shake
+		local dark = Instance.new("Frame")
+		dark.Name = "Hitstop"
+		dark.Size = UDim2.new(1, 0, 1, 0)
+		dark.BackgroundColor3 = Color3.fromRGB(6, 8, 11)
+		dark.BackgroundTransparency = 0.55
+		dark.ZIndex = 999998
+		dark.Parent = gui
+		task.delay(0.07, function()
+			pcall(function() dark.BackgroundTransparency = 0.9 end)
+			task.delay(0.05, function()
+				pcall(function() dark:Destroy() end)
+			end)
+		end)
+	end
+	task.delay(0.18, function()
+		pcall(function() flash:Destroy() end)
+		pcall(function() gui:Destroy() end)
+		popFx = false
+	end)
 end
 
+-- the QB holding the ball never gets the fall state knocked into him. the
+-- block drives the hit instead of the ragdoll, this is the backstop.
+local function refreshAntiFall()
+	if not myRig() then return end
+	local hum = myRig():FindFirstChildOfClass("Humanoid")
+	if not hum then return end
+	pcall(function()
+		hum:SetStateEnabled(Enum.HumanoidStateType.Falling, not (CFG.antiFall and hasBall()))
+	end)
+end
+
+-- one writer for Steer, so pursuit and block drive can never fight
 local function driveTo(worldDir)
 	if worldDir then
 		local cam = Workspace.CurrentCamera
 		if cam then
-			local r = flatUnit(cam.CFrame.RightVector)
-			-- looking straight down: the up vector is what points "forward" on screen
-			local l = flatUnit(cam.CFrame.LookVector) or flatUnit(cam.CFrame.UpVector)
-			if r and l then
-				local vx = r:Dot(worldDir)
-				local vy = l:Dot(worldDir)
-				if math.abs(vx) < CFG.steerDead then vx = 0 end
-				if math.abs(vy) < CFG.steerDead then vy = 0 end
-				steerTarget = Vector2.new(vx * CFG.steerGain, vy * CFG.steerGain)
-				return
+			local right = cam.CFrame.RightVector
+			local look = cam.CFrame.LookVector
+			local vx = Vector3.new(right.X, 0, right.Z).Unit:Dot(worldDir)
+			local vy = Vector3.new(look.X, 0, look.Z).Unit:Dot(worldDir)
+			if math.abs(vx) < CFG.steerDead then vx = 0 end
+			if math.abs(vy) < CFG.steerDead then vy = 0 end
+			vx, vy = vx * CFG.steerGain, vy * CFG.steerGain
+			-- a diagonal stick is 1.41 long. games that scale speed by input
+			-- magnitude read that as 41% extra walking, which is exactly the
+			-- kind of thing a distance audit picks out of a lobby.
+			local m = math.sqrt(vx * vx + vy * vy)
+			if m > 1 then
+				vx, vy = vx / m, vy / m
 			end
+			steerTarget = Vector2.new(vx, vy)
+			return
 		end
 	end
 	steerTarget = Vector2.zero
@@ -577,13 +1009,45 @@ local statusBox
 local tackleToggle
 local blockToggle
 local throwKey
+local tagTarget
+local modeTag
+local aimCard
+local chargeBar
+local ballBar
+local statTarget
+local statCarrier
+local statShots
+local statPicks
+local statTackles
+local statAvg
+local statFps
+local statErr
+local statUp
+local leadSlider
+local passDropdown
+local interceptToggle
+local pathToggle
+local guardToggle
+local autopilotToggle
+local aimToggle
+local autoThrowToggle
+local antiFallToggle
+local radarFrame
+local radarCanvas
+local radarDots = {}
+local radarRings = {}
+local lastRadar = 0
+local lastPickAt = 0
+local leadConn
 
 local shutOnce = false
 local shutdown
 shutdown = function()
 	if shutOnce then return end
 	shutOnce = true
+	pcall(saveCfg)
 	pcall(function() RunService:UnbindFromRenderStep("SlimPanel") end)
+	if leadConn then pcall(function() leadConn:Disconnect() end) end
 	releaseAction()
 	pcall(function() Steer:Fire(Vector2.zero) end)
 	_G.QBAim = nil
@@ -606,6 +1070,73 @@ end
 
 -- the window is optional: if the library will not load, the three modules keep
 -- running headless and the globals in _G still drive them
+
+-- volt theme: near-black blue glass, lime accent, drifting window gradient
+local function slimTheme()
+	local t = {
+		WindowColor = ColorSequence.new(Color3.fromRGB(10, 12, 17), Color3.fromRGB(19, 23, 31)),
+		ShadowColor = Color3.fromRGB(0, 0, 0),
+		SurfaceStroke = Color3.fromRGB(52, 60, 76),
+		LiveAnimation = true,
+
+		CornerRoundness = UDim.new(0, 16),
+		PillCornerRadius = UDim.new(1, 0),
+		ElementCornerRadius = UDim.new(0, 10),
+
+		TitlingColor = Color3.fromRGB(244, 247, 252),
+		ContentColor = Color3.fromRGB(203, 210, 224),
+		ElementTextHoverColor = Color3.fromRGB(255, 255, 255),
+		ActionColor = Color3.fromRGB(140, 150, 168),
+		PlaceholderColor = Color3.fromRGB(108, 118, 136),
+
+		TabColor = Color3.fromRGB(158, 168, 186),
+		TabBackground = ColorSequence.new(Color3.fromRGB(30, 36, 47), Color3.fromRGB(21, 25, 34)),
+		TabStroke = ColorSequence.new(Color3.fromRGB(64, 74, 92), Color3.fromRGB(44, 52, 66)),
+
+		ElementGradient = ColorSequence.new(Color3.fromRGB(27, 32, 42), Color3.fromRGB(20, 24, 32)),
+		ElementStroke = Color3.fromRGB(50, 58, 72),
+		ElementStrokeHover = Color3.fromRGB(150, 210, 110),
+		ElementTransparency = 0,
+		ElementStrokeTransparency = 0,
+		ElementStrokeHoverTransparency = 0.2,
+
+		AccentColor = Color3.fromRGB(178, 255, 64),
+		AccentStroke = Color3.fromRGB(214, 255, 150),
+		AccentGlow = 0.35,
+		SliderBackground = Color3.fromRGB(32, 38, 48),
+		SliderBackgroundHover = Color3.fromRGB(42, 50, 62),
+		SliderProgress = ColorSequence.new(Color3.fromRGB(150, 240, 60), Color3.fromRGB(96, 214, 96)),
+		SliderStroke = Color3.fromRGB(60, 70, 86),
+		SliderHandle = Color3.fromRGB(240, 248, 232),
+		ToggleTrack = Color3.fromRGB(36, 42, 53),
+		ToggleKnobOff = Color3.fromRGB(126, 136, 154),
+		ToggleKnobOffTransparency = 0,
+
+		FieldBackground = Color3.fromRGB(17, 21, 27),
+		FieldGlow = Color3.fromRGB(150, 220, 90),
+		StatBackground = Color3.fromRGB(23, 28, 37),
+		BoxStroke = Color3.fromRGB(58, 68, 86),
+		DropdownHighlight = Color3.fromRGB(46, 64, 44),
+		ErrorColor = Color3.fromRGB(255, 96, 104),
+		ErrorStrokeColor = Color3.fromRGB(255, 150, 156),
+
+		-- edges: a faint top-lit bevel rather than a flat line
+		ElementStrokeGradient = ColorSequence.new(Color3.fromRGB(76, 88, 110), Color3.fromRGB(28, 34, 44)),
+		ToggleTrackTransparency = 0,
+		ToggleKnobOn = Color3.fromRGB(20, 26, 18),
+		ScrollBarImageTransparency = 0.35,
+		NeutralButtonStroke = Color3.fromRGB(64, 74, 92),
+	}
+
+	-- montserrat if this client has it, otherwise the theme's own font
+	pcall(function()
+		t.TitleFont = Font.fromEnum(Enum.Font.MontserratBold)
+		t.Font = Font.fromEnum(Enum.Font.MontserratMedium)
+	end)
+
+	return t
+end
+
 local function buildUI()
 	local ok, res = pcall(function()
 		return loadstring(game:HttpGet("https://sirius.menu/gen2"))()
@@ -616,48 +1147,213 @@ local function buildUI()
 	end
 	Rayfield = res
 
-	window = Rayfield:CreateWindow({
+	local props = {
 		name = "RUGBALL",
-		subtitle = "slim suite",
+		subtitle = "slim suite  |  v2  |  client side",
 		sidebarLayout = true,
+		showName = "RUGBALL",
 		configuration = {
 			autoSave = true,
 			autoLoad = true,
 			fileName = "RugballSlim",
 		},
+	}
+
+	-- a theme the build does not understand must not cost us the window
+	local themed, win = pcall(function()
+		local withTheme = table.clone(props)
+		withTheme.theme = slimTheme()
+		return Rayfield:CreateWindow(withTheme)
+	end)
+	if themed and win then
+		window = win
+	else
+		warn("[Slim] theme rejected, falling back to default: " .. tostring(win))
+		window = Rayfield:CreateWindow(props)
+	end
+
+	-- cosmetic calls are optional. if the build under us lacks a helper, the
+	-- panel still draws, it just draws plainer.
+	local function section(owner, name)
+		if not owner or not owner.CreateSection then return end
+		pcall(function() owner:CreateSection({ name = name }) end)
+	end
+
+	local function groupOf(owner)
+		if owner and owner.CreateGroup then
+			local made, row = pcall(function() return owner:CreateGroup() end)
+			if made and row then return row end
+		end
+		return owner
+	end
+
+	pcall(function()
+		window:CreateTag({ text = "SLIM", color = Color3.fromRGB(178, 255, 64), order = 0 })
+		tagTarget = window:CreateTag({ text = "NO TGT", color = Color3.fromRGB(70, 76, 90), order = 1 })
+		modeTag = window:CreateTag({ text = "IDLE", color = Color3.fromRGB(44, 50, 62), order = 2 })
+	end)
+
+	section(window, "PLAY")
+	local aimTab = window:CreateTab({ name = "AIM" })
+	local tackleTab = window:CreateTab({ name = "TACKLE" })
+	local blockTab = window:CreateTab({ name = "BLOCK" })
+
+	section(window, "VIEW")
+	local lookTab = window:CreateTab({ name = "LOOK" })
+
+	section(window, "SYS")
+	local liveTab = window:CreateTab({ name = "LIVE" })
+
+	-- aim ---------------------------------------------------------------------
+
+	-- a running readout of the pick, so the tab itself tells you who is held
+	pcall(function()
+		aimCard = aimTab:CreateText({
+			name = "picked man  |  nobody",
+			text = "auto scanning",
+			icon = 91452555903853,
+		})
+	end)
+
+	section(aimTab, "AUTOPILOT")
+
+	-- one switch plays the whole game: the qb auto-throws to the deepest open
+	-- man, the defense tackles, blocks, guards and intercepts by itself
+	local function setAutopilot(v)
+		CFG.autopilot = v
+		if v then
+			CFG.aim = true
+			CFG.autoThrow = true
+			CFG.tackle = true
+			CFG.pursue = true
+			CFG.block = true
+			CFG.intercept = true
+			CFG.antiFall = true
+			CFG.guard = true
+			pcall(function() aimToggle:Set(true, true) end)
+			pcall(function() autoThrowToggle:Set(true, true) end)
+			pcall(function() tackleToggle:Set(true, true) end)
+			pcall(function() blockToggle:Set(true, true) end)
+			pcall(function() interceptToggle:Set(true, true) end)
+			pcall(function() pathToggle:Set(true, true) end)
+			pcall(function() guardToggle:Set(true, true) end)
+			pcall(function() antiFallToggle:Set(true, true) end)
+		end
+		mode = v and "autopilot" or mode
+	end
+
+	pcall(function()
+		autopilotToggle = aimTab:CreateToggle({
+			name = "autopilot",
+			description = "one switch: qb throws + defense runs itself",
+			flag = "autopilot",
+			value = CFG.autopilot,
+			callback = function(v) setAutopilot(v) end,
+		})
+	end)
+
+	aimTab:CreateKeybind({
+		name = "autopilot key",
+		description = "flip autopilot without opening the panel",
+		value = Enum.KeyCode.G,
+		flag = "autopilotKey",
+		callback = function()
+			setAutopilot(not CFG.autopilot)
+			if autopilotToggle then
+				pcall(function() autopilotToggle:Set(CFG.autopilot, true) end)
+			end
+		end,
 	})
 
-	local aimTab = window:CreateTab({ name = "Aim" })
-	local tackleTab = window:CreateTab({ name = "Tackle" })
-	local blockTab = window:CreateTab({ name = "Block" })
-	local lookTab = window:CreateTab({ name = "Look" })
-	local liveTab = window:CreateTab({ name = "Live" })
+	section(aimTab, "LOCK ON")
 
-	-- aim -------------------------------------------------------------------------
+	pcall(function()
+		lockDropdown = aimTab:CreateDropdown({
+			name = "pass to",
+			description = "sticks the pick on one man until you change it",
+			options = { "none" },
+			value = "none",
+			flag = "lockTarget",
+			callback = function(pick)
+				local chosen = type(pick) == "table" and pick[1] or pick
+				if not chosen or chosen == "none" then
+					lockClear()
+					return
+				end
+				for _, rig in ipairs(lockable()) do
+					if label(rig) == chosen then
+						lockTo(rig)
+						return
+					end
+				end
+			end,
+		})
+	end)
 
-	aimTab:CreateDivider({ text = "targeting" })
+	aimTab:CreateKeybind({
+		name = "lock under crosshair",
+		description = "Q  |  press again on the same man to unlock",
+		value = Enum.KeyCode.Q,
+		flag = "lockKey",
+		callback = function()
+			if lockPinned then
+				lockClear()
+			else
+				local rig = rigUnderCursor(Workspace.CurrentCamera)
+				if rig then
+					lockTo(rig)
+				else
+					mode = "nothing under the crosshair"
+				end
+			end
+		end,
+	})
+
+	aimTab:CreateKeybind({
+		name = "cycle lock",
+		description = "C  |  nearest first",
+		value = Enum.KeyCode.C,
+		flag = "cycleKey",
+		callback = function()
+			lockCycle(1)
+		end,
+	})
 
 	aimTab:CreateToggle({
+		name = "route memory",
+		description = "auto-lock your most-thrown man when the ball hits your hand",
+		flag = "routeLock",
+		value = CFG.routeLock,
+		callback = function(v) CFG.routeLock = v end,
+	})
+
+	section(aimTab, "TARGETING")
+
+	local aimRow = groupOf(aimTab)
+	aimToggle = aimRow:CreateToggle({
 		name = "aimbot",
-		description = "pick the best man and drop the ball on him",
 		flag = "aim",
 		value = CFG.aim,
 		callback = function(v) CFG.aim = v end,
 	})
-
-	aimTab:CreateToggle({
-		name = "auto throw",
-		description = "throw the moment you can",
-		flag = "autoThrow",
-		value = CFG.autoThrow,
-		callback = function(v) CFG.autoThrow = v end,
-	})
-
-	aimTab:CreateToggle({
+	aimRow:CreateToggle({
 		name = "team only",
 		flag = "teamOnly",
 		value = CFG.teamOnly,
 		callback = function(v) CFG.teamOnly = v end,
+	})
+	autoThrowToggle = aimRow:CreateToggle({
+		name = "auto throw",
+		flag = "autoThrow",
+		value = CFG.autoThrow,
+		callback = function(v) CFG.autoThrow = v end,
+	})
+	aimRow:CreateToggle({
+		name = "coach",
+		description = "reads the coverage and calls the throw",
+		flag = "coach",
+		value = CFG.coach,
+		callback = function(v) CFG.coach = v end,
 	})
 
 	aimTab:CreateSlider({
@@ -680,7 +1376,139 @@ local function buildUI()
 		callback = function(v) CFG.fov = v end,
 	})
 
-	aimTab:CreateDivider({ text = "throw" })
+	leadSlider = aimTab:CreateSlider({
+		name = "lead",
+		description = "extra studs thrown ahead of the receiver",
+		range = { 0, 100 },
+		increment = 1,
+		value = CFG.lead,
+		suffix = " st",
+		flag = "lead",
+		callback = function(v) CFG.lead = v end,
+	})
+
+	aimTab:CreateSlider({
+		name = "horizon",
+		description = "tomorrow throw: solve this far past the catch point",
+		range = { 0, 2.5 },
+		increment = 0.05,
+		value = CFG.horizon,
+		suffix = " s",
+		flag = "horizon",
+		callback = function(v) CFG.horizon = v end,
+	})
+
+	pcall(function()
+		passDropdown = aimTab:CreateDropdown({
+			name = "pass",
+			description = "auto lobs anything past the cut-off",
+			options = { "Bullet", "Lob", "auto" },
+			value = CFG.passType,
+			flag = "passType",
+			callback = function(pick)
+				local chosen = type(pick) == "table" and pick[1] or pick
+				if chosen then CFG.passType = chosen end
+			end,
+		})
+	end)
+
+	aimTab:CreateSlider({
+		name = "auto lob past",
+		description = "distance where auto stops throwing bullets",
+		range = { 25, 140 },
+		increment = 5,
+		value = CFG.autoLobAt,
+		suffix = " st",
+		flag = "autoLobAt",
+		callback = function(v) CFG.autoLobAt = v end,
+	})
+
+	aimTab:CreateSlider({
+		name = "open gate",
+		description = "refuse auto throws into coverage, 0 = off",
+		range = { 0, 20 },
+		increment = 0.5,
+		value = CFG.openGate,
+		suffix = " st",
+		flag = "openGate",
+		callback = function(v) CFG.openGate = v end,
+	})
+
+	aimTab:CreateToggle({
+		name = "hit pop",
+		description = "flash on every tackle or block impact",
+		flag = "hitPop",
+		value = CFG.hitPop,
+		callback = function(v) CFG.hitPop = v end,
+	})
+
+	aimTab:CreateToggle({
+		name = "banger text",
+		description = "one-word slam across the screen on a big hit",
+		flag = "banger",
+		value = CFG.banger,
+		callback = function(v) CFG.banger = v end,
+	})
+
+	aimTab:CreateToggle({
+		name = "pump fake",
+		description = "E holds a fake then throws it",
+		flag = "pumpFake",
+		value = CFG.pumpFake,
+		callback = function(v) CFG.pumpFake = v end,
+	})
+
+	aimTab:CreateToggle({
+		name = "fake spike",
+		description = "spike it, then throw the fake",
+		flag = "fakeSpike",
+		value = CFG.fakeSpike,
+		callback = function(v) CFG.fakeSpike = v end,
+	})
+
+	aimTab:CreateToggle({
+		name = "fake fumble",
+		description = "strip bait: looks loose, fires a beat later",
+		flag = "fakeFumble",
+		value = CFG.fakeFumble,
+		callback = function(v) CFG.fakeFumble = v end,
+	})
+
+	aimTab:CreateToggle({
+		name = "no look",
+		description = "throw off the snap dir, not the crosshair",
+		flag = "noLook",
+		value = CFG.noLook,
+		callback = function(v) CFG.noLook = v end,
+	})
+
+	aimTab:CreateToggle({
+		name = "scramble",
+		description = "break the throw side to the hash",
+		flag = "scramble",
+		value = CFG.scramble,
+		callback = function(v) CFG.scramble = v end,
+	})
+
+	aimTab:CreateSlider({
+		name = "scramble amt",
+		range = { 2, 20 },
+		increment = 1,
+		value = CFG.scrambleAmt,
+		suffix = " st",
+		flag = "scrambleAmt",
+		callback = function(v) CFG.scrambleAmt = v end,
+	})
+
+	aimTab:CreateToggle({
+		name = "sep assist",
+		description = "extra push on the deep receiver",
+		flag = "sepAssist",
+		value = CFG.sepAssist,
+		callback = function(v) CFG.sepAssist = v end,
+	})
+
+	section(aimTab, "THROW")
 
 	aimTab:CreateButton({
 		name = "throw to picked man",
@@ -689,6 +1517,17 @@ local function buildUI()
 			if not requestThrow() then
 				window:Notify({ title = "RUGBALL", content = mode })
 			end
+		end,
+	})
+
+	aimTab:CreateButton({
+		name = "drop the pick",
+		description = "back to auto scanning (F)",
+		callback = function()
+			locked = nil
+			lockManual = false
+			hoverLostAt = 0
+			mode = "auto"
 		end,
 	})
 
@@ -713,28 +1552,168 @@ local function buildUI()
 		end,
 	})
 
-	-- tackle ----------------------------------------------------------------------
+	-- hot routes: save the man you are locked on + your lead + pass type.
+	-- keys 1/2/3 lock him, drop your ball on that spot, throw.
+	local function saveRoute(i)
+		local name = locked and label(locked) or (currentEntry and label(currentEntry.rig))
+		if not name then
+			mode = "no man to save"
+			return
+		end
+		hotRoutes[i] = { name = name, lead = CFG.lead, ptype = CFG.passType }
+		mode = string.format("route %d saved: %s", i, name)
+	end
 
-	tackleTab:CreateDivider({ text = "tackle" })
+	local function fireRoute(i)
+		local r = hotRoutes[i]
+		if not r then
+			mode = string.format("route %d empty", i)
+			return
+		end
+		local target
+		for _, rig in ipairs(rigs()) do
+			if label(rig) == r.name then target = rig break end
+		end
+		if not target then
+			mode = string.format("route %d man gone", i)
+			return
+		end
+		lockTo(target)
+		CFG.lead = r.lead or CFG.lead
+		CFG.passType = r.ptype or CFG.passType
+		if leadSlider then pcall(function() leadSlider:Set(CFG.lead, true) end) end
+		if passDropdown then pcall(function() passDropdown:Set(CFG.passType, true) end) end
+		lastManual = 0
+		requestThrow()
+	end
+	routeApi.save = saveRoute
+	routeApi.fire = fireRoute
 
-	tackleToggle = tackleTab:CreateToggle({
+	section(aimTab, "HOT ROUTES")
+
+	local routeRow1 = groupOf(aimTab)
+	routeRow1:CreateButton({
+		name = "save r1",
+		description = "snapshots the current pick + lead + pass",
+		callback = function() saveRoute(1) end,
+	})
+	routeRow1:CreateButton({
+		name = "fire r1",
+		description = "lock him, load the ball, throw",
+		callback = function() fireRoute(1) end,
+	})
+
+	local routeRow2 = groupOf(aimTab)
+	routeRow2:CreateButton({ name = "save r2", callback = function() saveRoute(2) end })
+	routeRow2:CreateButton({ name = "fire r2", callback = function() fireRoute(2) end })
+
+	local routeRow3 = groupOf(aimTab)
+	routeRow3:CreateButton({ name = "save r3", callback = function() saveRoute(3) end })
+	routeRow3:CreateButton({ name = "fire r3", callback = function() fireRoute(3) end })
+
+	aimTab:CreateKeybind({
+		name = "fire route 1",
+		value = Enum.KeyCode.One,
+		flag = "route1Key",
+		callback = function() fireRoute(1) end,
+	})
+	aimTab:CreateKeybind({
+		name = "fire route 2",
+		value = Enum.KeyCode.Two,
+		flag = "route2Key",
+		callback = function() fireRoute(2) end,
+	})
+	aimTab:CreateKeybind({
+		name = "fire route 3",
+		value = Enum.KeyCode.Three,
+		flag = "route3Key",
+		callback = function() fireRoute(3) end,
+	})
+
+	-- tackle ------------------------------------------------------------------
+
+	section(tackleTab, "TACKLE")
+
+	local tackleRow = groupOf(tackleTab)
+	tackleToggle = tackleRow:CreateToggle({
 		name = "auto tackle",
-		description = "press the game's own tackle when the carrier is in reach",
 		flag = "tackle",
 		value = CFG.tackle,
 		callback = function(v) CFG.tackle = v end,
 	})
-
-	tackleTab:CreateToggle({
+	tackleRow:CreateToggle({
 		name = "pursue",
-		description = "steer at the carrier while closing",
 		flag = "pursue",
 		value = CFG.pursue,
 		callback = function(v) CFG.pursue = v end,
 	})
 
+	antiFallToggle = tackleRow:CreateToggle({
+		name = "anti fall",
+		description = "qb carrier never gets knocked down while holding the ball",
+		flag = "antiFall",
+		value = CFG.antiFall,
+		callback = function(v) CFG.antiFall = v end,
+	})
+
+	tackleRow:CreateToggle({
+		name = "escape juke",
+		description = "sidestep the hit instead of eating it while holding",
+		flag = "escapeJuke",
+		value = CFG.escapeJuke,
+		callback = function(v) CFG.escapeJuke = v end,
+	})
+
+	section(tackleTab, "DEFENSE ASSIST")
+
+	local assistRow = groupOf(tackleTab)
+	pcall(function()
+		interceptToggle = assistRow:CreateToggle({
+			name = "ball intercept",
+			flag = "intercept",
+			value = CFG.intercept,
+			callback = function(v) CFG.intercept = v end,
+		})
+	end)
+	pcall(function()
+		pathToggle = assistRow:CreateToggle({
+			name = "pursuit pathing",
+			flag = "pathing",
+			value = CFG.pathing,
+			callback = function(v) CFG.pathing = v end,
+		})
+	end)
+	pcall(function()
+		guardToggle = assistRow:CreateToggle({
+			name = "auto guard",
+			description = "sit the man the enemy throw is for, contest the catch",
+			flag = "guard",
+			value = CFG.guard,
+			callback = function(v) CFG.guard = v end,
+		})
+	end)
+	pcall(function()
+		assistRow:CreateToggle({
+			name = "deep half",
+			description = "pre-throw: park over the top of the deepest receiver",
+			flag = "deepHalf",
+			value = CFG.deepHalf,
+			callback = function(v) CFG.deepHalf = v end,
+		})
+	end)
+
 	tackleTab:CreateSlider({
-		name = "tackle range",
+		name = "intercept range",
+		range = { 10, 90 },
+		increment = 5,
+		value = CFG.interceptRange,
+		suffix = " st",
+		flag = "interceptRange",
+		callback = function(v) CFG.interceptRange = v end,
+	})
+
+	tackleTab:CreateSlider({
+		name = "tackle reach",
 		range = { 4, 14 },
 		increment = 0.5,
 		value = CFG.tackleRange,
@@ -783,19 +1762,18 @@ local function buildUI()
 		end,
 	})
 
-	-- block -----------------------------------------------------------------------
+	-- block -------------------------------------------------------------------
 
-	blockTab:CreateDivider({ text = "block" })
+	section(blockTab, "BLOCK")
 
-	blockToggle = blockTab:CreateToggle({
+	local blockRow = groupOf(blockTab)
+	blockToggle = blockRow:CreateToggle({
 		name = "auto block",
-		description = "hold tackle on a rusher and drive into him",
 		flag = "block",
 		value = CFG.block,
 		callback = function(v) CFG.block = v end,
 	})
-
-	blockTab:CreateToggle({
+	blockRow:CreateToggle({
 		name = "drive",
 		flag = "drive",
 		value = CFG.drive,
@@ -852,36 +1830,41 @@ local function buildUI()
 		end,
 	})
 
-	-- look ------------------------------------------------------------------------
+	-- look --------------------------------------------------------------------
 
-	lookTab:CreateDivider({ text = "esp" })
+	section(lookTab, "ESP")
 
-	lookTab:CreateToggle({
+	local espRow = groupOf(lookTab)
+	espRow:CreateToggle({
 		name = "aim target",
 		flag = "espAim",
 		value = CFG.espAim,
 		callback = function(v) CFG.espAim = v end,
 	})
-
-	lookTab:CreateToggle({
+	espRow:CreateToggle({
 		name = "carrier",
 		flag = "espCarrier",
 		value = CFG.espCarrier,
 		callback = function(v) CFG.espCarrier = v end,
 	})
-
-	lookTab:CreateToggle({
+	espRow:CreateToggle({
 		name = "block threat",
 		flag = "espThreat",
 		value = CFG.espThreat,
 		callback = function(v) CFG.espThreat = v end,
 	})
-
-	lookTab:CreateToggle({
+	espRow:CreateToggle({
 		name = "tracers",
 		flag = "tracers",
 		value = CFG.tracers,
 		callback = function(v) CFG.tracers = v end,
+	})
+	espRow:CreateToggle({
+		name = "pass arc",
+		description = "neon beam from the release point to the landing spot",
+		flag = "passArc",
+		value = CFG.passArc,
+		callback = function(v) CFG.passArc = v end,
 	})
 
 	lookTab:CreateColorPicker({
@@ -895,24 +1878,358 @@ local function buildUI()
 			aimMark.box.Color3 = color
 			aimMark.beam.Color = color
 			aimMark.text.TextColor3 = color
+			if tagTarget then tagTarget:SetColor(color) end
 		end,
 	})
 
-	lookTab:CreateDivider({ text = "panel" })
+	pcall(function()
+		lookTab:CreateDropdown({
+			name = "skin",
+			description = "repaints the whole window live",
+			options = { "volt", "default", "cobalt", "ember", "amethyst", "frost", "rose" },
+			value = "volt",
+			flag = "skin",
+			callback = function(pick)
+				local chosen = type(pick) == "table" and pick[1] or pick
+				if chosen == "volt" then
+					pcall(function() window:ChangeTheme(slimTheme()) end)
+				else
+					pcall(function() window:ChangeTheme(chosen) end)
+				end
+			end,
+		})
+	end)
+
+	section(lookTab, "PANEL")
 
 	lookTab:CreateButton({
 		name = "unload",
 		description = "tear the panel down and leave the game alone",
+		icon = 83277910885129,
 		callback = function()
 			shutdown()
 		end,
 	})
 
-	-- live ------------------------------------------------------------------------
+	-- live --------------------------------------------------------------------
 
-	liveTab:CreateDivider({ text = "state" })
-	statusBox = liveTab:CreateConsole({ name = "", height = 300, follow = false })
+	-- the dashboard is the newest part of the library; a missing element here
+	-- costs a card, not the window
+	pcall(function()
+		liveTab:CreateText({
+			name = "RUGBALL // slim suite",
+			text = "client side  |  steer 12.5 hz  |  camera writes 0  |  no shoulder offset\nE throw   F clear   T tackle   B block   K settings",
+		})
+	end)
 
+	local statRow = groupOf(liveTab)
+	pcall(function()
+		statTarget = statRow:CreateStat({
+			name = "target",
+			suffix = "st",
+			value = 0,
+			changeMode = "absolute",
+		})
+		statCarrier = statRow:CreateStat({
+			name = "carrier",
+			suffix = "st",
+			value = 0,
+			changeMode = "absolute",
+		})
+		statShots = statRow:CreateStat({
+			name = "throws",
+			value = 0,
+			changeMode = "absolute",
+		})
+	end)
+
+	-- second row: what the session has actually done
+	local statRow2 = groupOf(liveTab)
+	pcall(function()
+		statPicks = statRow2:CreateStat({
+			name = "picks",
+			value = stats.picks,
+			changeMode = "absolute",
+		})
+		statTackles = statRow2:CreateStat({
+			name = "tackles",
+			value = stats.tackles,
+			changeMode = "absolute",
+		})
+		statAvg = statRow2:CreateStat({
+			name = "avg",
+			suffix = "st",
+			value = 0,
+			changeMode = "absolute",
+		})
+	end)
+
+	-- reach: how much of the 226.9 st throw ceiling the current pick uses
+	pcall(function()
+		chargeBar = liveTab:CreateProgress({
+			name = "throw reach",
+			description = "picked man against the 226.9 st ceiling",
+			range = { 0, 227 },
+			value = 0,
+			format = function(v)
+				return string.format("%.0f st", v)
+			end,
+		})
+	end)
+
+	-- pickup: loose, moving, or in your hands
+	pcall(function()
+		ballBar = liveTab:CreateProgress({
+			name = "ball",
+			range = { 0, 2 },
+			value = 0,
+			format = function(v)
+				local names = { "loose", "in flight", "in hand" }
+				return names[math.clamp(math.floor(v) + 1, 1, 3)]
+			end,
+		})
+	end)
+
+	-- field radar: a plain frame sitting in the library's own list layout, with
+	-- pooled dots. camera-relative, so up is always where you are looking.
+	pcall(function()
+		local page = liveTab.tabPage
+		if not page then return end
+
+		radarFrame = Instance.new("Frame")
+		radarFrame.Name = "Radar"
+		radarFrame.BackgroundColor3 = Color3.fromRGB(11, 15, 20)
+		radarFrame.BorderSizePixel = 0
+		radarFrame.Size = UDim2.new(1, 0, 0, 200)
+		radarFrame.ClipsDescendants = true
+		radarFrame.Parent = page
+		pcall(function() radarFrame.LayoutOrder = #liveTab.elements * 10 + 5 end)
+
+		local corner = Instance.new("UICorner")
+		corner.CornerRadius = UDim.new(0, 10)
+		corner.Parent = radarFrame
+
+		local stroke = Instance.new("UIStroke")
+		stroke.Color = Color3.fromRGB(52, 60, 76)
+		stroke.Transparency = 0.25
+		stroke.Parent = radarFrame
+
+		radarCanvas = Instance.new("Frame")
+		radarCanvas.Name = "Field"
+		radarCanvas.AnchorPoint = Vector2.new(0.5, 0.5)
+		radarCanvas.Position = UDim2.fromScale(0.5, 0.5)
+		radarCanvas.Size = UDim2.fromOffset(184, 184)
+		radarCanvas.BackgroundTransparency = 1
+		radarCanvas.Parent = radarFrame
+
+		for _, frac in ipairs({ 0.5, 1 }) do
+			local ring = Instance.new("Frame")
+			ring.Name = "Ring"
+			ring.AnchorPoint = Vector2.new(0.5, 0.5)
+			ring.Position = UDim2.fromScale(0.5, 0.5)
+			ring.Size = UDim2.fromScale(frac, frac)
+			ring.BackgroundTransparency = 1
+			ring.Parent = radarCanvas
+
+			local rc = Instance.new("UICorner")
+			rc.CornerRadius = UDim.new(1, 0)
+			rc.Parent = ring
+
+			local rs = Instance.new("UIStroke")
+			rs.Color = Color3.fromRGB(48, 58, 74)
+			rs.Thickness = 1
+			rs.Transparency = frac == 1 and 0.35 or 0.65
+			rs.Parent = ring
+			radarRings[#radarRings + 1] = ring
+		end
+
+		for i = 1, 32 do
+			local dot = Instance.new("Frame")
+			dot.Name = "Dot"
+			dot.AnchorPoint = Vector2.new(0.5, 0.5)
+			dot.Size = UDim2.fromOffset(6, 6)
+			dot.BorderSizePixel = 0
+			dot.Visible = false
+			dot.ZIndex = 4
+			dot.Parent = radarCanvas
+
+			local dc = Instance.new("UICorner")
+			dc.CornerRadius = UDim.new(1, 0)
+			dc.Parent = dot
+
+			local ds = Instance.new("UIStroke")
+			ds.Color = Color3.fromRGB(6, 9, 12)
+			ds.Thickness = 1
+			ds.Transparency = 0.25
+			ds.Parent = dot
+
+			radarDots[i] = dot
+		end
+
+		local caption = Instance.new("TextLabel")
+		caption.Name = "Caption"
+		caption.BackgroundTransparency = 1
+		caption.Position = UDim2.fromOffset(12, 8)
+		caption.Size = UDim2.new(1, -24, 0, 16)
+		caption.Font = Enum.Font.GothamMedium
+		caption.TextSize = 12
+		caption.TextXAlignment = Enum.TextXAlignment.Left
+		caption.TextColor3 = Color3.fromRGB(120, 132, 152)
+		caption.Text = "RADAR  |  you lime  mates blue  enemies red  ball white"
+		caption.Parent = radarFrame
+	end)
+
+	pcall(function()
+		liveTab:CreateSlider({
+			name = "radar range",
+			range = { 20, 120 },
+			increment = 5,
+			value = CFG.radarRange,
+			suffix = " st",
+			flag = "radarRange",
+			callback = function(v) CFG.radarRange = v end,
+		})
+	end)
+
+	section(liveTab, "ENGINE")
+
+	local engineRow = groupOf(liveTab)
+	pcall(function()
+		statFps = engineRow:CreateStat({
+			name = "fps",
+			value = 0,
+			changeMode = "absolute",
+		})
+		statErr = engineRow:CreateStat({
+			name = "frame errors",
+			value = 0,
+			changeMode = "absolute",
+		})
+	end)
+	pcall(function()
+		statUp = engineRow:CreateStat({
+			name = "uptime",
+			suffix = "s",
+			value = 0,
+			changeMode = "absolute",
+		})
+	end)
+
+	section(liveTab, "BUILD")
+
+	liveTab:CreateButton({
+		name = "copy build",
+		description = "the whole build + playbook as one paste string",
+		callback = function()
+			local s = buildShareString()
+			local ok = pcall(function() SetClipboard(s) end)
+			pcall(function()
+				window:Notify({
+					title = "RUGBALL",
+					content = ok and "build copied to clipboard" or "clipboard failed - console only",
+					duration = 4,
+				})
+			end)
+			mode = "build copied"
+		end,
+	})
+
+	liveTab:CreateButton({
+		name = "paste build",
+		description = "paste a build string, load it",
+		callback = function()
+			-- a tiny modal: paste the string, hit load, it applies validated
+			local gui2 = Instance.new("ScreenGui")
+			gui2.Name = "SlimShare"
+			gui2.ResetOnSpawn = false
+			gui2.Parent = LocalPlayer:FindFirstChild("PlayerGui")
+			local back = Instance.new("Frame")
+			back.Size = UDim2.new(1, 0, 1, 0)
+			back.BackgroundColor3 = Color3.fromRGB(6, 8, 11)
+			back.BackgroundTransparency = 0.25
+			back.ZIndex = 5
+			back.Parent = gui2
+			local box = Instance.new("TextBox")
+			box.AnchorPoint = Vector2.new(0.5, 0.5)
+			box.Position = UDim2.new(0.5, 0, 0.47, 0)
+			box.Size = UDim2.new(0.6, 0, 0.3, 0)
+			box.BackgroundColor3 = Color3.fromRGB(14, 17, 23)
+			box.TextColor3 = Color3.fromRGB(210, 220, 235)
+			box.Font = Enum.Font.Code
+			box.TextSize = 13
+			box.Text = ""
+			box.ClearTextOnFocus = false
+			box.TextWrapped = true
+			box.MultiLine = true
+			box.ZIndex = 6
+			box.Parent = back
+			local btn = Instance.new("TextButton")
+			btn.AnchorPoint = Vector2.new(0.5, 0)
+			btn.Position = UDim2.new(0.5, 0, 0.64, 0)
+			btn.Size = UDim2.new(0.16, 0, 0.05, 0)
+			btn.BackgroundColor3 = Color3.fromRGB(178, 255, 64)
+			btn.TextColor3 = Color3.fromRGB(10, 12, 16)
+			btn.Font = Enum.Font.GothamBold
+			btn.TextSize = 16
+			btn.Text = "load build"
+			btn.ZIndex = 6
+			btn.Parent = back
+			local cancel = Instance.new("TextButton")
+			cancel.AnchorPoint = Vector2.new(0.5, 0)
+			cancel.Position = UDim2.new(0.5, 0, 0.71, 0)
+			cancel.Size = UDim2.new(0.1, 0, 0.035, 0)
+			cancel.BackgroundColor3 = Color3.fromRGB(34, 40, 52)
+			cancel.TextColor3 = Color3.fromRGB(150, 158, 172)
+			cancel.Font = Enum.Font.GothamBold
+			cancel.TextSize = 13
+			cancel.Text = "cancel"
+			cancel.ZIndex = 6
+			cancel.Parent = back
+			btn.MouseButton1Click:Connect(function()
+				if applyShareString(box.Text) then
+					pcall(function()
+						window:Notify({ title = "RUGBALL", content = "build loaded", duration = 4 })
+					end)
+					gui2:Destroy()
+					mode = "build loaded"
+				end
+			end)
+			cancel.MouseButton1Click:Connect(function()
+				gui2:Destroy()
+			end)
+		end,
+	})
+
+	section(liveTab, "CONSOLE")
+	statusBox = liveTab:CreateConsole({ name = "", height = 210, follow = false })
+
+	-- first-run briefing: what is running, and the four binds. once per client
+	-- session, so reloading while tuning does not shove a card in your face.
+	if not _G.SlimBriefed then
+		local shown = pcall(function()
+			_G.SlimBriefed = true
+			_G.SlimPopup = window:Popup({
+				title = "BRIEFING",
+				subtitle = "slim suite  |  client side only",
+				boxes = {
+					{ title = "AIM", description = "holds the deepest open man. hover to pin him, E to throw." },
+					{ title = "TACKLE", description = "fires the game's own tackle inside 7.5 st, 0.55 s hold." },
+					{ title = "BLOCK", description = "drives the carrier's lane, yields the moment a tackle is live." },
+					{ title = "BINDS", description = "E throw   F clear   T tackle   B block   K settings" },
+				},
+				options = { { text = "Let's go", style = "primary" } },
+			})
+		end)
+		if not shown then _G.SlimBriefed = nil end
+	end
+
+	pcall(function()
+		window:Notify({
+			title = "RUGBALL  |  slim suite",
+			content = "aim + tackle + block are live.\nE throw   F clear   T tackle   B block   K settings",
+			duration = 6,
+		})
+	end)
 end
 
 local uiOk, uiErr = pcall(buildUI)
@@ -922,7 +2239,228 @@ elseif not window then
 	warn("[Slim] no window - modules running headless, _G.QBAim still exposed")
 end
 
+--// radar + lead hotkeys -------------------------------------------------------
+
+-- redraw at 10 hz: camera-relative, so "up" is where you are looking and the
+-- dot pattern matches what you see on screen instead of a fixed world axis
+local function updateRadar(now, myRoot, allRigs, entry, carrierRig)
+	if not (radarFrame and radarCanvas) then return end
+	if now - lastRadar < 0.1 then return end
+	lastRadar = now
+
+	local cam = Workspace.CurrentCamera
+	local look = cam and cam.CFrame.LookVector or Vector3.new(0, 0, -1)
+	local fwd = Vector3.new(look.X, 0, look.Z)
+	if fwd.Magnitude < 0.01 then fwd = Vector3.new(0, 0, -1) end
+	fwd = fwd.Unit
+	local right = Vector3.new(-fwd.Z, 0, fwd.X)
+
+	local size = radarCanvas.AbsoluteSize.X
+	if size <= 1 then size = 184 end
+	local radius = size * 0.5 - 4
+	local range = math.max(10, CFG.radarRange)
+	local scale = radius / range
+
+	local myT = myTeam()
+	local n = 0
+
+	local function place(pos, color, px)
+		n = n + 1
+		local dot = radarDots[n]
+		if not dot then return end
+		local dx = pos - myRoot.Position
+		local flat = Vector3.new(dx.X, 0, dx.Z)
+		local cx = math.clamp(flat:Dot(right) * scale, -radius, radius)
+		local cy = math.clamp(-flat:Dot(fwd) * scale, -radius, radius)
+		dot.Position = UDim2.new(0.5, cx, 0.5, cy)
+		dot.Size = UDim2.fromOffset(px, px)
+		dot.BackgroundColor3 = color
+		dot.Visible = true
+	end
+
+	local ball = ballPart()
+	if ball then
+		place(ball.Position, Color3.fromRGB(245, 248, 255), 7)
+	end
+
+	for _, rig in ipairs(allRigs) do
+		if rig ~= myRig() and rig.PrimaryPart then
+			local pos = rig.PrimaryPart.Position
+			local t = teamOf(rig)
+			local color
+			if myT and t == myT then
+				color = Color3.fromRGB(86, 156, 255)
+			elseif myT and t and t ~= myT then
+				color = Color3.fromRGB(255, 82, 82)
+			else
+				color = Color3.fromRGB(150, 158, 172)
+			end
+			local px = 6
+			if entry and entry.rig == rig then
+				color = COLORS.aim
+				px = 9
+			elseif carrierRig == rig then
+				px = 8
+			end
+			place(pos, color, px)
+		end
+	end
+
+	-- you last, always dead centre
+	place(myRoot.Position, Color3.fromRGB(178, 255, 64), 9)
+
+	for i = n + 1, #radarDots do
+		radarDots[i].Visible = false
+	end
+end
+
+-- [ and ] nudge lead five studs mid-play without opening the panel
+leadConn = UserInputService.InputBegan:Connect(function(input, typing)
+	if typing then return end
+	if UserInputService:GetFocusedTextBox() then return end
+	local k = input.KeyCode
+	if k ~= Enum.KeyCode.LeftBracket and k ~= Enum.KeyCode.RightBracket then return end
+	local step = (k == Enum.KeyCode.RightBracket) and 5 or -5
+	CFG.lead = math.clamp(math.floor((CFG.lead or 0) + step + 0.5), 0, 100)
+	if leadSlider then
+		pcall(function() leadSlider:Set(CFG.lead, true) end)
+	end
+	mode = string.format("lead %d st", CFG.lead)
+end)
+
 --// modules -------------------------------------------------------------------
+
+-- step around a body sitting in the path instead of running into it
+local function avoidBlockers(myRoot, dir, skip)
+	local best = dir
+	for _, rig in ipairs(rigs()) do
+		if rig ~= myRig() and rig ~= skip and rig.PrimaryPart then
+			local delta = rig.PrimaryPart.Position - myRoot.Position
+			local flat = Vector3.new(delta.X, 0, delta.Z)
+			local d = flat.Magnitude
+			if d > 0.8 and d < 5.5 then
+				local u = flat.Unit
+				local ahead = u:Dot(dir)
+				if ahead > 0.45 then
+					local side = Vector3.new(-dir.Z, 0, dir.X)
+					if side:Dot(u) > 0 then side = -side end
+					best = (best + side * (1.1 - ahead * 0.5)).Unit
+				end
+			end
+		end
+	end
+	return best
+end
+
+-- auto guard: the enemy ball is in the air, so get on the man he is throwing
+-- to and make the catch happen through us. our own throw is not an assignment.
+local function guardTick(now, mine, myRoot)
+	if not CFG.guard or hasBall() then return nil, nil end
+	local ball = ballPart()
+	if not ball or ball:GetAttribute("InFlight") ~= true then return nil, nil end
+	if myLastThrowAt > 0 and now - myLastThrowAt < 5 then return nil, nil end
+	local spot = ball:GetAttribute("LandedAt")
+	local target = typeof(spot) == "Vector3" and spot or ball.Position
+	local myT = myTeam()
+	local best, bestD
+	for _, rig in ipairs(rigs()) do
+		if rig ~= mine and rig.PrimaryPart then
+			local t = teamOf(rig)
+			local enemy = (myT == nil and t ~= nil) or (t ~= nil and myT ~= nil and t ~= myT)
+			if enemy then
+				local d = (rig.PrimaryPart.Position - target).Magnitude
+				if not bestD or d < bestD then
+					best, bestD = rig, d
+				end
+			end
+		end
+	end
+	if not best then return nil, nil end
+	local root = best.PrimaryPart
+	local toBall = target - root.Position
+	if toBall.Magnitude < 0.5 then
+		toBall = Vector3.new(0, 0, -1)
+	end
+	-- stand in his hands: a couple of studs toward the ball, on his ball side
+	local k = math.min(CFG.guardStand or 3.5, toBall.Magnitude * 0.4)
+	local stand = root.Position + toBall.Unit * k
+	local flat = Vector3.new(stand.X - myRoot.Position.X, 0, stand.Z - myRoot.Position.Z)
+	local d = flat.Magnitude
+	if d < 0.8 then
+		flat = Vector3.new(toBall.X, 0, toBall.Z)
+	end
+	-- contest: we are on him and the ball is about to arrive, go get it
+	local ballClose = (ball.Position - stand).Magnitude < (CFG.guardJump or 7)
+	local himClose = (root.Position - myRoot.Position).Magnitude < 6
+	if ballClose and himClose and now >= nextJump and Jump then
+		if ball.Position.Y - myRoot.Position.Y > 3 then
+			nextJump = now + 0.8
+			press(Jump, 0.1)
+			stats.intercepts = stats.intercepts + 1
+			return nil, "guard jump"
+		end
+	end
+	return flat.Unit, string.format("guard %s %.0f", label(best), d)
+end
+
+-- deep half: pre-throw defense. nothing is live, so sit over the top of the
+-- deepest receiver so nothing gets behind you.
+local function deepHalfTick(now, mine, myRoot, carrierRig)
+	if not CFG.deepHalf or hasBall() then return nil, nil end
+	local ball = ballPart()
+	if ball and ball:GetAttribute("InFlight") == true then return nil, nil end
+	local myT = myTeam()
+	if carrierRig and teamOf(carrierRig) ~= myT then return nil, nil end
+	local anchorPos = carrierRig and carrierRig.PrimaryPart.Position
+		or (ball and ball.Position or myRoot.Position)
+	local best, bestDepth
+	for _, rig in ipairs(rigs()) do
+		if rig ~= mine and rig.PrimaryPart then
+			local t = teamOf(rig)
+			local enemy = (myT == nil and t ~= nil) or (t ~= nil and t ~= myT)
+			if enemy then
+				local flat = Vector3.new(rig.PrimaryPart.Position.X - anchorPos.X, 0, rig.PrimaryPart.Position.Z - anchorPos.Z)
+				local depth = flat.Magnitude
+				if not bestDepth or depth > bestDepth then
+					best, bestDepth = rig, depth
+				end
+			end
+		end
+	end
+	if not best or bestDepth < 18 then return nil, nil end
+	local away = best.PrimaryPart.Position - anchorPos
+	local spot = best.PrimaryPart.Position + away.Unit * 4
+	local flat = Vector3.new(spot.X - myRoot.Position.X, 0, spot.Z - myRoot.Position.Z)
+	if flat.Magnitude < 0.8 then return nil, nil end
+	return flat.Unit, string.format("deep half %s %.0f", label(best), flat.Magnitude)
+end
+
+-- ball in the air or on the ground: run under the landing spot, jump on arrival
+local function interceptTick(now, mine, myRoot)
+	-- guard outranks the plain intercept: defending the man beats the spot
+	local gdir, gstate = guardTick(now, mine, myRoot)
+	if gdir or gstate then return gdir, gstate end
+	if not CFG.intercept or hasBall() then return nil, nil end
+	local ball = ballPart()
+	if not ball then return nil, nil end
+	if ball:GetAttribute("InFlight") ~= true and ball:GetAttribute("Loose") ~= true then
+		return nil, nil
+	end
+	local spot = ball:GetAttribute("LandedAt")
+	local target = typeof(spot) == "Vector3" and spot or ball.Position
+	local flat = Vector3.new(target.X - myRoot.Position.X, 0, target.Z - myRoot.Position.Z)
+	local d = flat.Magnitude
+	if d < 1.2 or d > CFG.interceptRange then return nil, nil end
+	if d < 5 and now >= nextJump and Jump then
+		if ball.Position.Y - myRoot.Position.Y > 4 then
+			nextJump = now + 0.8
+			press(Jump, 0.1)
+			stats.intercepts = stats.intercepts + 1
+			return nil, "jump"
+		end
+	end
+	return flat.Unit, string.format("intercept %.0f", d)
+end
 
 local function tackleTick(now, mine, myRoot, carrierRig)
 	if not (CFG.tackle and carrierRig) or carrierRig == mine then
@@ -958,21 +2496,23 @@ local function tackleTick(now, mine, myRoot, carrierRig)
 	end
 
 	if dist <= CFG.tackleRange and now >= nextTackle then
-		if press(Tackle, CFG.tackleHold + math.random() * 0.08) then
-			nextTackle = now + CFG.tackleCd + math.random() * 0.12
-		end
+		nextTackle = now + CFG.tackleCd
+		press(Tackle, CFG.tackleHold)
+		triggerPop(0.9)
+		stats.tackles = stats.tackles + 1
 		return nil, string.format("tackle %.1f", dist)
-	elseif dist <= CFG.diveRange and dist > CFG.tackleRange and now >= nextDive then
-		if press(Dive, 0.12) then
-			nextDive = now + CFG.tackleCd * 1.5 + math.random() * 0.12
-		end
+	elseif CFG.dive and dist <= CFG.diveRange and dist > CFG.tackleRange and now >= nextDive then
+		nextDive = now + CFG.tackleCd * 1.5
+		press(Dive, 0.12)
 		return nil, string.format("dive %.1f", dist)
 	end
 
 	if CFG.pursue and dist > CFG.tackleRange * 0.75 then
 		local flat = Vector3.new(delta.X, 0, delta.Z)
 		if flat.Magnitude > 0.5 then
-			return flat.Unit, string.format("chase %.1f", dist)
+			local dir = flat.Unit
+			if CFG.pathing then dir = avoidBlockers(myRoot, dir, carrierRig) end
+			return dir, string.format("chase %.1f", dist)
 		end
 	end
 	return nil, string.format("carrier %.1f", dist)
@@ -1042,10 +2582,9 @@ local function blockTick(now, mine, myRoot, ballRig)
 	local state
 	if dist <= CFG.blockEngage then
 		if now >= nextBlock then
-			local hold = CFG.blockHold + math.random() * 0.08
-			if press(Tackle, hold) then
-				nextBlock = now + hold + CFG.blockCd + math.random() * 0.12
-			end
+			press(Tackle, CFG.blockHold)
+			triggerPop(0.55)
+			nextBlock = now + CFG.blockHold + CFG.blockCd
 		end
 		state = string.format("blocking %.1f", dist)
 	elseif dist <= CFG.blockScan then
@@ -1060,26 +2599,91 @@ end
 --// main loop -----------------------------------------------------------------
 
 local lastStatus = 0
-local lastPrune = 0
+local lastStats = 0
+local lastCfgSave = 0
+local bootAt = os.clock()
+local framesSince = 0
+local lastFpsAt = 0
+
+-- coach calls: read the coverage on the pick and call the throw in the console.
+-- over top = deep help, sitting under = robbing the route, pocket = in his lap.
+local function coachCall(entry)
+	if not entry or not entry.cover or not entry.cover.PrimaryPart then
+		return "no coverage, free throw"
+	end
+	if not entry.rig or not entry.rig.PrimaryPart then return "-" end
+	local rel = entry.cover.PrimaryPart.Position - entry.rig.PrimaryPart.Position
+	local along = rel:Dot(entry.dir or Vector3.new(0, 0, -1))
+	local d = entry.coverGap or math.huge
+	if d < 2.5 then
+		return string.format("in his pocket: %s %.1fst", label(entry.cover), d)
+	elseif along > 1.5 then
+		return string.format("over top: %s %.1fst", label(entry.cover), d)
+	elseif along < -2 then
+		return string.format("sitting under: %s %.1fst", label(entry.cover), d)
+	end
+	return string.format("trail: %s %.1fst, open window", label(entry.cover), d)
+end
+
+-- catch chance on the throw: safe (green) wide open, risky (yellow) contested,
+-- covered (red) dangerous throw. gap is the defender's distance at the throw point.
+local function catchStateFor(entry)
+	local safeC = Color3.fromRGB(178, 255, 64)
+	local riskyC = Color3.fromRGB(255, 221, 35)
+	local coveredC = Color3.fromRGB(255, 70, 70)
+	if not entry then return "SAFE", safeC end
+	local gap = entry.gap or math.huge
+	local dist = entry.dist or 0
+	local ang = entry.angle or 0
+	local inRange = dist <= (CFG.maxDist or 195) and ang <= (CFG.fov or 42) and dist > 6
+	local openGate = CFG.openGate or 0
+	if not inRange or gap < 6 or (openGate > 0 and gap < openGate) then
+		return "COVERED", coveredC
+	elseif gap < 12 then
+		return "RISKY", riskyC
+	end
+	return "SAFE", safeC
+end
 
 local function statusText(entry, carrierRig, threatState)
 	local lines = {}
 	lines[#lines + 1] = string.format("mode     %s", mode)
 	if entry then
-		lines[#lines + 1] = string.format("target   %s  %.0f st  %.0f deg", label(entry.rig), entry.dist, entry.angle)
+		lines[#lines + 1] = string.format("target   %s  %.0f st  %.0f deg", label(entry.rig), entry.dist or 0, entry.angle or 0)
 	else
 		lines[#lines + 1] = "target   -"
 	end
 	lines[#lines + 1] = string.format("carrier  %s", carrierRig and (label(carrierRig) .. "  " .. tostring(teamOf(carrierRig))) or "-")
-	if tackleStatus then lines[#lines + 1] = string.format("tackle   %s", tackleStatus) end
 	if threatState then lines[#lines + 1] = string.format("block    %s", threatState) end
 	lines[#lines + 1] = string.format("ball     %s", hasBall() and "in hand" or (canThrow() and "ready" or "-"))
 	lines[#lines + 1] = string.format("throws   %d   last c=%.2f", stats.shots, stats.lastCharge)
+	lines[#lines + 1] = string.format("session  picks %d  tackles %d  intercepts %d", stats.picks, stats.tackles, stats.intercepts)
+	if (stats.shots or 0) > 0 then
+		local pct = math.floor((stats.completions or 0) / (stats.shots or 1) * 100 + 0.5)
+		lines[#lines + 1] = string.format("accuracy %d%%  (%d/%d, %d dropped)", pct, stats.completions or 0, stats.shots or 0, stats.drops or 0)
+	end
+	if (CFG.lead or 0) > 0 then
+		lines[#lines + 1] = string.format("lead     %d st past the pick", CFG.lead)
+	end
 	lines[#lines + 1] = string.format("pick     %s", lockManual and "mouse" or "auto")
+	if CFG.coach then
+		lines[#lines + 1] = string.format("coach    %s", coachCall(entry))
+	end
+	local cstate, ccol = catchStateFor(entry)
+	local coverTxt = entry and entry.cover and string.format("  %s %.1f st", label(entry.cover), entry.coverGap or 0) or ""
+	lines[#lines + 1] = string.format("catch    %s%s", cstate, coverTxt)
 	return table.concat(lines, "\n")
 end
 
-RunService:BindToRenderStep("SlimPanel", Enum.RenderPriority.Camera.Value + 3, function()
+-- one bad frame must not take the loop down with it: warn once, notify once,
+-- and only stop after the errors stop being transient.
+local frameErrors = 0
+local frameWarned = false
+
+-- the loop body lives in its own function so one bad frame cannot unbind the
+-- whole panel: the pcall below catches it, warns once, and only stops the loop
+-- if it keeps happening.
+local function renderFrame()
 	local cam = Workspace.CurrentCamera
 	if not cam then return end
 	Camera = cam
@@ -1092,33 +2696,35 @@ RunService:BindToRenderStep("SlimPanel", Enum.RenderPriority.Camera.Value + 3, f
 		return
 	end
 	local myRoot = mine.PrimaryPart
+	refreshAntiFall()
 	local now = os.clock()
 	local origin = throwOrigin()
 	local allRigs = rigs()
-
-	if now - lastPrune > 5 then
-		lastPrune = now
-		for rig in pairs(trackers) do
-			if not rig.Parent then trackers[rig] = nil end
-		end
-	end
+	framesSince = framesSince + 1
 
 	-- point at a man and he is the target; the auto picker takes over 1.2s later
-	local hovered = CFG.hoverPick and rigUnderCursor(cam) or nil
-	if hovered then
-		if hovered ~= locked and mode ~= ("picked " .. label(hovered)) then
-			mode = "picked " .. label(hovered)
+	-- a pinned lock ignores hover and auto, only a fresh Q / C / F / dropdown change it
+	if lockPinned then
+		if not locked or not locked.Parent or not locked.PrimaryPart then
+			lockClear()
 		end
-		locked = hovered
-		lockManual = true
-		hoverLostAt = 0
-	elseif lockManual and locked then
-		if hoverLostAt == 0 then hoverLostAt = now end
-		if now - hoverLostAt >= CFG.hoverRelease then
-			locked = nil
-			lockManual = false
+	else
+		local hovered = CFG.hoverPick and rigUnderCursor(cam) or nil
+		if hovered then
+			if hovered ~= locked and mode ~= ("picked " .. label(hovered)) then
+				mode = "picked " .. label(hovered)
+			end
+			locked = hovered
+			lockManual = true
 			hoverLostAt = 0
-			mode = "auto"
+		elseif lockManual and locked then
+			if hoverLostAt == 0 then hoverLostAt = now end
+			if now - hoverLostAt >= CFG.hoverRelease then
+				locked = nil
+				lockManual = false
+				hoverLostAt = 0
+				mode = "auto"
+			end
 		end
 	end
 
@@ -1134,6 +2740,19 @@ RunService:BindToRenderStep("SlimPanel", Enum.RenderPriority.Camera.Value + 3, f
 	end
 	currentEntry = entry
 
+	-- tally pick changes, but not the auto picker flickering between two men
+	if entry and entry.rig ~= lastPickRig then
+		local o = origin or myRoot.Position
+		snapDir = (entry.point - o).Unit
+		snapSet = true
+		if now - lastPickAt > 0.35 then
+			stats.picks = stats.picks + 1
+			lastPickAt = now
+		end
+		lastPickRig = entry.rig
+	end
+	if not entry then lastPickRig = nil snapSet = false end
+
 	-- esp on the aim target
 	if CFG.espAim and entry then
 		markTo(aimMark, entry.rig, string.format("%s  %.0f st", label(entry.rig), entry.dist), myRoot.Position, now)
@@ -1141,9 +2760,41 @@ RunService:BindToRenderStep("SlimPanel", Enum.RenderPriority.Camera.Value + 3, f
 		markOff(aimMark)
 	end
 
-	-- auto throw
+	-- catch chance billboard over the pick: safe / risky / covered, plus the
+	-- man covering him and how far off when the throw is not clean
+	if catchMark then
+		if entry then
+			local cstate, ccol = catchStateFor(entry)
+			local ctext = cstate
+			if cstate ~= "SAFE" and entry.cover then
+				ctext = string.format("%s  %s %.0fst", cstate, label(entry.cover), entry.coverGap or 0)
+			end
+			markTo(catchMark, entry.rig, ctext, myRoot.Position, now, ccol)
+		end
+	end
+
+	-- pass preview: the arc the ball will take, colored by catch chance
+	if arcPart then
+		local show = entry and CFG.passArc and origin and (entry.point - origin).Magnitude > 1
+		if show then
+			local cstate, ccol = catchStateFor(entry)
+			local delta = entry.point - origin
+			arcPart.Size = Vector3.new(0.14, 0.14, delta.Magnitude)
+			arcPart.CFrame = CFrame.lookAt(origin + delta * 0.5, entry.point)
+			arcPart.Color = ccol
+			arcPart.Transparency = 0.45
+		else
+			arcPart.Transparency = 1
+		end
+	end
+
+	-- auto throw. the open gate is a coverage check: a defender inside
+	-- openGate studs of the receiver means the throw is not worth it.
 	if CFG.autoThrow and entry and not throwing and (now - lastThrow) > 1.25 then
-		if hasBall() or canThrow() then
+		local gap = entry.gap or math.huge
+		if CFG.openGate > 0 and gap < CFG.openGate then
+			mode = string.format("covered %.0f/%.0f", gap, CFG.openGate)
+		elseif hasBall() or canThrow() then
 			throwing = true
 			lastThrow = now
 			local e = entry
@@ -1156,30 +2807,265 @@ RunService:BindToRenderStep("SlimPanel", Enum.RenderPriority.Camera.Value + 3, f
 	end
 
 	local carrierRig = carrier()
+	local tackleDir, tackleState, blockDir, blockState
 
-	-- tackle first: an enemy carrier in reach owns the tackle button
-	local tackleDir, tackleState = tackleTick(now, mine, myRoot, carrierRig)
-	local blockDir, blockState
-	if tackleDir then
-		blockDir, blockState = nil, "yield"
-		if CFG.block then
-			local threat = findThreat(myRoot, myTeam(), carrierRig)
-			if threat and CFG.espThreat then
-				markTo(threatMark, threat, string.format("BLOCK %s  %.1f st", label(threat), (threat.PrimaryPart.Position - myRoot.Position).Magnitude), myRoot.Position, now)
+	-- nothing live, nothing to do: no steering, no tackles. the lobby is the
+	-- one place a distance audit is guaranteed to be watching.
+	if ballPart() == nil then
+		markOff(carrierMark)
+		markOff(threatMark)
+		blockState = "no ball"
+	else
+		-- a loose or in-flight ball outranks coverage: run under it first
+		local interceptDir, interceptState = interceptTick(now, mine, myRoot)
+		if interceptDir or interceptState then
+			tackleDir, tackleState = interceptDir, interceptState
+			blockDir, blockState = nil, "ball"
+		else
+			-- tackle next: an enemy carrier in reach owns the tackle button
+			tackleDir, tackleState = tackleTick(now, mine, myRoot, carrierRig)
+			-- escape juke: while holding the ball, sidestep the hit instead of eating it
+			if CFG.escapeJuke and hasBall() and tackleDir then
+				local threat = findThreat(myRoot, myTeam(), carrierRig)
+				if threat and threat.PrimaryPart then
+					local away = myRoot.Position - threat.PrimaryPart.Position
+					local diru = away.Unit
+					local lat = Vector3.new(-diru.Z, 0, diru.X)
+					if lat.Magnitude > 0.01 then
+						local side = lat.Unit
+						local fwdv = Vector3.new(cam.CFrame.LookVector.X, 0, cam.CFrame.LookVector.Z)
+						if side:Dot(fwdv) < 0.2 then side = -side end
+						tackleDir = (diru + side * 0.85).Unit
+					end
+					tackleState = "juke"
+				end
+			end
+			if tackleDir then
+				blockDir, blockState = nil, "yield"
+				if CFG.block then
+					local threat = findThreat(myRoot, myTeam(), carrierRig)
+					if threat and CFG.espThreat then
+						markTo(threatMark, threat, string.format("BLOCK %s  %.1f st", label(threat), (threat.PrimaryPart.Position - myRoot.Position).Magnitude), myRoot.Position, now)
+					end
+				end
+			else
+				blockDir, blockState = blockTick(now, mine, myRoot, carrierRig)
+			end
+			-- deep half: nothing live, so take the deepest receiver's vertical
+			if blockDir == nil and CFG.deepHalf then
+				local dDir, dState = deepHalfTick(now, mine, myRoot, carrierRig)
+				if dDir then
+					blockDir, blockState = dDir, dState
+				end
 			end
 		end
-	else
-		blockDir, blockState = blockTick(now, mine, myRoot, carrierRig)
 	end
 
 	driveTo(tackleDir or blockDir)
 	pumpSteer(now)
 
-	tackleStatus = tackleState
+	-- rush speed: while the tackle/block is driving the player into the hit, he
+	-- moves harder. the tackle reach is what decides whether the hit happens.
+	local hum = mine:FindFirstChildOfClass("Humanoid")
+	local boost = (tackleDir ~= nil or blockDir ~= nil) and true or false
+	if boost ~= rushOn then
+		rushOn = boost
+		if hum then
+			if boost then
+				hum:SetAttribute("SlimRush", true)
+				hum.WalkSpeed = (hum.WalkSpeed or 16) * 1.5
+			else
+				hum:SetAttribute("SlimRush", false)
+				hum.WalkSpeed = (hum.WalkSpeed or 16) / 1.5
+			end
+		end
+	end
+
+	if tackleState then mode = tackleState end
 
 	if now - lastStatus > 0.1 then
 		lastStatus = now
 		if statusBox then statusBox:Set(statusText(entry, carrierRig, blockState)) end
+	end
+
+	-- dashboard: rolling numbers plus the live tags in the title bar
+	if now - lastStats > 0.2 then
+		lastStats = now
+		-- persistence: keep _G.SlimCfg current even if a shutdown never fires
+		if now - lastCfgSave > 2 then
+			lastCfgSave = now
+			pcall(saveCfg)
+		end
+		-- accuracy: watch our own throw land. teammate holds it = completion,
+		-- nobody on the ball and it hit the dirt = incompletion.
+		if shotWatch then
+			if now - shotWatch.at > 6 then
+				shotWatch = nil
+			elseif not hasBall() and now - shotWatch.at > 0.7 then
+				local b = ballPart()
+				if not b then
+					shotWatch = nil -- ball despawned, drop the watch
+				elseif b:GetAttribute("InFlight") ~= true then
+					local held = carrier()
+					if held then
+						local ht = teamOf(held)
+						local myT = myTeam()
+						if myT == nil or ht == myT then
+							stats.completions = stats.completions + 1
+						else
+							stats.picked = stats.picked + 1
+						end
+						shotWatch = nil
+					elseif now - shotWatch.at > 3 then
+						stats.drops = stats.drops + 1
+						shotWatch = nil
+					end
+				end
+			end
+		end
+		-- route memory: when the ball lands in hand, lock the man you throw to most
+		local hb = hasBall()
+		if CFG.routeLock and hb and not lastHadBall and not lockManual then
+			local bestRig, bestN
+			for _, rig in ipairs(lockable()) do
+				local n = routeMemory[label(rig)] or 0
+				if n > (bestN or 0) then
+					bestRig, bestN = rig, n
+				end
+			end
+			if bestRig then
+				lockTo(bestRig)
+				mode = "route memory: " .. label(bestRig)
+			end
+		end
+		lastHadBall = hb
+		-- engine light: is the loop healthy
+		if statFps then
+			local fps = framesSince / math.max(0.05, now - lastFpsAt)
+			pcall(function() statFps:Set(math.floor(fps + 0.5)) end)
+		end
+		if statErr then pcall(function() statErr:Set(frameErrors) end) end
+		if statUp then pcall(function() statUp:Set(math.floor(now - bootAt)) end) end
+		lastFpsAt = now
+		framesSince = 0
+		local tdist = entry and entry.dist or 0
+		local cdist = 0
+		if carrierRig and carrierRig.PrimaryPart then
+			cdist = (carrierRig.PrimaryPart.Position - myRoot.Position).Magnitude
+		end
+		if statTarget then statTarget:Set(math.floor(tdist + 0.5)) end
+		if statCarrier then statCarrier:Set(math.floor(cdist + 0.5)) end
+		if statShots then statShots:Set(stats.shots) end
+		if statPicks then statPicks:Set(stats.picks) end
+		if statTackles then statTackles:Set(stats.tackles) end
+		if statAvg then
+			local avg = stats.shots > 0 and (stats.distSum / stats.shots) or 0
+			pcall(function() statAvg:Set(math.floor(avg + 0.5)) end)
+		end
+		if tagTarget then
+			if entry then
+				if lockPinned then
+					tagTarget:SetText("LOCK " .. string.sub(label(entry.rig), 1, 9))
+					tagTarget:SetColor(Color3.fromRGB(178, 255, 64))
+				else
+					tagTarget:SetText(string.format("TGT %.0f st", tdist or 0))
+					tagTarget:SetColor(COLORS.aim)
+				end
+			else
+				tagTarget:SetText("NO TGT")
+				tagTarget:SetColor(Color3.fromRGB(70, 76, 90))
+			end
+		end
+
+		-- keep the lock list current as players sub in and out
+		if lockDropdown then
+			local names = { "none" }
+			for _, rig in ipairs(lockable()) do
+				names[#names + 1] = label(rig)
+			end
+			local sig = table.concat(names, "|")
+			if sig ~= lockSig then
+				lockSig = sig
+				pcall(function()
+					lockDropdown:Refresh(names)
+					if lockPinned and locked then
+						lockDropdown:Set(label(locked), true)
+					else
+						lockDropdown:Set("none", true)
+					end
+				end)
+			end
+		end
+
+		-- mode pill: what the loop is doing this second
+		if modeTag then
+			local shown = string.upper(string.sub(mode, 1, 10))
+			pcall(function() modeTag:SetText(shown) end)
+		end
+
+		-- the pick card in the aim tab
+		if aimCard then
+			if entry then
+				local extra = ""
+				if (CFG.lead or 0) > 0 then extra = string.format("  |  lead %d", CFG.lead) end
+				pcall(function()
+					aimCard:SetTitle(string.format("picked man  |  %s", label(entry.rig)))
+					aimCard:Set(string.format(
+						"%s  |  %.0f st  |  %.0f deg  |  %s%s",
+						tostring(teamOf(entry.rig)),
+						entry.dist or 0,
+						entry.angle or 0,
+						lockPinned and "locked" or (lockManual and "pinned" or "auto"),
+						extra
+					))
+				end)
+			else
+				pcall(function()
+					aimCard:SetTitle("picked man  |  nobody")
+					aimCard:Set(CFG.aim and "auto scanning" or "aim off")
+				end)
+			end
+		end
+
+		-- two little bars that make the numbers mean something
+		if chargeBar then
+			pcall(function() chargeBar:Set(math.min(tdist, 227)) end)
+		end
+		if ballBar then
+			local state = 0
+			if hasBall() then
+				state = 2
+			elseif ballPart() then
+				state = 1
+			end
+			pcall(function() ballBar:Set(state) end)
+		end
+	end
+
+	-- the radar keeps its own 10 hz clock, so it does not ride the 5 hz stats tick
+	pcall(updateRadar, now, myRoot, allRigs, entry, carrierRig)
+end
+
+RunService:BindToRenderStep("SlimPanel", Enum.RenderPriority.Camera.Value + 3, function()
+	local ok, err = pcall(renderFrame)
+	if ok then
+		if frameErrors > 0 then frameErrors = frameErrors - 1 end
+		return
+	end
+
+	frameErrors = frameErrors + 1
+	if not frameWarned then
+		frameWarned = true
+		warn("[Slim] frame error: " .. tostring(err))
+		pcall(function()
+			if window and window.Notify then
+				window:Notify({ title = "SLIM", content = "module error - running degraded", duration = 5 })
+			end
+		end)
+	end
+	if frameErrors > 90 then
+		RunService:UnbindFromRenderStep("SlimPanel")
+		warn("[Slim] loop stopped after repeated frame errors")
 	end
 end)
 
@@ -1199,18 +3085,28 @@ _G.QBAim = {
 		if typeof(target) == "Instance" and target:IsA("Model") then
 			locked = target
 			lockManual = true
+			lockPinned = true
 			hoverLostAt = 0
+			mode = "locked " .. label(target)
 			return true
 		end
 		return false
 	end,
+	lock = function(rigOrName) return lockTo(rigOrName) end,
+	unlock = function() lockClear() end,
 	clear = function()
 		locked = nil
 		lockManual = false
+		lockPinned = false
 		hoverLostAt = 0
 		mode = "auto"
+		if lockDropdown then
+			pcall(function() lockDropdown:Set("none", true) end)
+		end
 	end,
 	throw = function() return requestThrow() end,
+	routes = routeApi,
+	share = { out = buildShareString, load = applyShareString },
 	cfg = CFG,
 	stats = stats,
 	panel = window,
