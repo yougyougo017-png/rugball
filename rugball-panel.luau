@@ -34,6 +34,7 @@ local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ReplicatedFirst = game:GetService("ReplicatedFirst")
 local Workspace = game:GetService("Workspace")
 
 local LocalPlayer = Players.LocalPlayer
@@ -121,9 +122,41 @@ local CFG = {
 	diveRange   = 12.0,
 	tackleHold  = 0.55,
 	tackleCd    = 1.15,
+	tackleLead  = true,    -- chase the intercept point, not the body
+	dodgeTruck  = true,    -- sidestep the truck spike instead of eating it
+	swarm       = true,    -- gang tackle: take the escape lane, not the pile
+	tackleTele  = true,    -- teleport right on top of the enemy carrier to tackle
+	tackleTeleY = 2,       -- studs above the carrier when you land
+
+	-- catch / ball magnet: pull straight at the ball's landing point so you're
+	-- under it when it comes down. reads the sim's own LandingPoint attribute.
+	catchMagnet = false,   -- steer at the ball's landing point while it's in flight
+	magnetRadius= 28,      -- max distance to engage the magnet
+	magnetLead  = true,    -- arrive a beat before the ball lands
+	magnetCatch = true,    -- auto dive at the very end of the flight
+	magnetSpeed = 1.0,     -- steer strength while magnet is active (1 = full)
+	ballToMe    = false,   -- teleport the loose ball straight to your rig
+	ballToMeY   = 4,       -- studs above you when it lands
+	teleToPlay  = true,    -- teleport you to the ball / play
+	teleOffset  = 6,       -- studs away from the ball when you land
 
 	antiFall    = true,
 	escapeJuke  = false,   -- sidestep the hit instead of eating it while holding
+	speed       = false,   -- cruise speed bonus through the raw sim channel
+	speedMult   = 1.15,    -- 1.15 = about +4 st/s on the cruise (1.0 = stock)
+	rushSurge   = true,    -- tackle/block drive adds +5 st/s through the sim
+	autoPump    = true,    -- pocket coverage fires the pump fake first
+	meatShield  = false,   -- block path: cover both lanes, not one threat
+	ghostRoute  = true,    -- neon line: where the pick will actually be
+	statCard    = true,    -- floating statline hud
+
+	-- ultimate batch two: everything else
+	coverHeat   = true,    -- 7x7 heat grid on the field around the pick
+	diveLead    = true,    -- aim the dive at where the carrier WILL be
+	diveLeadTime= 0.22,    -- seconds of carrier motion the dive leads by
+	jukeBait    = true,    -- burst sidestep right before the hit lands
+	replay      = true,    -- neon trail of your last run-back
+	chatSync    = true,    -- receive friend builds sent through chat
 
 	-- defense assist
 	intercept   = false,
@@ -159,6 +192,11 @@ local CFG = {
 	radarRange  = 55,
 }
 
+-- stock snapshot: page one of the build share. only the keys a user touches
+-- travel in the short chat code; everything still stock stays out.
+local CFG_STOCK = {}
+for k, v in pairs(CFG) do CFG_STOCK[k] = v end
+
 -- settings survive a reload: _G.SlimCfg holds the last saved build and the
 -- shutdown hook writes it back out before the sweep tears everything down
 do
@@ -175,11 +213,60 @@ end
 local hotRoutes = _G.SlimRoutes or {}
 _G.SlimRoutes = hotRoutes
 
+-- panic state lives here so saveCfg (declared below) can see it
+local panicSnapshot = nil
+
 local function saveCfg()
+	-- a panicked build is NOT the user's build: skip persisting while the
+	-- kill switch is on, so a reload mid-panic comes back with the real setup
+	if panicSnapshot then return end
 	local copy = {}
 	for k, v in pairs(CFG) do copy[k] = v end
 	_G.SlimCfg = copy
 	pcall(function() _G.SlimRoutes = hotRoutes end)
+end
+
+-- panic: one press fells every toggle in one cut, a second press brings the
+-- whole build back out of the snapshot. for the moment someone walks past
+-- your screen. booleans only - sliders hold no secrets.
+local function panicRestore()
+	if not panicSnapshot then return false end
+	local snap = panicSnapshot
+	panicSnapshot = nil
+	-- window is declared later in the file, so panel handles come from _G
+	local w = _G.QBAim and _G.QBAim.panel
+	for k in pairs(snap) do
+		CFG[k] = true
+		if w and w.controls then
+			local ctl = w.controls[k]
+			if ctl and ctl.Set then pcall(function() ctl:Set(true, false) end) end
+		end
+	end
+	mode = "panic restored"
+	pcall(saveCfg)
+	return true
+end
+local function panic()
+	if panicSnapshot then
+		panicRestore()
+		return true
+	end
+	panicSnapshot = {}
+	local n = 0
+	for k, v in pairs(CFG) do
+		if type(v) == "boolean" and v then
+			panicSnapshot[k] = true
+			CFG[k] = false
+			n = n + 1
+			if _G.QBAim and _G.QBAim.panel and _G.QBAim.panel.controls then
+				local ctl = _G.QBAim.panel.controls[k]
+				if ctl and ctl.Set then pcall(function() ctl:Set(false, false) end) end
+			end
+		end
+	end
+	mode = string.format("PANIC %d toggles off", n)
+	print(string.format("[Slim] panic: %d toggles killed (press again to restore)", n))
+	return true
 end
 
 -- build share: the whole build (settings + playbook) as one paste string your
@@ -195,17 +282,41 @@ local function buildShareString()
 	return HttpService:JSONEncode(payload)
 end
 
+-- short share: only the keys that drifted off stock + the playbook. small
+-- enough to ride in a few chat messages, which is what team sync uses.
+local function buildShortShare()
+	local payload = { v = "s", d = {}, routes = {} }
+	for k, v in pairs(CFG) do
+		if CFG_STOCK[k] ~= v then payload.d[k] = v end
+	end
+	for i = 1, 3 do
+		if hotRoutes[i] then payload.routes[tostring(i)] = hotRoutes[i] end
+	end
+	return HttpService:JSONEncode(payload)
+end
+
 local function applyShareString(text)
 	local ok, data = pcall(function() return HttpService:JSONDecode(text) end)
 	if not ok or type(data) ~= "table" then return false end
 	local got = 0
-	if type(data.cfg) == "table" then
+	-- full share carries cfg{}; a short share carries d{} (diff vs stock).
+	-- both validate every key against the live table before writing.
+	if type(data.cfg) ~= "table" and type(data.d) == "table" and data.v == "s" then
+		for k, v in pairs(data.d) do
+			if type(v) == type(CFG[k]) then
+				CFG[k] = v
+				got = got + 1
+			end
+		end
+	elseif type(data.cfg) == "table" then
 		for k, v in pairs(data.cfg) do
 			if type(v) == type(CFG[k]) then
 				CFG[k] = v
 				got = got + 1
 			end
 		end
+	else
+		return false
 	end
 	if type(data.routes) == "table" then
 		for i, r in pairs(data.routes) do
@@ -217,6 +328,139 @@ local function applyShareString(text)
 		end
 	end
 	return got > 0
+end
+
+--// team build sync ------------------------------------------------------------
+-- the short build code rides through chat in a few tagged chunks
+-- ("SlimBuild 2/5 <data>"). anyone else running the panel with sync on
+-- reassembles them live and applies the build - no clipboard, no paste.
+local CODE_TAG = "SlimBuild"
+local chatConns = {}
+local chatBuffer = {}
+local chatLastApply = 0
+
+local function chatChunks(code)
+	local n = math.ceil(#code / 170)
+	n = math.clamp(n, 1, 30)
+	local out = {}
+	for i = 1, n do
+		local s0 = (i - 1) * 170 + 1
+		out[#out + 1] = string.format("%s %d/%d %s", CODE_TAG, i, n, code:sub(s0, math.min(#code, s0 + 169)))
+	end
+	return out
+end
+
+local function pruneChatBuffer(now)
+	for key, buf in pairs(chatBuffer) do
+		if now - buf.at > 25 then chatBuffer[key] = nil end
+	end
+end
+
+local function chatTargetChannel()
+	local tcs = game:GetService("TextChatService")
+	local channels = tcs:FindFirstChild("TextChannels")
+	if not channels then return nil end
+	local fallback = nil
+	for _, ch in ipairs(channels:GetChildren()) do
+		if ch:IsA("TextChannel") then
+			local lower = ch.Name:lower()
+			if fallback == nil and lower:find("general") then fallback = ch end
+			if lower:find("team") then return ch end
+		end
+	end
+	return fallback
+end
+
+local function sendBuildChat()
+	local code = buildShortShare()
+	local chunks = chatChunks(code)
+	local target = chatTargetChannel()
+	if not target then
+		print("[Slim] chat sync: no TextChannels found")
+		return 0
+	end
+	for _, m in ipairs(chunks) do
+		task.spawn(function()
+			pcall(function() target:SendAsync(m) end)
+		end)
+	end
+	print(string.format("[Slim] build sent over chat (%d msgs)", #chunks))
+	return #chunks
+end
+
+local function handleChatMessage(msg)
+	if not CFG.chatSync then return end
+	local text = ""
+	pcall(function() text = msg.Text or "" end)
+	if #text < 20 or text:sub(1, #CODE_TAG) ~= CODE_TAG then return end
+	pcall(function()
+		if msg.TextSource and msg.TextSource == LocalPlayer then return end
+	end)
+	local i, n = text:match("^" .. CODE_TAG .. " (%d+)/(%d+)")
+	if not i then return end
+	i, n = tonumber(i) or 0, tonumber(n) or 1
+	if i < 1 or n < 1 or n > 32 then return end
+	local chunk = text:sub(#string.format("%s %d/%d ", CODE_TAG, i, n) + 1)
+	local sender = "x"
+	pcall(function()
+		if msg.TextSource then sender = tostring(msg.TextSource.UserId) end
+	end)
+	local now = os.clock()
+	pruneChatBuffer(now)
+	local key = sender .. ":" .. n
+	local buf = chatBuffer[key]
+	if not buf then
+		buf = { parts = {}, n = n, at = now }
+		chatBuffer[key] = buf
+	end
+	buf.parts[i] = chunk
+	buf.at = now
+	local got = 0
+	for j = 1, n do
+		if buf.parts[j] then got = got + 1 end
+	end
+	if got == n and now - chatLastApply > 2 then
+		chatLastApply = now
+		chatBuffer[key] = nil
+		local code = table.concat(buf.parts)
+		if applyShareString(code) then
+			pcall(saveCfg)
+			print(string.format("[Slim] build synced from chat (%d msgs, %.0f chars)", n, #code))
+			local w = _G.QBAim and _G.QBAim.panel
+			if w and w.Notify then
+				pcall(function()
+					w:Notify({ title = "SLIM", content = "build loaded from chat sync", duration = 4 })
+				end)
+			end
+		else
+			print("[Slim] chat sync chunk arrived garbled - ignored")
+		end
+	end
+end
+
+local function bindChatSync()
+	pcall(function()
+		local tcs = game:GetService("TextChatService")
+		local channels = tcs:FindFirstChild("TextChannels")
+		if not channels then return end
+		for _, ch in ipairs(channels:GetChildren()) do
+			if ch:IsA("TextChannel") then
+				table.insert(chatConns, ch.MessageReceived:Connect(handleChatMessage))
+			end
+		end
+		table.insert(chatConns, channels.ChildAdded:Connect(function(ch)
+			if ch:IsA("TextChannel") then
+				table.insert(chatConns, ch.MessageReceived:Connect(handleChatMessage))
+			end
+		end))
+	end)
+end
+
+local function unbindChatSync()
+	for _, c in ipairs(chatConns) do
+		pcall(function() c:Disconnect() end)
+	end
+	chatConns = {}
 end
 
 local COLORS = {
@@ -270,6 +514,7 @@ local pressing = false
 local pressToken = 0
 local nextTackle = 0
 local nextDive = 0
+local diveLeadAt = nil   -- when the smart dive started steering the lead
 local nextBlock = 0
 local nextJump = 0
 local lastPickRig = nil
@@ -300,6 +545,79 @@ stats.leadSum = stats.leadSum or 0
 local espFolder = Instance.new("Folder")
 espFolder.Name = "SlimEsp"
 espFolder.Parent = Workspace
+
+-- statline card: a small floating HUD with the session's numbers. screen
+-- corner, not a billboard - it stays put while the play runs around it, and
+-- it outlives the Rayfield window if that ever refuses to load.
+local statCardBody, statCardTitle
+local statCardGui = Instance.new("ScreenGui")
+statCardGui.Name = "SlimStatCard"
+statCardGui.ResetOnSpawn = false
+statCardGui.IgnoreGuiInset = true
+statCardGui.DisplayOrder = 9000
+do
+	local ok = pcall(function()
+		statCardGui.Parent = game:GetService("CoreGui")
+	end)
+	if not ok then
+		local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+		if pg then pcall(function() statCardGui.Parent = pg end) end
+	end
+	local card = Instance.new("Frame")
+	card.Name = "Card"
+	card.AnchorPoint = Vector2.new(1, 1)
+	card.Position = UDim2.new(1, -14, 1, -14)
+	card.Size = UDim2.new(0, 208, 0, 78)
+	card.BackgroundColor3 = Color3.fromRGB(16, 18, 24)
+	card.BackgroundTransparency = 0.25
+	card.BorderSizePixel = 0
+	card.Parent = statCardGui
+	pcall(function()
+		local cr = Instance.new("UICorner")
+		cr.CornerRadius = UDim.new(0, 8)
+		cr.Parent = card
+		local cs = Instance.new("UIStroke")
+		cs.Color = Color3.fromRGB(178, 255, 64)
+		cs.Transparency = 0.55
+		cs.Parent = card
+	end)
+	statCardTitle = Instance.new("TextLabel")
+	statCardTitle.Name = "Title"
+	statCardTitle.BackgroundTransparency = 1
+	statCardTitle.Position = UDim2.new(0, 10, 0, 6)
+	statCardTitle.Size = UDim2.new(1, -20, 0, 16)
+	statCardTitle.Font = Enum.Font.Code
+	statCardTitle.TextSize = 13
+	statCardTitle.TextXAlignment = Enum.TextXAlignment.Left
+	statCardTitle.TextColor3 = Color3.fromRGB(178, 255, 64)
+	statCardTitle.Text = "SLIM SESSION"
+	statCardTitle.Parent = card
+	statCardBody = Instance.new("TextLabel")
+	statCardBody.Name = "Body"
+	statCardBody.BackgroundTransparency = 1
+	statCardBody.Position = UDim2.new(0, 10, 0, 24)
+	statCardBody.Size = UDim2.new(1, -20, 1, -30)
+	statCardBody.Font = Enum.Font.Code
+	statCardBody.TextSize = 12
+	statCardBody.TextXAlignment = Enum.TextXAlignment.Left
+	statCardBody.TextYAlignment = Enum.TextYAlignment.Top
+	statCardBody.TextColor3 = Color3.fromRGB(210, 214, 224)
+	statCardBody.TextWrapped = false
+	statCardBody.Text = ""
+	statCardBody.Parent = card
+end
+
+-- rebuild the card's lines. called from the render loop's slow section.
+local function updateStatCard()
+	if not statCardBody then return end
+	statCardBody.Text = string.format(
+		"comps %d/%d (%d%%)\npicks %d | gave %d\ntackles %d | int %d",
+		stats.completions or 0, stats.shots or 0,
+		stats.shots > 0 and math.floor((stats.completions or 0) / stats.shots * 100 + 0.5) or 0,
+		stats.picks or 0, stats.picked or 0,
+		stats.tackles or 0, stats.intercepts or 0)
+	pcall(function() statCardGui.Enabled = CFG.statCard == true end)
+end
 
 --// world helpers -------------------------------------------------------------
 
@@ -705,7 +1023,8 @@ local function requestThrow()
 	if now - lastManual < 0.3 then return false end
 	if (CFG.pumpFake or CFG.fakeSpike or CFG.fakeFumble) and (hasBall() or canThrow()) then
 		-- pump fake: hold the fake, then let it fly. fake spike: shorter hold,
-		-- fumble bait: looks loose, fires a beat later.
+		-- fumble bait: looks loose, fires a beat later. while the fake holds,
+		-- cancel is possible (throwing flips false), which is what skips it.
 		throwing = true
 		lastManual = now
 		local hold = CFG.pumpDelay or 0.85
@@ -713,7 +1032,28 @@ local function requestThrow()
 		if CFG.fakeSpike then hold = 0.3 mode = "fake spike" end
 		if CFG.fakeFumble then hold = 0.45 mode = "fumble bait" end
 		task.delay(hold, function()
-			if not throwing then
+			if throwing then
+				throwing = false
+				local e = currentEntry
+				if e then
+					local ok, err = pcall(doThrow, e)
+					if not ok then mode = "err: " .. tostring(err):sub(1, 40) end
+				end
+			end
+		end)
+		return true
+	end
+	-- auto pump: the coach call matters live. pocket coverage - the defender
+	-- is inside 2.5 studs - buys a beat of fake before the commit, staged
+	-- through the same fake pipeline so free throws still read as fakes.
+	local entry0 = currentEntry
+	if CFG.autoPump and entry0 and entry0.cover
+		and (entry0.coverGap or math.huge) < 2.5 and (hasBall() or canThrow()) then
+		throwing = true
+		lastManual = now
+		mode = "auto pump (pocket)"
+		task.delay(0.5, function()
+			if throwing then
 				throwing = false
 				local e = currentEntry
 				if e then
@@ -801,6 +1141,22 @@ local aimMark = newMark("Aim", COLORS.aim)
 local carrierMark = newMark("Carrier", COLORS.carrier)
 local threatMark = newMark("Threat", COLORS.threat)
 local catchMark = newMark("Catch", Color3.fromRGB(178, 255, 64))
+local magnetMark = newMark("MAGNET", Color3.fromRGB(90, 170, 255))
+
+-- ball magnet target: a small floating neon target at the ball's landing point,
+-- so you can see exactly where the magnet is pulling you.
+local magnetPart = Instance.new("Part")
+magnetPart.Name = "SlimMagnet"
+magnetPart.Anchored = true
+magnetPart.CanCollide = false
+magnetPart.CanQuery = false
+magnetPart.CanTouch = false
+magnetPart.CastShadow = false
+magnetPart.Material = Enum.Material.Neon
+magnetPart.Color = Color3.fromRGB(90, 170, 255)
+magnetPart.Transparency = 1
+magnetPart.Size = Vector3.new(1.6, 0.1, 1.6)
+magnetPart.Parent = espFolder
 
 -- pass preview: one neon beam from the release point to the landing spot,
 -- recolored by catch chance every frame
@@ -816,6 +1172,85 @@ arcPart.Color = Color3.fromRGB(178, 255, 64)
 arcPart.Transparency = 1
 arcPart.Size = Vector3.new(0.14, 0.14, 1)
 arcPart.Parent = espFolder
+
+-- ghost route: one neon line from the pick to where his run actually goes,
+-- so the throw point reads as where he WILL be, not where he stands
+local ghostPart = Instance.new("Part")
+ghostPart.Name = "SlimGhost"
+ghostPart.Anchored = true
+ghostPart.CanCollide = false
+ghostPart.CanQuery = false
+ghostPart.CanTouch = false
+ghostPart.CastShadow = false
+ghostPart.Material = Enum.Material.Neon
+ghostPart.Color = Color3.fromRGB(90, 170, 255)
+ghostPart.Transparency = 1
+ghostPart.Size = Vector3.new(0.1, 0.1, 1)
+ghostPart.Parent = espFolder
+
+-- coverage heat: a snapping 7x7 grid of tiles painted around the pick, red
+-- where the defenders cluster. pure paint - the sim never reads these. the
+-- throttled update rides the render frame.
+local heatTiles = {}
+local lastHeatAt = 0
+for ti = 1, 49 do
+	local tile = Instance.new("Part")
+	tile.Name = "SlimHeat"
+	tile.Anchored = true
+	tile.CanCollide = false
+	tile.CanQuery = false
+	tile.CanTouch = false
+	tile.CastShadow = false
+	tile.Material = Enum.Material.Neon
+	tile.Size = Vector3.new(5.7, 0.06, 5.7)
+	tile.Transparency = 1
+	tile.Parent = espFolder
+	heatTiles[ti] = tile
+end
+
+-- replay trail: sample the run-back while the ball is ours, repaint it as
+-- neon dots when the play ends. 7s of ghost history, then it clears itself.
+local trailPts = {}
+local trailLast = 0
+local trailArmed = false
+local function drawTrail(now)
+	if #trailPts < 2 then return end
+	local folder = Instance.new("Folder")
+	folder.Name = "SlimTrail"
+	folder.Parent = espFolder
+	local step = math.max(1, math.floor(#trailPts / 40))
+	for i = 1, #trailPts, step do
+		local dot = Instance.new("Part")
+		dot.Anchored = true
+		dot.CanCollide = false
+		dot.CanQuery = false
+		dot.CanTouch = false
+		dot.CastShadow = false
+		dot.Material = Enum.Material.Neon
+		dot.Size = Vector3.new(0.5, 0.5, 0.5)
+		dot.Color = Color3.fromRGB(120, 255, 160)
+		dot.Transparency = 0.3 + 0.45 * (i / #trailPts)
+		dot.Position = trailPts[i]
+		dot.Parent = folder
+	end
+	local endDot = Instance.new("Part")
+	endDot.Anchored = true
+	endDot.CanCollide = false
+	endDot.CanQuery = false
+	endDot.CanTouch = false
+	endDot.CastShadow = false
+	endDot.Material = Enum.Material.Neon
+	endDot.Size = Vector3.new(1.4, 1.4, 1.4)
+	endDot.Color = Color3.fromRGB(255, 90, 90)
+	endDot.Transparency = 0.25
+	endDot.Position = trailPts[#trailPts] + Vector3.new(0, 1.2, 0)
+	endDot.Parent = folder
+	task.delay(7, function()
+		pcall(function() folder:Destroy() end)
+	end)
+	-- keep the sampled run-back visible to the debugger too
+	trailPts = {}
+end
 
 local function markOff(m)
 	if not m or not m.rig then return end
@@ -875,8 +1310,11 @@ local function press(action, seconds)
 	action:Fire(true)
 	task.spawn(function()
 		task.wait(seconds)
+		-- a newer press takes the release slot, but its own hold must still
+		-- end: our earlier design skipped this release and the held action
+		-- leaked (tackle pinned in state 3 until the panel unloaded)
+		pcall(function() action:Fire(false) end)
 		if token == pressToken then
-			action:Fire(false)
 			pressing = false
 		end
 	end)
@@ -885,10 +1323,59 @@ end
 
 local function releaseAction()
 	pressToken = pressToken + 1
-	if pressing then
-		pressing = false
-		Tackle:Fire(false)
+	pressing = false
+	-- release everything the panel could have held: an unload mid-press used
+	-- to leak the action into the sim and freeze tackle/dive/speed channels
+	for _, a in ipairs({ Tackle, Dive, Jump }) do
+		if a then
+			pcall(function() a:Fire(false) end)
+		end
 	end
+end
+
+-- watched tackle hold: same guard grammar as press(), but the hold watches
+-- its own resale value. a full burn of the hold window is dead time the sim
+-- sits in the tackle drive branch (which also parks the cruise speed law),
+-- so the release fires the moment the result is known:
+--   landed  -> the carrier lost the ball while we were wrapping up
+--   whiffed -> he beat us out of reach, stop holding an empty button
+--   knocked -> we went down, a held press would just leak
+local function tacklePress(mine)
+	if pressing then return false end
+	pressing = true
+	pressToken = pressToken + 1
+	local token = pressToken
+	Tackle:Fire(true)
+	local started = os.clock()
+	task.spawn(function()
+		while true do
+			task.wait(0.06)
+			if pressToken ~= token then return end -- a newer press owns release
+			local elapsed = os.clock() - started
+			local c = carrier()
+			local croot = c and c.PrimaryPart
+			local myRoot = mine and mine.PrimaryPart
+			if not myRoot or not croot or elapsed >= CFG.tackleHold then
+				break
+			end
+			-- landed: the carry is dead while the wrap is still on
+			local landed = croot:GetAttribute("HasBall") ~= true
+			-- whiffed: he beat us out of reach, don't burn the rest of it
+			local reach = math.max(CFG.tackleRange, CFG.diveRange or 0) + 4
+			local whiffed = (croot.Position - myRoot.Position).Magnitude > reach
+			-- knocked: eating a truck freezes the hold silently otherwise
+			local knocked = mine:GetAttribute("Frozen") == true
+				or (myRoot:GetAttribute("Down") == true)
+			if landed or whiffed or knocked then
+				break
+			end
+		end
+		pcall(function() Tackle:Fire(false) end)
+		if token == pressToken then
+			pressing = false
+		end
+	end)
+	return true
 end
 
 --// hit pop + anti-fall -------------------------------------------------------
@@ -955,15 +1442,36 @@ local function triggerPop(strength)
 	end)
 end
 
--- the QB holding the ball never gets the fall state knocked into him. the
--- block drives the hit instead of the ragdoll, this is the backstop.
+local antiFallRig = nil    -- rig model the cache was built for
+local antiFallTargets = {} -- that rig's base parts, walked once per life
+
+-- anti fall: rigs have no humanoid, so knockback lives in attributes.
+-- frozen (on the rig) locks all input, down (on the pelvis) parks you on the
+-- ground, truck time spikes you into the dirt. with anti fall on we clear
+-- all three every frame so nothing can pin you -- no one can move you -- and
+-- if something slips through between frames we clear it the very next frame,
+-- which is the auto get up. runs on both render and heartbeat so the sim
+-- can't re-pin you between renders. targets are cached per rig life.
 local function refreshAntiFall()
-	if not myRig() then return end
-	local hum = myRig():FindFirstChildOfClass("Humanoid")
-	if not hum then return end
-	pcall(function()
-		hum:SetStateEnabled(Enum.HumanoidStateType.Falling, not (CFG.antiFall and hasBall()))
-	end)
+	if not CFG.antiFall then return end
+	local mine = myRig()
+	if not mine then return end
+	if mine ~= antiFallRig then
+		pcall(function()
+			antiFallTargets = { mine }
+			for _, p in ipairs(mine:GetDescendants()) do
+				if p:IsA("BasePart") then
+					antiFallTargets[#antiFallTargets + 1] = p
+				end
+			end
+			antiFallRig = mine
+		end)
+	end
+	for _, t in ipairs(antiFallTargets) do
+		pcall(function() t:SetAttribute("Frozen", false) end)
+		pcall(function() t:SetAttribute("Down", false) end)
+		pcall(function() t:SetAttribute("TruckTime", 0) end)
+	end
 end
 
 -- one writer for Steer, so pursuit and block drive can never fight
@@ -992,12 +1500,84 @@ local function driveTo(worldDir)
 	steerTarget = Vector2.zero
 end
 
+-- ball magnet: when the ball is in the air and uncarried, steer straight at
+-- its landing point so you're under it when it comes down. reads LandingPoint
+-- from the sim's own ball attributes. returns a world-space direction, or nil.
+local function magnetSteer(now, ball, myRoot)
+	if not CFG.catchMagnet then return nil end
+	if not ball or not myRoot then return nil end
+	if ball:GetAttribute("InFlight") ~= true then return nil end
+	if (ball:GetAttribute("CarrierUserId") or 0) ~= 0 then return nil end
+	local lp = ball:GetAttribute("LandingPoint")
+	if typeof(lp) ~= "Vector3" then return nil end
+	local dist = (lp - myRoot.Position).Magnitude
+	if dist > CFG.magnetRadius then return nil end
+	-- lead: arrive a beat before the ball lands, not exactly as it touches
+	local target = lp
+	if CFG.magnetLead then
+		local nowTs = workspace:GetServerTimeNow()
+		local lat = ball:GetAttribute("LandingAt") or 0
+		local remaining = math.max(lat - nowTs, 0)
+		if remaining > 0.15 then
+			local bv = ball.AssemblyLinearVelocity
+			local bFlat = Vector3.new(bv.X, 0, bv.Z)
+			if bFlat.Magnitude > 1 then
+				local leadAmt = bFlat.Magnitude * math.min(remaining * 0.5, 0.35)
+				target = lp + bFlat.Unit * leadAmt
+			end
+		end
+	end
+	local dir = (target - myRoot.Position).Unit
+	return dir
+end
+
 local function pumpSteer(now)
 	if now - lastSteer < 1 / CFG.steerHz then return end
 	lastSteer = now
 	if (steerTarget - steerVec).Magnitude > 0.05 then
 		steerVec = steerTarget
 		Steer:Fire(steerVec)
+	end
+end
+
+-- speed: ReplicatedFirst.RigSim reads Types.speedPenalty(rig) at every drive
+-- tick and subtracts it from a flat 24-25 st/s cruise. require() returns the
+-- same module table the sim is already reading through, so one patched penaly
+-- function is the clean channel: no force fights, no balance loss, no
+-- compounding. the patch is live per tick, so the slider moves the cruise in
+-- real time, the original function is kept and restored on unload, and with
+-- speed off the patch just calls straight through.
+local speedTypes
+local origPenalty
+do
+	local ok, sim = pcall(require, ReplicatedFirst:WaitForChild("RigSim"))
+	if ok and type(sim) == "table" and type(sim.Types) == "table"
+		and type(sim.Types.speedPenalty) == "function" then
+		speedTypes = sim.Types
+		origPenalty = sim.Types.speedPenalty
+		speedTypes.speedPenalty = function(rig)
+			-- mult maps 1.0 -> no bias, 1.2 -> about +5 st/s, 1.5 -> +12.5.
+			-- rush adds its own +5 even with speed off: pursuit gets real pace.
+			local bias = 0
+			if CFG.speed then
+				bias = math.max(0, (tonumber(CFG.speedMult) or 1) - 1) * 25
+			end
+			if rushOn and CFG.rushSurge then
+				bias = bias + 5
+			end
+			if bias <= 0.001 then
+				return origPenalty(rig)
+			end
+			return origPenalty(rig) - bias
+		end
+	end
+end
+
+local function unpatchSpeed()
+	if speedTypes and origPenalty then
+		pcall(function() speedTypes.speedPenalty = origPenalty end)
+		origPenalty = nil
+		speedTypes = nil
 	end
 end
 
@@ -1039,6 +1619,7 @@ local radarRings = {}
 local lastRadar = 0
 local lastPickAt = 0
 local leadConn
+local antiFallConn
 
 local shutOnce = false
 local shutdown
@@ -1046,10 +1627,13 @@ shutdown = function()
 	if shutOnce then return end
 	shutOnce = true
 	pcall(saveCfg)
+	unpatchSpeed()
 	pcall(function() RunService:UnbindFromRenderStep("SlimPanel") end)
 	if leadConn then pcall(function() leadConn:Disconnect() end) end
+	if antiFallConn then pcall(function() antiFallConn:Disconnect() end) end
 	releaseAction()
 	pcall(function() Steer:Fire(Vector2.zero) end)
+	unbindChatSync()
 	_G.QBAim = nil
 	_G.Slim = nil
 	markOff(aimMark)
@@ -1059,6 +1643,10 @@ shutdown = function()
 		pcall(function() v:Destroy() end)
 	end
 	pcall(function() espFolder:Destroy() end)
+	if statCardGui then
+		pcall(function() statCardGui:Destroy() end)
+	end
+	panicRestore() -- an unload is not a panic: bring everything back anyway
 	if window then
 		pcall(function() window:Unload() end)
 		pcall(function()
@@ -1203,6 +1791,7 @@ local function buildUI()
 
 	section(window, "SYS")
 	local liveTab = window:CreateTab({ name = "LIVE" })
+	local catchTab = window:CreateTab({ name = "CATCH" })
 
 	-- aim ---------------------------------------------------------------------
 
@@ -1459,6 +2048,14 @@ local function buildUI()
 	})
 
 	aimTab:CreateToggle({
+		name = "auto pump",
+		description = "pocket coverage under 2.5 st buys a free fake first",
+		flag = "autoPump",
+		value = CFG.autoPump,
+		callback = function(v) CFG.autoPump = v end,
+	})
+
+	aimTab:CreateToggle({
 		name = "fake spike",
 		description = "spike it, then throw the fake",
 		flag = "fakeSpike",
@@ -1647,10 +2244,68 @@ local function buildUI()
 		value = CFG.pursue,
 		callback = function(v) CFG.pursue = v end,
 	})
+	tackleRow:CreateToggle({
+		name = "tackle lead",
+		description = "chase the intercept point instead of the body",
+		flag = "tackleLead",
+		value = CFG.tackleLead,
+		callback = function(v) CFG.tackleLead = v end,
+	})
+	tackleRow:CreateToggle({
+		name = "dodge truck",
+		description = "sidestep the truck spike instead of eating it",
+		flag = "dodgeTruck",
+		value = CFG.dodgeTruck,
+		callback = function(v) CFG.dodgeTruck = v end,
+	})
+	tackleRow:CreateToggle({
+		name = "swarm",
+		description = "gang tackle: take the escape lane when a mate has him",
+		flag = "swarm",
+		value = CFG.swarm,
+		callback = function(v) CFG.swarm = v end,
+	})
+	tackleRow:CreateButton({
+		name = "teleport → tackle",
+		description = "snap right on top of the enemy carrier",
+		callback = function()
+			local c = carrier()
+			local r = myRig()
+			if not c or not c.PrimaryPart or not r or not r.PrimaryPart then return end
+			if teamOf(c) == myTeam() then return end -- only enemy carriers
+			local off = Vector3.new(0, CFG.tackleTeleY or 2, 0)
+			pcall(function() r.PrimaryPart.CFrame = CFrame.new(c.PrimaryPart.Position + off) end)
+			mode = "teleported to tackle"
+		end,
+	})
+	tackleRow:CreateSlider({
+		name = "tackle tele height",
+		description = "studs above the carrier when you land",
+		range = { 1, 8 },
+		increment = 0.5,
+		value = CFG.tackleTeleY,
+		suffix = " st",
+		flag = "tackleTeleY",
+		callback = function(v) CFG.tackleTeleY = v end,
+	})
+	tackleRow:CreateToggle({
+		name = "auto dive",
+		description = "lunge at the carrier from the band between the ranges",
+		flag = "dive",
+		value = CFG.dive,
+		callback = function(v) CFG.dive = v end,
+	})
+	tackleRow:CreateToggle({
+		name = "dive lead",
+		description = "spend a beat steering at where the carrier will be first",
+		flag = "diveLead",
+		value = CFG.diveLead,
+		callback = function(v) CFG.diveLead = v end,
+	})
 
 	antiFallToggle = tackleRow:CreateToggle({
 		name = "anti fall",
-		description = "qb carrier never gets knocked down while holding the ball",
+		description = "clear frozen/down/truck every frame: no one can move you, auto get up if they do",
 		flag = "antiFall",
 		value = CFG.antiFall,
 		callback = function(v) CFG.antiFall = v end,
@@ -1662,6 +2317,41 @@ local function buildUI()
 		flag = "escapeJuke",
 		value = CFG.escapeJuke,
 		callback = function(v) CFG.escapeJuke = v end,
+	})
+	tackleRow:CreateToggle({
+		name = "juke bait",
+		description = "one hard burst sidestep timed to the tackle closing",
+		flag = "jukeBait",
+		value = CFG.jukeBait,
+		callback = function(v) CFG.jukeBait = v end,
+	})
+
+	section(tackleTab, "MOVEMENT")
+
+	local moveRow = groupOf(tackleTab)
+	moveRow:CreateToggle({
+		name = "speed",
+		description = "raises the cruise the sim drives toward",
+		flag = "speed",
+		value = CFG.speed,
+		callback = function(v) CFG.speed = v end,
+	})
+	moveRow:CreateSlider({
+		name = "speed mult",
+		description = "1.15 = about +4 st/s | 1.5+ gets loud",
+		range = { 1, 1.6 },
+		increment = 0.05,
+		value = CFG.speedMult,
+		suffix = "x",
+		flag = "speedMult",
+		callback = function(v) CFG.speedMult = v end,
+	})
+	moveRow:CreateToggle({
+		name = "rush surge",
+		description = "tackle/block drive adds +5 st/s, even with speed off",
+		flag = "rushSurge",
+		value = CFG.rushSurge,
+		callback = function(v) CFG.rushSurge = v end,
 	})
 
 	section(tackleTab, "DEFENSE ASSIST")
@@ -1724,6 +2414,7 @@ local function buildUI()
 
 	tackleTab:CreateSlider({
 		name = "dive range",
+		description = "won't shrink below the tackle reach",
 		range = { 6, 20 },
 		increment = 0.5,
 		value = CFG.diveRange,
@@ -1778,6 +2469,13 @@ local function buildUI()
 		flag = "drive",
 		value = CFG.drive,
 		callback = function(v) CFG.drive = v end,
+	})
+	blockRow:CreateToggle({
+		name = "meat shield",
+		description = "sit in the seam between carrier and his two hunters",
+		flag = "meatShield",
+		value = CFG.meatShield,
+		callback = function(v) CFG.meatShield = v end,
 	})
 
 	blockTab:CreateSlider({
@@ -1865,6 +2563,20 @@ local function buildUI()
 		flag = "passArc",
 		value = CFG.passArc,
 		callback = function(v) CFG.passArc = v end,
+	})
+	espRow:CreateToggle({
+		name = "ghost route",
+		description = "neon line to where the pick will actually be",
+		flag = "ghostRoute",
+		value = CFG.ghostRoute,
+		callback = function(v) CFG.ghostRoute = v end,
+	})
+	espRow:CreateToggle({
+		name = "coverage heat",
+		description = "7x7 grid around the pick, red where defenders cluster",
+		flag = "coverHeat",
+		value = CFG.coverHeat,
+		callback = function(v) CFG.coverHeat = v end,
 	})
 
 	lookTab:CreateColorPicker({
@@ -2091,6 +2803,33 @@ local function buildUI()
 		})
 	end)
 
+	liveTab:CreateToggle({
+		name = "stat card",
+		description = "floating session HUD, bottom right of the screen",
+		flag = "statCard",
+		value = CFG.statCard,
+		callback = function(v)
+			CFG.statCard = v
+			if statCardGui then pcall(function() statCardGui.Enabled = v end) end
+		end,
+	})
+
+	liveTab:CreateToggle({
+		name = "replay trail",
+		description = "neon dots repainting your last run-back when the play ends",
+		flag = "replay",
+		value = CFG.replay,
+		callback = function(v) CFG.replay = v end,
+	})
+
+	liveTab:CreateKeybind({
+		name = "panic key",
+		description = "press: kill every toggle | press again: rebuild",
+		value = Enum.KeyCode.P,
+		flag = "panicKey",
+		callback = function() panic() end,
+	})
+
 	section(liveTab, "ENGINE")
 
 	local engineRow = groupOf(liveTab)
@@ -2116,6 +2855,31 @@ local function buildUI()
 	end)
 
 	section(liveTab, "BUILD")
+
+	liveTab:CreateToggle({
+		name = "team sync",
+		description = "auto-load builds friends send through chat (SlimBuild tags)",
+		flag = "chatSync",
+		value = CFG.chatSync,
+		callback = function(v) CFG.chatSync = v end,
+	})
+
+	liveTab:CreateButton({
+		name = "build -> team chat",
+		description = "short build code in a few chat messages",
+		callback = function()
+			local sent = sendBuildChat()
+			if sent == 0 then
+				pcall(function()
+					window:Notify({ title = "SLIM", content = "no chat channel found", duration = 4 })
+				end)
+			else
+				pcall(function()
+					window:Notify({ title = "SLIM", content = string.format("build sent (%d msgs)", sent), duration = 4 })
+				end)
+			end
+		end,
+	})
 
 	liveTab:CreateButton({
 		name = "copy build",
@@ -2202,6 +2966,122 @@ local function buildUI()
 
 	section(liveTab, "CONSOLE")
 	statusBox = liveTab:CreateConsole({ name = "", height = 210, follow = false })
+
+	-- catch --------------------------------------------------------------------
+	section(catchTab, "BALL MAGNET")
+
+	catchTab:CreateToggle({
+		name = "ball magnet",
+		description = "steer straight at the ball's landing point while it's in flight",
+		flag = "catchMagnet",
+		value = CFG.catchMagnet,
+		callback = function(v) CFG.catchMagnet = v end,
+	})
+
+	catchTab:CreateSlider({
+		name = "magnet radius",
+		description = "max distance to start pulling toward the landing spot",
+		range = { 10, 50 },
+		increment = 1,
+		value = CFG.magnetRadius,
+		suffix = " st",
+		flag = "magnetRadius",
+		callback = function(v) CFG.magnetRadius = v end,
+	})
+
+	catchTab:CreateToggle({
+		name = "magnet lead",
+		description = "arrive a beat before the ball lands, not exactly on it",
+		flag = "magnetLead",
+		value = CFG.magnetLead,
+		callback = function(v) CFG.magnetLead = v end,
+	})
+
+	catchTab:CreateToggle({
+		name = "magnet catch",
+		description = "auto dive at the very end of the flight to make the grab",
+		flag = "magnetCatch",
+		value = CFG.magnetCatch,
+		callback = function(v) CFG.magnetCatch = v end,
+	})
+
+	catchTab:CreateSlider({
+		name = "magnet speed",
+		description = "steer strength while the magnet is active",
+		range = { 0.2, 1.0 },
+		increment = 0.05,
+		value = CFG.magnetSpeed,
+		suffix = "x",
+		flag = "magnetSpeed",
+		callback = function(v) CFG.magnetSpeed = v end,
+	})
+
+	catchTab:CreateButton({
+		name = "teleport ball → me",
+		description = "instant: loose ball snaps to your rig",
+		callback = function()
+			local b = ballPart()
+			local r = myRig()
+			if not b or not r or not r.PrimaryPart then return end
+			if (b:GetAttribute("CarrierUserId") or 0) ~= 0 then return end
+			local target = r.PrimaryPart.Position + Vector3.new(0, CFG.ballToMeY or 4, 0)
+			pcall(function() b.CFrame = CFrame.new(target) end)
+			pcall(function() b.AssemblyLinearVelocity = Vector3.zero end)
+			mode = "ball teleported to me"
+		end,
+	})
+
+	catchTab:CreateToggle({
+		name = "keep ball on me",
+		description = "continuously teleport the loose ball to your rig",
+		flag = "ballToMe",
+		value = CFG.ballToMe,
+		callback = function(v) CFG.ballToMe = v end,
+	})
+
+	catchTab:CreateSlider({
+		name = "ball height",
+		description = "studs above you when it lands",
+		range = { 2, 12 },
+		increment = 0.5,
+		value = CFG.ballToMeY,
+		suffix = " st",
+		flag = "ballToMeY",
+		callback = function(v) CFG.ballToMeY = v end,
+	})
+
+	catchTab:CreateButton({
+		name = "teleport → play",
+		description = "you snap to the ball or carrier",
+		callback = function()
+			local b = ballPart()
+			local c = carrier()
+			local r = myRig()
+			if not r or not r.PrimaryPart then return end
+			local target = nil
+			if c and c.PrimaryPart then
+				target = c.PrimaryPart.Position
+			elseif b then
+				target = b.Position
+			else
+				return
+			end
+			local off = Vector3.new(0, CFG.teleOffset or 6, 0)
+			pcall(function() r.PrimaryPart.CFrame = CFrame.new(target + off) end)
+			mode = "teleported to play"
+		end,
+	})
+
+	catchTab:CreateSlider({
+		name = "teleport offset",
+		description = "studs above the ball when you land",
+		range = { 2, 12 },
+		increment = 0.5,
+		value = CFG.teleOffset,
+		suffix = " st",
+		flag = "teleOffset",
+		callback = function(v) CFG.teleOffset = v end,
+	})
 
 	-- first-run briefing: what is running, and the four binds. once per client
 	-- session, so reloading while tuning does not shove a card in your face.
@@ -2359,7 +3239,7 @@ local function guardTick(now, mine, myRoot)
 	local ball = ballPart()
 	if not ball or ball:GetAttribute("InFlight") ~= true then return nil, nil end
 	if myLastThrowAt > 0 and now - myLastThrowAt < 5 then return nil, nil end
-	local spot = ball:GetAttribute("LandedAt")
+	local spot = ball:GetAttribute("LandingPoint")
 	local target = typeof(spot) == "Vector3" and spot or ball.Position
 	local myT = myTeam()
 	local best, bestD
@@ -2446,7 +3326,7 @@ local function interceptTick(now, mine, myRoot)
 	if ball:GetAttribute("InFlight") ~= true and ball:GetAttribute("Loose") ~= true then
 		return nil, nil
 	end
-	local spot = ball:GetAttribute("LandedAt")
+	local spot = ball:GetAttribute("LandingPoint")
 	local target = typeof(spot) == "Vector3" and spot or ball.Position
 	local flat = Vector3.new(target.X - myRoot.Position.X, 0, target.Z - myRoot.Position.Z)
 	local d = flat.Magnitude
@@ -2495,22 +3375,133 @@ local function tackleTick(now, mine, myRoot, carrierRig)
 		return nil, string.format("carrier %.1f (not eligible)", dist)
 	end
 
-	if dist <= CFG.tackleRange and now >= nextTackle then
-		nextTackle = now + CFG.tackleCd
-		press(Tackle, CFG.tackleHold)
-		triggerPop(0.9)
-		stats.tackles = stats.tackles + 1
-		return nil, string.format("tackle %.1f", dist)
-	elseif CFG.dive and dist <= CFG.diveRange and dist > CFG.tackleRange and now >= nextDive then
-		nextDive = now + CFG.tackleCd * 1.5
-		press(Dive, 0.12)
-		return nil, string.format("dive %.1f", dist)
+	-- truck dodge: a trucking carrier is tackle-immune and knock-hard for
+	-- the spike's life. his pelvis announces the windup (TruckTime ramps),
+	-- so side-step the lean direction and come back when he's spent.
+	if CFG.dodgeTruck and dist < 7 then
+		local tt = root:GetAttribute("TruckTime") or 0
+		if tt > 0 and tt < 1.2 then
+			local away = myRoot.Position - root.Position
+			local awu = Vector3.new(away.X, 0, away.Z)
+			if awu.Magnitude > 0.3 then
+				local lat = Vector3.new(-awu.Z, 0, awu.X)
+				-- dodge the shoulder he's leaning into
+				local lean = root.CFrame.RightVector
+				local side = lat.Unit
+				if side:Dot(lean) > 0 then side = -side end
+				local dir = (awu.Unit * 0.55 + side).Unit
+				if CFG.pathing then dir = avoidBlockers(myRoot, dir, carrierRig) end
+				return dir, string.format("dodge truck %.1f", dist)
+			end
+		end
+	end
+
+	-- engage: in reach now, or cross into reach inside the next beat. the
+	-- second arm stops the dead cycle of firing at a ghost, eating the
+	-- cooldown, and watching the carrier run through the empty window.
+	local dirToHim = delta / math.max(0.01, dist)
+	local relVel = root.AssemblyLinearVelocity - myRoot.AssemblyLinearVelocity
+	local closing = relVel:Dot(dirToHim) -- positive = gap shrinking
+	local inReach = dist <= CFG.tackleRange
+		or (closing > 4 and dist <= CFG.tackleRange + closing * 0.09)
+	if inReach and now >= nextTackle then
+		if tacklePress(mine) then
+			nextTackle = now + CFG.tackleCd
+			triggerPop(0.9)
+			stats.tackles = stats.tackles + 1
+			return nil, string.format("tackle %.1f", dist)
+		end
+		-- another hold owns the input: keep driving, don't eat the cd empty
+	elseif CFG.dive and now >= nextDive then
+		-- dive reach can never be smaller than the tackle reach: if the two
+		-- sliders touch, the band in between vanishes and the dive never fires
+		local diveReach = math.max(CFG.diveRange, CFG.tackleRange + 4)
+		if dist <= diveReach and dist > CFG.tackleRange then
+			-- smart dive lead: a dive committed at a cutting runner dies in
+			-- the grass. steer at where he WILL be, fire once pointed there,
+			-- and a dwell cap still bites throwers who keep juking forever.
+			local vFlat = Vector3.zero
+			if CFG.diveLead then
+				local cv = root.AssemblyLinearVelocity
+				vFlat = Vector3.new(cv.X, 0, cv.Z)
+			end
+			if CFG.diveLead and vFlat.Magnitude > 3 then
+				local leadAmt = vFlat.Magnitude * (CFG.diveLeadTime or 0.22)
+				local leadPt = root.Position + vFlat.Unit * leadAmt
+				local dd = leadPt - myRoot.Position
+				local dflat = Vector3.new(dd.X, 0, dd.Z)
+				if dflat.Magnitude > 1.2 then
+					local aim = dflat.Unit
+					local look = myRoot.CFrame.LookVector
+					local faceFlat = Vector3.new(look.X, 0, look.Z)
+					local dot = faceFlat.Magnitude > 0.1 and faceFlat.Unit:Dot(aim) or 1
+					local dwellOk = not diveLeadAt or (now - diveLeadAt) > 0.45
+					if dot > 0.9 or dwellOk then
+						diveLeadAt = nil
+						nextDive = now + CFG.tackleCd * 1.5
+						press(Dive, 0.12)
+						return nil, string.format("dive led %.1f", dist)
+					end
+					if not diveLeadAt then diveLeadAt = now end
+					return aim, string.format("dive lead %.1f", dist)
+				end
+			end
+			diveLeadAt = nil
+			nextDive = now + CFG.tackleCd * 1.5
+			press(Dive, 0.12)
+			return nil, string.format("dive %.1f", dist)
+		end
+		diveLeadAt = nil -- slid out of the band: drop the lead, drive under him
 	end
 
 	if CFG.pursue and dist > CFG.tackleRange * 0.75 then
 		local flat = Vector3.new(delta.X, 0, delta.Z)
 		if flat.Magnitude > 0.5 then
 			local dir = flat.Unit
+			-- intercept chase: aim up his future spot. straightlining at his
+			-- body refunds him a step every plant; a runner almost never
+			-- outsprints another runner who took his angle early.
+			if CFG.tackleLead then
+				local cv = root.AssemblyLinearVelocity
+				local vFlat = Vector3.new(cv.X, 0, cv.Z)
+				local along = dir:Dot(vFlat.Unit)
+				if vFlat.Magnitude > 2 and along > 0.25 then
+					-- we're chasing his tail, not staring him down: run the
+					-- cut-off. reach time from closing speed joint over both.
+					local myVel = myRoot.AssemblyLinearVelocity
+					local mySpd = Vector3.new(myVel.X, 0, myVel.Z).Magnitude
+					if mySpd < 12 then mySpd = 24 end -- standing: plan for cruise
+					local closingSpd = math.max(6, mySpd + vFlat.Magnitude * along)
+					local tHit = flat.Magnitude / closingSpd
+					local ahead = root.Position + vFlat.Unit * math.min(vFlat.Magnitude * tHit, 26)
+					local dd = ahead - myRoot.Position
+					local dflat = Vector3.new(dd.X, 0, dd.Z)
+					if dflat.Magnitude > 1 then dir = dflat.Unit end
+				end
+			end
+			-- swarm: a teammate already engaging him means the pile is full.
+			-- take the lane on the far side of the carrier from the mate -
+			-- whoever he juke-bounces off runs straight into us.
+			if CFG.swarm then
+				for _, mate in ipairs(rigs()) do
+					if mate ~= mine and mate.PrimaryPart and teamOf(mate) == myTeam() then
+						local md = (mate.PrimaryPart.Position - root.Position).Magnitude
+						if md < 6 then
+							local runThrough = root.Position - mate.PrimaryPart.Position
+							local rFlat = Vector3.new(runThrough.X, 0, runThrough.Z)
+							if rFlat.Magnitude > 2 then
+								local lane = root.Position + rFlat.Unit * 6
+								local dd = lane - myRoot.Position
+								local dflat = Vector3.new(dd.X, 0, dd.Z)
+								if dflat.Magnitude > 1 then
+									dir = dflat.Unit
+									break
+								end
+							end
+						end
+					end
+				end
+			end
 			if CFG.pathing then dir = avoidBlockers(myRoot, dir, carrierRig) end
 			return dir, string.format("chase %.1f", dist)
 		end
@@ -2573,7 +3564,47 @@ local function blockTick(now, mine, myRoot, ballRig)
 	end
 
 	local dir = nil
-	if CFG.drive then
+	if CFG.meatShield then
+		-- meat shield: instead of matching one threat's lane, sit in the seam
+		-- between the ball carrier and his two nearest hunters. the sitting
+		-- point slides as they move, so the block happens before contact.
+		local carrierRig = ballRig or carrier()
+		if carrierRig and carrierRig.PrimaryPart then
+			local foes = {}
+			for _, rig in ipairs(rigs()) do
+				if rig ~= mine and rig ~= carrierRig then
+					local root = rig.PrimaryPart
+					local frozen = rig:GetAttribute("Frozen") == true
+					local downed = root and root:GetAttribute("Down") == true
+					if teamOf(rig) ~= myTeam() and not frozen and not downed then
+						local d = (root.Position - carrierRig.PrimaryPart.Position).Magnitude
+						foes[#foes + 1] = { rig = rig, d = d }
+					end
+				end
+			end
+			table.sort(foes, function(a, b) return a.d < b.d end)
+			if #foes > 0 then
+				-- nearest hunter weighs double so the lane that bites first wins
+				local dirSum = Vector3.zero
+				local cover = math.min(2, #foes)
+				for i = 1, cover do
+					local fd = foes[i].rig.PrimaryPart.Position - carrierRig.PrimaryPart.Position
+					local flat = Vector3.new(fd.X, 0, fd.Z)
+					if flat.Magnitude > 0.5 then
+						dirSum = dirSum + flat.Unit * (cover + 1 - i)
+					end
+				end
+				if dirSum.Magnitude > 0.5 then
+					local standoff = math.clamp(foes[1].d * 0.5, 4, 8)
+					local seat = carrierRig.PrimaryPart.Position + dirSum.Unit * standoff
+					local delta = seat - myRoot.Position
+					local flat = Vector3.new(delta.X, 0, delta.Z)
+					if flat.Magnitude > 1 then dir = flat.Unit end
+				end
+			end
+		end
+	end
+	if not dir and CFG.drive then
 		local delta = threat.PrimaryPart.Position - myRoot.Position
 		local flat = Vector3.new(delta.X, 0, delta.Z)
 		if flat.Magnitude > 0.4 then dir = flat.Unit end
@@ -2601,6 +3632,8 @@ end
 local lastStatus = 0
 local lastStats = 0
 local lastCfgSave = 0
+local lastStuckRelease = 0
+local jukeDir, jukeUntil, lastJuke = nil, 0, 0
 local bootAt = os.clock()
 local framesSince = 0
 local lastFpsAt = 0
@@ -2788,6 +3821,82 @@ local function renderFrame()
 		end
 	end
 
+	-- ghost route: the continuation of the pick's run to the flight horizon.
+	-- same math the throw solves with, drawn on the field.
+	if ghostPart then
+		local show = entry and CFG.ghostRoute and entry.rig and entry.rig.PrimaryPart
+		if show then
+			local tail = entry.rig.PrimaryPart.Position
+			local t = flightTime((entry.point - origin).Magnitude) + launchLag() + (CFG.horizon or 0)
+			local reach = entry.vel or (entry.point - tail)
+			local endPt = tail + reach.Unit * math.min(t * reach.Magnitude, 130)
+			local delta = endPt - tail
+			if delta.Magnitude > 0.6 and t > 0.05 then
+				ghostPart.Size = Vector3.new(0.1, 0.1, delta.Magnitude)
+				ghostPart.CFrame = CFrame.lookAt(tail + delta * 0.5, endPt)
+				ghostPart.Transparency = 0.55
+			else
+				ghostPart.Transparency = 1
+			end
+		else
+			ghostPart.Transparency = 1
+		end
+	end
+
+	-- coverage heat: 7x7 tiles centred on the pick, red where the defense
+	-- clusters. throttled to 4hz; also the lobby cleanup (no ball, no paint).
+	if now - lastHeatAt > 0.25 then
+		lastHeatAt = now
+		local anchor = entry and entry.rig and entry.rig.PrimaryPart and entry.rig.PrimaryPart.Position
+		for ti = 1, #heatTiles do
+			local tile = heatTiles[ti]
+			if CFG.coverHeat and anchor and ballPart() then
+				local gx = (ti - 1) % 7
+				local gz = math.floor((ti - 1) / 7)
+				local center = anchor + Vector3.new((gx - 3) * 6, -3, (gz - 3) * 6)
+				tile.CFrame = CFrame.new(center)
+				local pressure = 0
+				for _, r in ipairs(allRigs) do
+					if r ~= mine and r.PrimaryPart and teamOf(r) ~= myTeam() then
+						local d = (r.PrimaryPart.Position - center).Magnitude
+						if d < 26 then
+							pressure = pressure + (1 - d / 26)
+						end
+					end
+				end
+				if pressure < 0.12 then
+					tile.Transparency = 1
+				else
+					local t = math.clamp(pressure, 0, 1)
+					tile.Color = Color3.fromRGB(255, math.floor(200 * (1 - t) + 55), math.floor(130 * (1 - t)))
+					tile.Transparency = 0.58 - 0.32 * t
+				end
+			else
+				tile.Transparency = 1
+			end
+		end
+	end
+
+	-- replay: sample the run-back while we carry, repaint on the play's end
+	if CFG.replay and now - trailLast > 0.12 then
+		trailLast = now
+		if myRoot then
+			if hasBall() then
+				if not trailArmed then
+					trailPts = {}
+					trailArmed = true
+				end
+				trailPts[#trailPts + 1] = myRoot.Position
+				if #trailPts > 400 then
+					table.remove(trailPts, 1)
+				end
+			elseif trailArmed then
+				trailArmed = false
+				drawTrail(now)
+			end
+		end
+	end
+
 	-- auto throw. the open gate is a coverage check: a defender inside
 	-- openGate studs of the receiver means the throw is not worth it.
 	if CFG.autoThrow and entry and not throwing and (now - lastThrow) > 1.25 then
@@ -2814,6 +3923,8 @@ local function renderFrame()
 	if ballPart() == nil then
 		markOff(carrierMark)
 		markOff(threatMark)
+		markOff(magnetMark)
+		magnetPart.Transparency = 1
 		blockState = "no ball"
 	else
 		-- a loose or in-flight ball outranks coverage: run under it first
@@ -2840,6 +3951,38 @@ local function renderFrame()
 					tackleState = "juke"
 				end
 			end
+			-- juke bait: a short burst sidestep timed to the hit arriving.
+			-- different lever than escape juke (which is continuous): this is
+			-- one hard flip when a tackler is CLOSING fast, reads as a normal
+			-- cut to the sim, ends quickly so your own pathing resumes.
+			if CFG.jukeBait and hasBall() and now >= jukeUntil and now - lastJuke > 1.6 then
+				local near, nd = nil, math.huge
+				for _, r in ipairs(allRigs) do
+					if r ~= mine and r.PrimaryPart and teamOf(r) ~= myTeam() then
+						local d = (r.PrimaryPart.Position - myRoot.Position).Magnitude
+						if d < nd then
+							near, nd = r, d
+						end
+					end
+				end
+				if near and near.PrimaryPart and nd < 6.5 then
+					local away = myRoot.Position - near.PrimaryPart.Position
+					local awu = Vector3.new(away.X, 0, away.Z)
+					if awu.Magnitude > 0.3 then
+						awu = awu.Unit
+						local closing = (near.PrimaryPart.AssemblyLinearVelocity - myRoot.AssemblyLinearVelocity):Dot(awu)
+						if closing > 6 then
+							local lat = Vector3.new(-awu.Z, 0, awu.X).Unit
+							local fwdv = Vector3.new(cam.CFrame.LookVector.X, 0, cam.CFrame.LookVector.Z)
+							if lat:Dot(fwdv) < 0.2 then lat = -lat end
+							jukeDir = (awu * 0.3 + lat).Unit
+							jukeUntil = now + 0.28
+							lastJuke = now
+							tackleState = tackleState or "juke burst"
+						end
+					end
+				end
+			end
 			if tackleDir then
 				blockDir, blockState = nil, "yield"
 				if CFG.block then
@@ -2861,24 +4004,67 @@ local function renderFrame()
 		end
 	end
 
-	driveTo(tackleDir or blockDir)
+	-- juke burst owns the stick for its life, then regular pathing resumes
+	local driveOut = (tackleDir or blockDir)
+	if now < jukeUntil and jukeDir then
+		driveOut = jukeDir
+		mode = "juke burst"
+	end
+	-- ball magnet: steer at the landing point when nothing else owns the stick
+	if not driveOut and CFG.catchMagnet then
+		local mball = ballPart()
+		local mdir = magnetSteer(now, mball, myRoot)
+		if mdir then
+			driveOut = mdir
+			mode = string.format("catch magnet %.0f st", (mball:GetAttribute("LandingPoint") and (mball:GetAttribute("LandingPoint") - myRoot.Position).Magnitude or 0))
+			-- paint the magnet target at the landing point
+			local lp = mball:GetAttribute("LandingPoint")
+			if typeof(lp) == "Vector3" then
+				magnetPart.CFrame = CFrame.new(lp + Vector3.new(0, 0.4, 0))
+				magnetPart.Transparency = 0.35
+			end
+			-- magnet catch: auto dive at the very end of the flight so you're
+			-- already on the ground when the ball arrives
+			if CFG.magnetCatch and now >= nextDive then
+				local lp = mball:GetAttribute("LandingPoint")
+				local lat = mball:GetAttribute("LandingAt") or 0
+				local nowTs = workspace:GetServerTimeNow()
+				local remaining = math.max(lat - nowTs, 0)
+				if typeof(lp) == "Vector3" and remaining > 0 and remaining < 0.35 then
+					local dist = (lp - myRoot.Position).Magnitude
+					if dist < 5 then
+						nextDive = now + CFG.tackleCd * 1.5
+						press(Dive, 0.12)
+						mode = "catch magnet dive"
+					end
+				end
+			end
+		else
+			magnetPart.Transparency = 1
+		end
+	else
+		magnetPart.Transparency = 1
+	end
+	-- ball to me: continuously teleport the loose ball straight to your rig
+	if CFG.ballToMe then
+		local b = ballPart()
+		if b and (b:GetAttribute("CarrierUserId") or 0) == 0 then
+			local target = myRoot.Position + Vector3.new(0, CFG.ballToMeY or 4, 0)
+			pcall(function() b.CFrame = CFrame.new(target) end)
+			pcall(function() b.AssemblyLinearVelocity = Vector3.zero end)
+			magnetPart.Transparency = 1
+			mode = "ball to me"
+		end
+	end
+	driveTo(driveOut)
 	pumpSteer(now)
 
-	-- rush speed: while the tackle/block is driving the player into the hit, he
-	-- moves harder. the tackle reach is what decides whether the hit happens.
-	local hum = mine:FindFirstChildOfClass("Humanoid")
+	-- rush: the slim rush attribute marks when a tackle or block is driving
+	-- into the hit. pure feedback, the sim owns the speed law.
 	local boost = (tackleDir ~= nil or blockDir ~= nil) and true or false
 	if boost ~= rushOn then
 		rushOn = boost
-		if hum then
-			if boost then
-				hum:SetAttribute("SlimRush", true)
-				hum.WalkSpeed = (hum.WalkSpeed or 16) * 1.5
-			else
-				hum:SetAttribute("SlimRush", false)
-				hum.WalkSpeed = (hum.WalkSpeed or 16) / 1.5
-			end
-		end
+		mine:SetAttribute("SlimRush", boost)
 	end
 
 	if tackleState then mode = tackleState end
@@ -2895,6 +4081,14 @@ local function renderFrame()
 		if now - lastCfgSave > 2 then
 			lastCfgSave = now
 			pcall(saveCfg)
+		end
+		-- stuck press recovery: the sim pins tackle state 3 the whole length
+		-- of a tackle hold. if the rig says held but no press of ours is live,
+		-- a previous hold leaked - force the release so tackle/dive/speed
+		-- channels unblock.
+		if not pressing and mine:GetAttribute("TackleState") == 3 and now - lastStuckRelease > 2 then
+			lastStuckRelease = now
+			pcall(function() Tackle:Fire(false) end)
 		end
 		-- accuracy: watch our own throw land. teammate holds it = completion,
 		-- nobody on the ball and it hit the dirt = incompletion.
@@ -2958,6 +4152,7 @@ local function renderFrame()
 		if statShots then statShots:Set(stats.shots) end
 		if statPicks then statPicks:Set(stats.picks) end
 		if statTackles then statTackles:Set(stats.tackles) end
+		if CFG.statCard then updateStatCard() end
 		if statAvg then
 			local avg = stats.shots > 0 and (stats.distSum / stats.shots) or 0
 			pcall(function() statAvg:Set(math.floor(avg + 0.5)) end)
@@ -3069,6 +4264,13 @@ RunService:BindToRenderStep("SlimPanel", Enum.RenderPriority.Camera.Value + 3, f
 	end
 end)
 
+-- anti fall heartbeat: runs after physics each frame so the sim can't
+-- re-pin you between render steps. if anti fall is on, frozen/down/truck
+-- never stick for more than a single frame.
+antiFallConn = RunService.Heartbeat:Connect(function()
+	refreshAntiFall()
+end)
+
 --// hooks + cleanup -----------------------------------------------------------
 
 _G.QBAim = {
@@ -3106,7 +4308,7 @@ _G.QBAim = {
 	end,
 	throw = function() return requestThrow() end,
 	routes = routeApi,
-	share = { out = buildShareString, load = applyShareString },
+	share = { out = buildShareString, short = buildShortShare, send = sendBuildChat, load = applyShareString },
 	cfg = CFG,
 	stats = stats,
 	panel = window,
@@ -3114,12 +4316,16 @@ _G.QBAim = {
 	box = statusBox,
 	getMode = function() return mode, currentEntry end,
 	stop = function() shutdown() end,
+	panic = panic,
+	panicRestore = panicRestore,
 }
 _G.Slim = _G.QBAim
 
 if STATE and STATE.onCleanup then
 	STATE.onCleanup(shutdown)
 end
+
+bindChatSync()
 
 if window then
 	print("[Slim] panel loaded - Rayfield Gen2 | aim, tackle, block in one window")
