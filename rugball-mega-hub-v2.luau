@@ -7276,7 +7276,7 @@ local CFG = {
 	stealDist = 6.4,
 	blockDist = 8.6,
 	crossDist = 4.6,
-	guardDist = 3.2,
+	guardDist = 2.4,
 }
 CFG.speedVal = math.clamp(CFG.speedVal, 5, 60)
 CFG.jumpVal = math.clamp(CFG.jumpVal, 0, 50)
@@ -7842,6 +7842,7 @@ local function buildUI()
 	court:CreateToggle({ name = "auto block", description = "press block when a defender gets near", value = CFG.autoBlock, callback = function(v) CFG.autoBlock = v end })
 	court:CreateToggle({ name = "auto cross", description = "press crossover when a defender presses you", value = CFG.autoCross, callback = function(v) CFG.autoCross = v end })
 	court:CreateToggle({ name = "auto guard", description = "stand between the ball handler and the hoop", flag = "autoGuard", value = CFG.autoGuard, callback = function(v) CFG.autoGuard = v end })
+	court:CreateSlider({ name = "guard space", description = "studs you stand off the ball handler - lower is tighter", range = {1.5, 8}, increment = .1, value = CFG.guardDist, suffix = " st", callback = function(v) CFG.guardDist = v end })
 	court:CreateSlider({ name = "steal reach", description = "studs before auto steal fires", range = {3, 8}, increment = .1, value = CFG.stealDist, suffix = " st", callback = function(v) CFG.stealDist = v end })
 	court:CreateSlider({ name = "block reach", description = "studs before auto block fires", range = {4, 10}, increment = .1, value = CFG.blockDist, suffix = " st", callback = function(v) CFG.blockDist = v end })
 
