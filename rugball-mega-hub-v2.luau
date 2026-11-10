@@ -14,6 +14,7 @@
 		122283827051026  NBA: Heroes (place v144) nba
 		134954408729617  Basketball Duels         duels
 		125942529011157  Throw A Football         taf bypass, then qb aimbot
+		96120449121277   PhysBox (HitBout)       physbox
 
 	the taf bypass runs before the suites that need it, so its hooks are live
 	before any suite code touches the controllers.
@@ -39,6 +40,7 @@ Hub.ORDER = {
 	{ place = 122283827051026, label = "NBA HEROES V144",  suites = { "nba" } },
 	{ place = 134954408729617, label = "BASKETBALL DUELS", suites = { "duels" } },
 	{ place = 125942529011157, label = "THROW A FOOTBALL", suites = { "taf_bypass", "qb_aimbot" } },
+	{ place = 96120449121277,  label = "PHYSBOX HITBOUT",  suites = { "physbox" } },
 }
 
 Hub.GAMES = {}
@@ -46,7 +48,7 @@ for _, g in ipairs(Hub.ORDER) do
 	Hub.GAMES[g.place] = g
 end
 
-Hub.SUITE_ORDER = { "football", "anime", "nba", "swish", "duels", "qb_aimbot", "taf_bypass" }
+Hub.SUITE_ORDER = { "football", "anime", "nba", "swish", "duels", "qb_aimbot", "taf_bypass", "physbox" }
 
 Hub.SUITE_NAMES = {
 	football   = "football panel    |  aim / tackle / block",
@@ -56,6 +58,7 @@ Hub.SUITE_NAMES = {
 	duels      = "duels panel       |  court panel",
 	qb_aimbot  = "qb aimbot         |  throw a football",
 	taf_bypass = "taf bypass        |  anticheat + speed",
+	physbox    = "physbox corner    |  autopilot / full power / inf stamina",
 }
 
 Hub.SUITE = {}
@@ -8577,6 +8580,849 @@ local uiOk = pcall(buildUI)
 if not uiOk then warn("[SlimTaf] rayfield failed to load - running headless") end
 
 _G.SlimTafBypass = { cfg = CFG, stats = stats, install = install, uninstall = uninstall, stop = shutdown }
+end
+
+--// embedded suite: physbox  (from physbox-panel.luau) =========================
+Hub.SUITE.physbox = function()
+-- PhysBox (HitBout) | CORNER - combo king autopilot, full power, inf stamina, ESP
+-- place 96120449121277 | Rayfield Gen2 | replace-not-stack via _G.PhysBoxCorner
+-- rides only official paths: Driver.punch + the Controls input table. never touches Net.Claim.
+
+local prev = _G.PhysBoxCorner
+local CFG = (prev and prev.cfg) or {}
+-- defaults merge: keeps saved settings across reloads, fills in fields added later
+for k, v in pairs({
+	guard = true,
+	guardStyle = "adaptive", -- adaptive | high | low
+	combo = false,
+	comboName = "jab jab cross",
+	stepIn = true,
+	range = 5.5,
+	staminaFloor = 0.15,
+	infSta = true,
+	fullPower = true,
+	autoplay = false,
+	aggr = 0.6,
+	antiLow = true,
+	dodge = false,
+	esp = true,
+}) do
+	if CFG[k] == nil then
+		CFG[k] = v
+	end
+end
+if prev and prev.stop then
+	pcall(prev.stop)
+end
+_G.PhysBoxCorner = { cfg = CFG }
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local RS = game:GetService("ReplicatedStorage")
+local LP = Players.LocalPlayer
+
+local PhysBox = RS:WaitForChild("PhysBox")
+local Moves = require(PhysBox:WaitForChild("Moves"))
+local Config = require(PhysBox:WaitForChild("Config"))
+
+local PS = LP:WaitForChild("PlayerScripts")
+local ClientScripts = PS:WaitForChild("PhysBoxClient")
+local Driver = require(ClientScripts:WaitForChild("Driver"))
+local Controls = require(ClientScripts:WaitForChild("Controls"))
+
+--// combos ---------------------------------------------------------------------
+local COMBOS = {
+	["jab jab cross"] = { "Jab", "Jab", "Cross" },
+	["hooks"] = { "LeftHook", "RightHook", "Cross" },
+	["mixup"] = { "Jab", "Cross", "LeftHook", "Uppercut" },
+	["heavy hands"] = { "Cross", "Uppercut", "RightHook" },
+	["kicks"] = { "FrontKick", "Roundhouse", "Cross" },
+	["low rider"] = { "Uppercut", "Cross", "Uppercut" },
+}
+
+-- punch class (from the game's own AI dodge tables) + which arm throws it
+local CLASS = {
+	Jab = "straight", Cross = "straight",
+	LeftHook = "hook", RightHook = "hook",
+	LeftUppercut = "upper", Uppercut = "upper",
+	FrontKick = "push", Roundhouse = "round", HighKick = "round",
+}
+local ARM = {
+	Jab = 1, LeftHook = 1, Uppercut = 1, FrontKick = 1,
+	Cross = -1, RightHook = -1, LeftUppercut = -1, Roundhouse = -1, HighKick = -1,
+}
+local GUARD_FOR = { straight = "High", hook = "High", upper = "Low", push = "Low", round = "High" }
+
+-- dodge shapes by punch class: duck hooks/swings, pull back off uppers, lateral slip the rest
+local DODGE_LEAN = {
+	hook = Vector2.new(0, -1),
+	round = Vector2.new(0, -1),
+	upper = Vector2.new(0, 1),
+}
+-- the game's own AI step-out distances per punch class
+local DODGE_STEP = { straight = 0.6, hook = 0.7, upper = 0.6, push = 1.5, round = 1.4 }
+
+--// state ----------------------------------------------------------------------
+local app, window
+local origUpdate, wrapUpdate
+local origPunch, origPress, wrapPunch, wrapPress
+local keyConn
+local queue, queueAt = {}, 0
+local myThrow = { move = nil, at = 0 } -- our last queue punch: move + time, for zero-gap chaining
+local lowTrack = { boxer = nil, maxHead = 0, lowFor = 0, t = 0 }
+local oppPhase = { boxer = nil, lastAct = nil, endedAt = 0, lastInterrupt = 0, lastCombo = nil }
+local oppGuard = { high = 0, low = 0 }
+local dead = false
+local lastErrAt = 0
+
+local mySta, myDaze, oppSta, oppDaze, roundStat
+
+-- find the shared app state via Controls.update's upvalues.
+-- recurses through wrapped functions, so a stale wrapper left by a torn-down
+-- previous run can't hide the game's own app table from us
+local lastAppTry = 0
+local function findApp()
+	local seen = {}
+	local function scan(fn, depth)
+		if depth > 4 or type(fn) ~= "function" or seen[fn] then
+			return nil
+		end
+		seen[fn] = true
+		local ok, ups = pcall(debug.getupvalues, fn)
+		if not ok or type(ups) ~= "table" then
+			return nil
+		end
+		for _, v in ipairs(ups) do
+			-- .input plus any shared-state marker; menuOpen nils out between bouts
+			if type(v) == "table" and type(rawget(v, "input")) == "table"
+				and (rawget(v, "menuOpen") ~= nil or rawget(v, "state") ~= nil or rawget(v, "matchLock") ~= nil) then
+				return v
+			end
+		end
+		for _, v in ipairs(ups) do
+			if type(v) == "function" then
+				local found = scan(v, depth + 1)
+				if found then
+					return found
+				end
+			end
+		end
+		return nil
+	end
+	return scan(Controls.update, 0)
+end
+app = findApp()
+
+local function oops(err)
+	local now = os.clock()
+	if now - lastErrAt > 5 then
+		lastErrAt = now
+		warn("[Corner] " .. tostring(err))
+	end
+end
+
+--// bout helpers ---------------------------------------------------------------
+local function myBoxer(bout)
+	return bout and bout.mine
+end
+
+local function nearestOpponent(bout, me)
+	local best, bestD = nil, math.huge
+	local boxers = bout and bout.boxers
+	if not boxers then
+		return nil, nil
+	end
+	local myPos = me and me.rig and me.rig.pelvis and me.rig.pelvis.Position
+	if not myPos then
+		return nil, nil
+	end
+	for _, b in ipairs(boxers) do
+		if b ~= me and b.rig and b.rig.pelvis and not b.victory then
+			local d = (b.rig.pelvis.Position - myPos).Magnitude
+			if d < bestD then
+				best, bestD = b, d
+			end
+		end
+	end
+	return best, bestD
+end
+
+local function punching(b)
+	return b ~= nil and b.action ~= nil and CLASS[b.action.name] ~= nil
+end
+
+local function free(b)
+	return b ~= nil and b.action == nil
+end
+
+local function inRange(d)
+	return d ~= nil and d <= CFG.range
+end
+
+local function staminaOK(b)
+	if CFG.infSta then
+		return true -- pinned at full: never let a mid-frame server read stall the engine
+	end
+	return (b and b.stamina or 1) > CFG.staminaFloor
+end
+
+-- quick counter punch: the game's own punch entry, skipping our full-power
+-- windup conversion - speed is the whole point of an interrupt
+local function quickPunch(move)
+	if type(origPunch) == "function" then
+		return (pcall(origPunch, move))
+	end
+	return (pcall(Driver.punch, move))
+end
+
+-- combo shuffle bag: the game's AI remembers the punches it has seen
+-- (seenActs / defendedActs) and defends them better each time, so the
+-- autopilot rotates through everything and never settles into a pattern
+local comboBag = {}
+local function nextCombo(opp)
+	if opp and (opp.daze or 0) > 45 then
+		return COMBOS["heavy hands"] -- they are rocked: finisher pressure
+	end
+	-- turtle reading: punch under a high guard, over a low one
+	if oppGuard.high > oppGuard.low * 1.5 and oppGuard.high > 1 then
+		return COMBOS["low rider"]
+	end
+	if oppGuard.low > oppGuard.high * 1.5 and oppGuard.low > 1 then
+		return COMBOS["hooks"]
+	end
+	if #comboBag == 0 then
+		for _, n in ipairs({ "jab jab cross", "hooks", "mixup", "heavy hands", "kicks" }) do
+			comboBag[#comboBag + 1] = n
+		end
+		for i = #comboBag, 2, -1 do
+			local j = math.random(i)
+			comboBag[i], comboBag[j] = comboBag[j], comboBag[i]
+		end
+	end
+	local pick = table.remove(comboBag, 1)
+	if pick == oppPhase.lastCombo and #comboBag > 0 then
+		comboBag[#comboBag + 1] = pick
+		pick = table.remove(comboBag, 1)
+	end
+	oppPhase.lastCombo = pick
+	return COMBOS[pick] or COMBOS["jab jab cross"]
+end
+
+-- inf stamina: ride the game's own unlimited flag where the local sim owns a meter
+local function meterUnlimited(on)
+	local bout = Driver.bout()
+	local me = bout and bout.mine
+	local fight = me and bout.fight
+	local sta = fight and rawget(fight, "stamina")
+	local m = type(sta) == "table" and rawget(sta, me) or nil
+	if type(m) == "table" and m.setUnlimited and rawget(m, "unlimited") ~= on then
+		pcall(function() m:setUnlimited(on) end)
+	end
+end
+
+local function pinStamina(bout, me)
+	if not CFG.infSta or not me then
+		return
+	end
+	me.stamina = 1
+	meterUnlimited(true)
+end
+
+local function pinNow()
+	local bout = Driver.bout()
+	pinStamina(bout, bout and bout.mine)
+end
+
+-- full power: taps become held windups; every windup (ours or the player's)
+-- auto-releases at max charge, like holding all the way every time
+local chargeWatch = { active = false, last = -1, lastAt = 0, stall = 0, at = 0 }
+local function fullPowerStep()
+	if not CFG.fullPower then
+		return
+	end
+	local bout = Driver.bout()
+	local me = bout and bout.mine
+	local a = me and me.action
+	if not (a and a.charging) then
+		chargeWatch.active = false
+		return
+	end
+	local now = os.clock()
+	if not chargeWatch.active then
+		chargeWatch.active = true
+		chargeWatch.last = -1
+		chargeWatch.stall = 0
+		chargeWatch.at = now
+		chargeWatch.lastAt = now
+		return
+	end
+	local cs = Driver.charge()
+	if cs > chargeWatch.last + 0.001 then
+		chargeWatch.last = cs
+		chargeWatch.stall = 0
+	else
+		chargeWatch.stall += now - chargeWatch.lastAt
+	end
+	chargeWatch.lastAt = now
+	-- release at full, on a stall (stamina cap / non-chargeable windup), or a hard timeout
+	if cs >= 0.99 or chargeWatch.stall > 0.4 or now - chargeWatch.at > 2.5 then
+		pcall(Driver.release, a.name)
+		chargeWatch.active = false
+	end
+end
+
+--// frame logic ----------------------------------------------------------------
+local function step()
+	local input = app and app.input
+	if not input then
+		return
+	end
+
+	local bout = Driver.bout()
+	local me = myBoxer(bout)
+	if not me or not me.rig or not me.rig.pelvis or me.victory then
+		queue = {}
+		return
+	end
+
+	-- inf stamina: pin the share the punch gates and fatigue HUD read
+	pinStamina(bout, me)
+
+	-- gym/menu/tutorial locks: hands off
+	if app.menuOpen or app.wheelOpen or app.tutorialActive or app.aiLock or app.matchLock then
+		queue = {}
+		return
+	end
+
+	local opp, dist = nearestOpponent(bout, me)
+	local oppAttack = punching(opp)
+
+	-- low-rider tracker: watch their head height against a standing reference
+	-- (their own max seen, or mine while I'm upright - same rig template).
+	-- half a second below 78% of standing = they are camping the crouch.
+	local camper = false
+	if opp and opp.rig and opp.rig.parts and opp.rig.parts.Head and opp.rig.pelvis then
+		local now = os.clock()
+		local dt = math.clamp(now - (lowTrack.t or now), 0, 0.1)
+		lowTrack.t = now
+		if lowTrack.boxer ~= opp then
+			lowTrack.boxer = opp
+			lowTrack.maxHead = 0
+			lowTrack.lowFor = 0
+		end
+		local ohd = opp.rig.parts.Head.Position.Y - opp.rig.pelvis.Position.Y
+		if ohd > lowTrack.maxHead then
+			lowTrack.maxHead = ohd
+		end
+		local myHead = me.rig.parts and me.rig.parts.Head
+		if myHead and (me.lean == nil or me.lean.Magnitude < 0.15) then
+			local mhd = myHead.Position.Y - me.rig.pelvis.Position.Y
+			if mhd > lowTrack.maxHead then
+				lowTrack.maxHead = mhd
+			end
+		end
+		if lowTrack.maxHead > 1 and ohd < lowTrack.maxHead * 0.78 then
+			lowTrack.lowFor += dt
+		else
+			lowTrack.lowFor = 0
+		end
+		camper = CFG.antiLow and lowTrack.lowFor > 0.5
+	end
+
+	-- opponent phase tracker: are they mid-windup (committed, can't dodge)
+	-- or recovering from a just-finished punch (wide open)?
+	if opp then
+		if oppPhase.boxer ~= opp then
+			oppPhase.boxer = opp
+			oppPhase.lastAct = nil
+			oppPhase.endedAt = 0
+		end
+		local oppName = opp.action and opp.action.name or nil
+		if oppPhase.lastAct ~= nil and oppName == nil then
+			oppPhase.endedAt = os.clock()
+		end
+		oppPhase.lastAct = oppName
+	end
+	local oppWinding = opp ~= nil and opp.action ~= nil and opp.action.charging == true
+	local oppRecovering = opp ~= nil and opp.action == nil and (os.clock() - oppPhase.endedAt) < 0.75
+	local staggered = opp ~= nil and (opp.stunned or (opp.daze or 0) > 60)
+
+	-- their guard height: target whatever they are NOT covering
+	if opp and dist and dist < CFG.range + 3 then
+		local oi = type(opp.input) == "table" and opp.input or nil
+		if oi and oi.block == true then
+			if oi.blockLow == true then
+				oppGuard.low = math.min(oppGuard.low + 0.05, 5)
+			else
+				oppGuard.high = math.min(oppGuard.high + 0.05, 5)
+			end
+		else
+			oppGuard.high = math.max(oppGuard.high - 0.01, 0)
+			oppGuard.low = math.max(oppGuard.low - 0.01, 0)
+		end
+	else
+		oppGuard.high = math.max(oppGuard.high - 0.01, 0)
+		oppGuard.low = math.max(oppGuard.low - 0.01, 0)
+	end
+
+	-- feature switches: auto play forces the whole package on
+	local wantGuard = CFG.guard or CFG.autoplay
+	local wantDodge = CFG.dodge or CFG.autoplay
+	local wantHunt = (CFG.stepIn and CFG.combo) or CFG.autoplay
+	local wantCombo = CFG.combo or CFG.autoplay
+
+	-- autopilot: badly dazed -> cover up and back out until the fog clears
+	if CFG.autoplay and opp and dist and ((me.daze or 0) > (20 + 25 * (CFG.aggr or 0.6)) or me.stunned) then
+		local away = (me.rig.pelvis.Position - opp.rig.pelvis.Position) * Vector3.new(1, 0, 1)
+		if away.Magnitude > 0.1 then
+			input.move = away.Unit
+		end
+		input.block = true
+		queue = {}
+		return
+	end
+
+	-- incoming attack: guard the light stuff, dodge the heavy stuff - guard broken always means dodge
+	if oppAttack and dist and dist < CFG.range + 2.5 then
+		local cls = CLASS[opp.action.name] or "straight"
+		local heavy = (cls == "hook") or (cls == "round") or (cls == "push") or (cls == "upper")
+		if wantDodge and (me.guardBroken or heavy) then
+			-- auto-dodge: class-aware slip plus step out of the strike lane (AI's own step distances)
+			local lean = DODGE_LEAN[cls]
+			if lean then
+				input.lean = lean
+			else
+				input.lean = Vector2.new(-(ARM[opp.action.name] or 1), 0)
+			end
+			local away = (me.rig.pelvis.Position - opp.rig.pelvis.Position) * Vector3.new(1, 0, 1)
+			if away.Magnitude > 0.1 then
+				input.move = away.Unit * math.clamp((DODGE_STEP[cls] or 0.6) / 1.5, 0.3, 1)
+			end
+		elseif wantGuard and not me.guardBroken then
+			-- auto-guard: raise the right guard while their punch is live
+			local style = CFG.guardStyle
+			if camper then
+				style = "Low" -- crouched opponents punch up into the body
+			elseif style == "adaptive" then
+				style = GUARD_FOR[cls] or "High"
+			end
+			input.block = true
+			input.blockLow = style == "Low"
+		end
+	end
+
+	-- hunt: step in when it is SAFE (they are committed to a windup,
+	-- recovering, rocked or camping), hold the ring when they are neutral
+	-- so we outbox instead of walking into counters - and circle a touch
+	-- under auto play so the approach isn't a straight line
+	if wantHunt and not oppAttack and opp and dist and dist > CFG.range * 0.75 then
+		local closing = oppWinding or oppRecovering or staggered or camper or dist > CFG.range or (CFG.autoplay and (CFG.aggr or 0.6) >= 0.75) -- max aggression: always take the ring
+		if closing then
+			local to = (opp.rig.pelvis.Position - me.rig.pelvis.Position) * Vector3.new(1, 0, 1)
+			if to.Magnitude > 1 then
+				local fwd = to.Unit
+				local dir = fwd
+				if CFG.autoplay then
+					dir = (fwd + Vector3.new(-fwd.Z, 0, fwd.X) * 0.3).Unit
+				end
+				input.move = dir * math.clamp(to.Magnitude / 4, 0.4, 1)
+			end
+		end
+	end
+
+	-- low rider: duck with them so our straights land as body shots
+	if camper and wantCombo and not oppAttack then
+		input.lean = Vector2.new(0, -0.7)
+	end
+
+	-- combo engine, combo-king edition: chain punches THROUGH the active
+	-- action so the game's own queue links them into the recovery frames
+	-- (zero gap), interrupt their windups with fast counters, and rotate
+	-- combos so their defence tracking never settles
+	local staggered = opp ~= nil and (opp.stunned or (opp.daze or 0) > 60)
+	local opening = (not CFG.autoplay) or (not oppAttack) or staggered or oppRecovering or oppWinding
+	if wantCombo and opp and inRange(dist) and opening then
+		local now = os.clock()
+		local a = me.action
+		local holding = a ~= nil and a.charging == true -- let the full-power watcher finish its windup first
+		if CFG.autoplay and oppWinding and not camper and not holding and now - oppPhase.lastInterrupt > 0.3 / math.max(CFG.aggr or 0.6, 0.3) then
+			-- interrupt: they are holding a windup and can't dodge - beat
+			-- them to contact with a quick punch (no full-power windup)
+			oppPhase.lastInterrupt = now
+			queue = {}
+			quickPunch("Jab")
+		elseif #queue == 0 and staminaOK(me) and now - queueAt > 0.25 then
+			-- no free(me) gate on purpose: a punch thrown mid-action gets
+			-- queued by the game and chains straight into the recovery
+			local combo = COMBOS[camper and "low rider"] or (CFG.autoplay and nextCombo(opp)) or COMBOS[CFG.comboName] or COMBOS["jab jab cross"]
+			for _, m in ipairs(combo) do
+				queue[#queue + 1] = m
+			end
+			queueAt = now
+		end
+		-- drain: throw the next punch while the current one is still flying
+		-- so Boxer queues it - the chain lands the frame recovery ends
+		if #queue > 0 and staminaOK(me) and not holding and now - myThrow.at > 0.12 then
+			local mv = queue[1]
+			local cost = (Config.Stamina and Config.Stamina.Cost and Config.Stamina.Cost[mv]) or 0
+			if CFG.infSta or cost == 0 or (me.stamina or 1) * (Config.Stamina and Config.Stamina.Max or 100) > cost + CFG.staminaFloor * 100 then
+				-- respect the repetition lock: rotate a same-move repeat to
+				-- the back so the chain keeps flowing instead of being refused
+				if #queue > 1 and (mv == (a and a.name) or mv == myThrow.move) then
+					table.remove(queue, 1)
+					queue[#queue + 1] = mv
+				else
+					table.remove(queue, 1)
+					myThrow.move = mv
+					myThrow.at = now
+					if not pcall(Driver.punch, mv) then
+						queue = {}
+					end
+				end
+			else
+				table.remove(queue, 1) -- can't afford it: skip the move, don't stall the chain
+			end
+		end
+	elseif #queue > 0 and (not inRange(dist) or not staminaOK(me)) then
+		queue = {}
+	end
+end
+
+-- registry of our wrappers -> what they wrapped (weak keys), so a torn-down
+-- previous run's stale wrappers get stripped and reloads never stack
+local WRAPS = setmetatable({}, { __mode = "k" })
+local function unwrapOurs(fn)
+	local n = 0
+	while type(fn) == "function" and WRAPS[fn] ~= nil and n < 8 do
+		fn = WRAPS[fn]
+		n += 1
+	end
+	return fn
+end
+
+-- wrap the game's own input poll so our writes land after the keyboard each frame
+origUpdate = unwrapOurs(Controls.update)
+wrapUpdate = function()
+	origUpdate()
+	if not dead then
+		local ok, err = pcall(step)
+		if not ok then
+			oops(err)
+		end
+	end
+end
+WRAPS[wrapUpdate] = origUpdate
+Controls.update = wrapUpdate
+
+-- wrap the public punch/press entry points so the kick gate reads full stamina at throw time
+origPunch = unwrapOurs(Driver.punch)
+wrapPunch = function(move, charge)
+	if not dead then
+		pcall(pinNow)
+	end
+	-- full power: a tap starts the held windup instead of the quick punch
+	if CFG.fullPower and type(move) == "string" and move ~= "Push" and charge == nil then
+		local def = Moves[move]
+		if type(def) == "table" and def.charge then
+			return origPunch(move, { held = true })
+		end
+	end
+	return origPunch(move, charge)
+end
+WRAPS[wrapPunch] = origPunch
+Driver.punch = wrapPunch
+if type(Driver.press) == "function" then
+	origPress = unwrapOurs(Driver.press)
+	wrapPress = function(move)
+		if not dead then
+			pcall(pinNow)
+		end
+		return origPress(move)
+	end
+	WRAPS[wrapPress] = origPress
+	Driver.press = wrapPress
+end
+
+--// ESP ------------------------------------------------------------------------
+local segs = {}
+local drawingOK = pcall(function()
+	local t = Drawing.new("Line")
+	pcall(function() t:Remove() end)
+	return true
+end)
+local function seg(i)
+	local s = segs[i]
+	if not s then
+		s = Drawing.new("Line")
+		s.Thickness = 1.6
+		segs[i] = s
+	end
+	return s
+end
+local function hideAll()
+	for _, s in ipairs(segs) do
+		s.Visible = false
+	end
+end
+
+local function headPartOf(b)
+	local rig = b and b.rig
+	if not rig then
+		return nil
+	end
+	local parts = rig.parts
+	if type(parts) == "table" then
+		local h = parts.Head or parts.head or parts["Head "]
+		if h then
+			return h
+		end
+	end
+	return rig.pelvis
+end
+
+local function box(x, y, r, color, used)
+	local corners = {
+		{ x - r, y - r, x + r, y - r },
+		{ x + r, y - r, x + r, y + r },
+		{ x + r, y + r, x - r, y + r },
+		{ x - r, y + r, x - r, y - r },
+	}
+	for _, c in ipairs(corners) do
+		used += 1
+		local ln = seg(used)
+		ln.From = Vector2.new(c[1], c[2])
+		ln.To = Vector2.new(c[3], c[4])
+		ln.Color = color
+		ln.Visible = true
+	end
+	return used
+end
+
+local function drawESP()
+	if not CFG.esp or dead or not drawingOK then
+		hideAll()
+		return
+	end
+	local bout = Driver.bout()
+	local me = myBoxer(bout)
+	local opp = nearestOpponent(bout, me)
+	if not opp then
+		hideAll()
+		return
+	end
+	local cam = workspace.CurrentCamera
+	if not cam then
+		hideAll()
+		return
+	end
+	local head = headPartOf(opp)
+	if not head then
+		hideAll()
+		return
+	end
+	local v = cam:WorldToViewportPoint(head.Position)
+	if v.Z <= 0 then
+		hideAll()
+		return
+	end
+	local dist = me and me.rig and me.rig.pelvis and (head.Position - me.rig.pelvis.Position).Magnitude or 10
+	local r = math.clamp(900 / math.max(v.Z, 1), 8, 60)
+	local camping = (lowTrack.lowFor or 0) > 0.5
+	local color = punching(opp) and Color3.fromRGB(255, 60, 60)
+		or (camping and Color3.fromRGB(255, 170, 40))
+		or Color3.fromRGB(80, 200, 255)
+	local used = box(v.X, v.Y, r, color, 0)
+
+	-- range line from my head to theirs: green in range, red out
+	if me and me.rig and me.rig.pelvis then
+		local mv = cam:WorldToViewportPoint(me.rig.pelvis.Position)
+		if mv.Z > 0 then
+			used += 1
+			local ln = seg(used)
+			ln.From = Vector2.new(mv.X, mv.Y)
+			ln.To = Vector2.new(v.X, v.Y)
+			ln.Color = dist <= CFG.range and Color3.fromRGB(90, 255, 120) or Color3.fromRGB(255, 120, 60)
+			ln.Thickness = 1
+			ln.Visible = true
+		end
+	end
+
+	for i = used + 1, #segs do
+		segs[i].Visible = false
+	end
+end
+
+local renderConn = RunService.RenderStepped:Connect(function()
+	if dead then return end
+	-- render-phase pin: lands after the frame's remote events, so the HUD reads full
+	pcall(pinNow)
+	drawESP()
+end)
+
+local lastStatAt = 0
+local function updateStats()
+	local now = os.clock()
+	if now - lastStatAt < 0.25 then
+		return
+	end
+	lastStatAt = now
+	local bout = Driver.bout()
+	local me = myBoxer(bout)
+	local opp = nearestOpponent(bout, me)
+	local function set(stat, val)
+		if stat then
+			pcall(function() stat:Set(val) end)
+		end
+	end
+	set(mySta, me and math.floor((me.stamina or 0) * 100 + 0.5) or 0)
+	set(myDaze, me and math.floor((me.daze or 0) + 0.5) or 0)
+	set(oppSta, opp and math.floor((opp.stamina or 0) * 100 + 0.5) or 0)
+	set(oppDaze, opp and math.floor((opp.daze or 0) + 0.5) or 0)
+	set(roundStat, bout and bout.round or 0)
+end
+local statConn = RunService.Heartbeat:Connect(function()
+	if dead then return end
+	-- app state can appear late (bout start, menu close) - keep retrying quietly
+	if not app and os.clock() - lastAppTry > 2 then
+		lastAppTry = os.clock()
+		app = findApp()
+		if app then
+			print("[Corner] app state found (late)")
+		end
+	end
+	-- inf stamina: re-pin every beat so incoming server state can't drain it
+	pcall(pinNow)
+	-- full power: walk the charge watcher every beat
+	pcall(fullPowerStep)
+	updateStats()
+end)
+
+--// lifecycle ------------------------------------------------------------------
+local function panic()
+	CFG.guard = false
+	CFG.combo = false
+	CFG.dodge = false
+	CFG.esp = false
+	CFG.stepIn = false
+	CFG.infSta = false
+	CFG.autoplay = false
+	CFG.fullPower = false
+	CFG.antiLow = false
+	pcall(meterUnlimited, false)
+	queue = {}
+	if window then
+		for _, f in ipairs({ "guard", "combo", "dodge", "esp", "stepin", "infsta", "autoplay", "antilow", "fullpower" }) do
+			pcall(function() window:Set(f, false) end)
+		end
+	end
+	print("[Corner] panic: hands off - everything off")
+end
+
+local function shutdown()
+	if dead then
+		return
+	end
+	dead = true
+	if Controls.update == wrapUpdate then
+		Controls.update = origUpdate
+	end
+	if Driver.punch == wrapPunch then
+		Driver.punch = origPunch
+	end
+	if origPress and Driver.press == wrapPress then
+		Driver.press = origPress
+	end
+	pcall(meterUnlimited, false)
+	if keyConn then keyConn:Disconnect() keyConn = nil end
+	if renderConn then renderConn:Disconnect() renderConn = nil end
+	if statConn then statConn:Disconnect() statConn = nil end
+	for _, s in ipairs(segs) do
+		pcall(function() s:Remove() end)
+	end
+	if window then
+		pcall(function() window:Unload() end)
+	end
+	_G.PhysBoxCorner = nil
+	print("[Corner] unloaded")
+end
+
+keyConn = UserInputService.InputBegan:Connect(function(i, gp)
+	if gp then return end
+	if i.KeyCode == Enum.KeyCode.P then
+		panic()
+	end
+end)
+
+--// UI -------------------------------------------------------------------------
+local Rayfield
+pcall(function() Rayfield = loadstring(game:HttpGet("https://sirius.menu/gen2"))() end)
+
+local function buildUI()
+	if not Rayfield then return end
+	local w = Rayfield:CreateWindow({
+		Name = "PHYSBOX | CORNER",
+		LoadingTitle = "CORNERMAN",
+		LoadingSubtitle = "combo-king autopilot, full power, inf stamina",
+		KeySystem = false,
+	})
+	window = w
+	local fight = w:CreateTab({ name = "FIGHT" })
+	local view = w:CreateTab({ name = "VIEW" })
+	local sys = w:CreateTab({ name = "SYS" })
+
+	fight:CreateToggle({ name = "full power punches", description = "every punch winds up and releases at max charge - taps throw like you held all the way", flag = "fullpower", value = CFG.fullPower, callback = function(v) CFG.fullPower = v chargeWatch.active = false end })
+	fight:CreateToggle({ name = "auto play", description = "full autopilot - chains zero-gap combos through their recovery, interrupts windups, rotates patterns so the AI can't adapt, covers when hurt - scale it with the aggression slider", flag = "autoplay", value = CFG.autoplay, callback = function(v) CFG.autoplay = v queue = {} end })
+	fight:CreateSlider({ name = "aggression", description = "autopilot intensity - interrupt rate, damage it eats before covering up, and how hard it takes the ring", flag = "aggr", range = { 0, 1 }, increment = .05, value = CFG.aggr, callback = function(v) CFG.aggr = v end })
+	fight:CreateToggle({ name = "inf stamina", description = "pin your stamina at full - punch while gassed, fatigue bar never drops", flag = "infsta", value = CFG.infSta, callback = function(v) CFG.infSta = v if not v then pcall(meterUnlimited, false) end end })
+	fight:CreateToggle({ name = "auto-guard", description = "raise the right guard the frame their punch starts - style picks high/low", flag = "guard", value = CFG.guard, callback = function(v) CFG.guard = v end })
+	fight:CreateDropdown({ name = "guard style", options = { "adaptive", "high", "low" }, value = CFG.guardStyle, flag = "guardStyle", callback = function(v) CFG.guardStyle = v end })
+	fight:CreateToggle({ name = "combo engine", description = "throw combos in range - punches chain through the active action into the recovery frames, zero gap", flag = "combo", value = CFG.combo, callback = function(v) CFG.combo = v queue = {} end })
+	fight:CreateToggle({ name = "punish low riders", description = "opponent camping the crouch? hold low guard, duck into body shots and answer with uppercuts - box turns orange while they camp", flag = "antilow", value = CFG.antiLow, callback = function(v) CFG.antiLow = v lowTrack.lowFor = 0 end })
+	fight:CreateDropdown({ name = "combo", options = { "jab jab cross", "hooks", "mixup", "heavy hands", "kicks", "low rider" }, value = CFG.comboName, flag = "comboName", callback = function(v) CFG.comboName = v queue = {} end })
+	fight:CreateToggle({ name = "step in", description = "walk into range while hunting (only with combo engine on)", flag = "stepin", value = CFG.stepIn, callback = function(v) CFG.stepIn = v end })
+	fight:CreateToggle({ name = "auto-dodge", description = "slip + step out of the strike lane when their punch starts - ducks hooks, backs off kicks, always on when guard broken", flag = "dodge", value = CFG.dodge, callback = function(v) CFG.dodge = v end })
+	fight:CreateSlider({ name = "punch range", description = "pelvis-to-pelvis studs before combos fire", range = { 2, 12 }, increment = .5, value = CFG.range, suffix = " st", callback = function(v) CFG.range = v end })
+	fight:CreateSlider({ name = "stamina floor", description = "stop punching below this stamina share", range = { 0, .6 }, increment = .05, value = CFG.staminaFloor, callback = function(v) CFG.staminaFloor = v end })
+
+	mySta = fight:CreateStat({ name = "my stamina", value = 0, suffix = "%" })
+	myDaze = fight:CreateStat({ name = "my daze", value = 0, suffix = "" })
+	oppSta = fight:CreateStat({ name = "their stamina", value = 0, suffix = "%" })
+	oppDaze = fight:CreateStat({ name = "their daze", value = 0, suffix = "" })
+	roundStat = fight:CreateStat({ name = "round", value = 0, suffix = "" })
+
+	view:CreateToggle({ name = "opponent ESP", description = "box on their head - red while they swing - plus a range line", flag = "esp", value = CFG.esp, callback = function(v) CFG.esp = v end })
+
+	sys:CreateButton({ name = "panic (P)", description = "everything off, hands back to you", callback = panic })
+	sys:CreateButton({ name = "unload panel", description = "tear everything down", callback = shutdown })
+end
+
+buildUI()
+
+_G.PhysBoxCorner = { cfg = CFG, window = window, stop = shutdown, panic = panic, punch = function(m) return pcall(Driver.punch, m) end, wraps = function() return Driver.punch == wrapPunch and (not origPress or Driver.press == wrapPress) end, lowInfo = function() return { maxHead = lowTrack.maxHead, lowFor = lowTrack.lowFor, camping = (lowTrack.lowFor or 0) > 0.5 } end, chargeInfo = function() local cs, ch, an = Driver.charge() return { cs = cs, charging = ch, action = an } end, aiInfo = function()
+	local b = Driver.bout()
+	local me = b and b.mine
+	local opp
+	if b then
+		for _, bx in ipairs(b.boxers or {}) do
+			if bx ~= me then opp = bx end
+		end
+	end
+	return {
+		winding = opp ~= nil and opp.action ~= nil and opp.action.charging == true,
+		recovering = opp ~= nil and opp.action == nil and (os.clock() - oppPhase.endedAt) < 0.75,
+		lastAct = oppPhase.lastAct,
+		endedAgo = math.round((os.clock() - oppPhase.endedAt) * 100) / 100,
+		lastCombo = oppPhase.lastCombo,
+		oppDaze = opp and opp.daze or 0,
+		queueLeft = #queue,
+		myLast = myThrow.move,
+	}
+end }
+
+print("[Corner] panel loaded - combo-king auto play, full power, dodges, anti-crouch, inf stamina | app state "
+	.. (app and "found" or "NOT found (input override off)")
+	.. (drawingOK and "" or " | Drawing unavailable - ESP off"))
 end
 
 --// dispatch -------------------------------------------------------------------
