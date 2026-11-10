@@ -8605,6 +8605,7 @@ for k, v in pairs({
 	aggr = 0.6,
 	antiLow = true,
 	dodge = false,
+	antiSlip = true,
 	esp = true,
 }) do
 	if CFG[k] == nil then
@@ -8671,7 +8672,8 @@ local keyConn
 local queue, queueAt = {}, 0
 local myThrow = { move = nil, at = 0 } -- our last queue punch: move + time, for zero-gap chaining
 local lowTrack = { boxer = nil, maxHead = 0, lowFor = 0, t = 0 }
-local oppPhase = { boxer = nil, lastAct = nil, endedAt = 0, lastInterrupt = 0, lastCombo = nil }
+local oppPhase = { boxer = nil, lastAct = nil, endedAt = 0, startedAt = 0, wasCharging = false, lastInterrupt = 0, lastCombo = nil }
+local dodgeState = { lastAt = 0, count = 0 } -- anti-slip: slip cooldown + counter
 local oppGuard = { high = 0, low = 0 }
 local dead = false
 local lastErrAt = 0
@@ -8937,11 +8939,21 @@ local function step()
 			oppPhase.boxer = opp
 			oppPhase.lastAct = nil
 			oppPhase.endedAt = 0
+			oppPhase.startedAt = 0
+			oppPhase.wasCharging = false
 		end
 		local oppName = opp.action and opp.action.name or nil
+		local oppCharging = opp.action ~= nil and opp.action.charging == true
+		-- a new action, or a held windup releasing into its strike: that
+		-- moment is the real strike clock - anti-slip slips off THIS, not
+		-- the windup hold, so long charges don't trigger an endless lean
+		if oppName ~= nil and (oppName ~= oppPhase.lastAct or (oppPhase.wasCharging and not oppCharging)) then
+			oppPhase.startedAt = os.clock()
+		end
 		if oppPhase.lastAct ~= nil and oppName == nil then
 			oppPhase.endedAt = os.clock()
 		end
+		oppPhase.wasCharging = oppCharging
 		oppPhase.lastAct = oppName
 	end
 	local oppWinding = opp ~= nil and opp.action ~= nil and opp.action.charging == true
@@ -8987,7 +8999,26 @@ local function step()
 	if oppAttack and dist and dist < CFG.range + 2.5 then
 		local cls = CLASS[opp.action.name] or "straight"
 		local heavy = (cls == "hook") or (cls == "round") or (cls == "push") or (cls == "upper")
-		if wantDodge and (me.guardBroken or heavy) then
+		-- anti-slip: the old logic leaned away for the WHOLE life of their
+		-- action - windup hold, strike and recovery, on every attack, with no
+		-- cooldown - which reads as a constant slip dance. Slip only when the
+		-- strike is actually flying (started < 0.45s ago, not still winding),
+		-- at most once per cooldown, and never mid-combo: our own chain keeps
+		-- the pressure and guards instead. Broken guard is urgent - it slips
+		-- past the timing gates but still respects the cooldown.
+		local slipOK = true
+		if CFG.antiSlip then
+			local tNow = os.clock()
+			local urgent = me.guardBroken == true
+			local strikeLive = opp.action.charging ~= true
+			local fresh = oppPhase.startedAt > 0 and (tNow - oppPhase.startedAt) < 0.45
+			local midChain = (#queue > 0) or (me.action ~= nil)
+			local cd = 0.3 + 0.5 * (CFG.aggr or 0.6)
+			slipOK = (urgent or (strikeLive and fresh and not midChain)) and (tNow - dodgeState.lastAt) > cd
+		end
+		if wantDodge and (me.guardBroken or heavy) and slipOK then
+			dodgeState.lastAt = os.clock()
+			dodgeState.count += 1
 			-- auto-dodge: class-aware slip plus step out of the strike lane (AI's own step distances)
 			local lean = DODGE_LEAN[cls]
 			if lean then
@@ -9309,10 +9340,11 @@ local function panic()
 	CFG.autoplay = false
 	CFG.fullPower = false
 	CFG.antiLow = false
+	CFG.antiSlip = false
 	pcall(meterUnlimited, false)
 	queue = {}
 	if window then
-		for _, f in ipairs({ "guard", "combo", "dodge", "esp", "stepin", "infsta", "autoplay", "antilow", "fullpower" }) do
+		for _, f in ipairs({ "guard", "combo", "dodge", "esp", "stepin", "infsta", "autoplay", "antilow", "fullpower", "antislip" }) do
 			pcall(function() window:Set(f, false) end)
 		end
 	end
@@ -9381,6 +9413,7 @@ local function buildUI()
 	fight:CreateToggle({ name = "punish low riders", description = "opponent camping the crouch? hold low guard, duck into body shots and answer with uppercuts - box turns orange while they camp", flag = "antilow", value = CFG.antiLow, callback = function(v) CFG.antiLow = v lowTrack.lowFor = 0 end })
 	fight:CreateDropdown({ name = "combo", options = { "jab jab cross", "hooks", "mixup", "heavy hands", "kicks", "low rider" }, value = CFG.comboName, flag = "comboName", callback = function(v) CFG.comboName = v queue = {} end })
 	fight:CreateToggle({ name = "step in", description = "walk into range while hunting (only with combo engine on)", flag = "stepin", value = CFG.stepIn, callback = function(v) CFG.stepIn = v end })
+	fight:CreateToggle({ name = "anti-slip", description = "smart slips - only dodges strikes that are actually flying, rate-limited, never mid-combo. off = slips every attack for its whole animation (the slip dance)", flag = "antislip", value = CFG.antiSlip, callback = function(v) CFG.antiSlip = v dodgeState.count = 0 end })
 	fight:CreateToggle({ name = "auto-dodge", description = "slip + step out of the strike lane when their punch starts - ducks hooks, backs off kicks, always on when guard broken", flag = "dodge", value = CFG.dodge, callback = function(v) CFG.dodge = v end })
 	fight:CreateSlider({ name = "punch range", description = "pelvis-to-pelvis studs before combos fire", range = { 2, 12 }, increment = .5, value = CFG.range, suffix = " st", callback = function(v) CFG.range = v end })
 	fight:CreateSlider({ name = "stamina floor", description = "stop punching below this stamina share", range = { 0, .6 }, increment = .05, value = CFG.staminaFloor, callback = function(v) CFG.staminaFloor = v end })
@@ -9417,6 +9450,9 @@ _G.PhysBoxCorner = { cfg = CFG, window = window, stop = shutdown, panic = panic,
 		oppDaze = opp and opp.daze or 0,
 		queueLeft = #queue,
 		myLast = myThrow.move,
+		slips = dodgeState.count,
+		oppCharging = opp ~= nil and opp.action ~= nil and opp.action.charging == true,
+		strikeAge = oppPhase.startedAt > 0 and math.round((os.clock() - oppPhase.startedAt) * 100) / 100 or nil,
 	}
 end }
 
