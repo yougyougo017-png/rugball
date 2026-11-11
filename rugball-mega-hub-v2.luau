@@ -8997,7 +8997,11 @@ local function step()
 	if oppAttack and dist and dist < CFG.range + 2.5 then
 		local cls = CLASS[opp.action.name] or "straight"
 		local heavy = (cls == "hook") or (cls == "round") or (cls == "push") or (cls == "upper")
-		if wantDodge and (me.guardBroken or heavy) then
+		-- full-power spammer: a charged straight is the one punch guard
+		-- can't save you from - read their charge off the action and slip
+		-- those too, old-school: whole animation, no cooldown, no gates
+		local charged = (opp.action.chargeNow or 0) >= 0.5
+		if wantDodge and (me.guardBroken or heavy or charged) then
 			-- auto-dodge: class-aware slip plus step out of the strike lane (AI's own step distances)
 			local lean = DODGE_LEAN[cls]
 			if lean then
@@ -9391,7 +9395,7 @@ local function buildUI()
 	fight:CreateToggle({ name = "punish low riders", description = "opponent camping the crouch? hold low guard, duck into body shots and answer with uppercuts - box turns orange while they camp", flag = "antilow", value = CFG.antiLow, callback = function(v) CFG.antiLow = v lowTrack.lowFor = 0 end })
 	fight:CreateDropdown({ name = "combo", options = { "jab jab cross", "hooks", "mixup", "heavy hands", "kicks", "low rider" }, value = CFG.comboName, flag = "comboName", callback = function(v) CFG.comboName = v queue = {} end })
 	fight:CreateToggle({ name = "step in", description = "walk into range while hunting (only with combo engine on)", flag = "stepin", value = CFG.stepIn, callback = function(v) CFG.stepIn = v end })
-	fight:CreateToggle({ name = "auto-dodge", description = "slip + step out of the strike lane when their punch starts - ducks hooks, backs off kicks, always on when guard broken", flag = "dodge", value = CFG.dodge, callback = function(v) CFG.dodge = v end })
+	fight:CreateToggle({ name = "auto-dodge", description = "slip + step out of the strike lane when their punch starts - ducks hooks, backs off kicks, slips full-power charged punches, always on when guard broken", flag = "dodge", value = CFG.dodge, callback = function(v) CFG.dodge = v end })
 	fight:CreateSlider({ name = "punch range", description = "pelvis-to-pelvis studs before combos fire", range = { 2, 12 }, increment = .5, value = CFG.range, suffix = " st", callback = function(v) CFG.range = v end })
 	fight:CreateSlider({ name = "stamina floor", description = "stop punching below this stamina share", range = { 0, .6 }, increment = .05, value = CFG.staminaFloor, callback = function(v) CFG.staminaFloor = v end })
 
