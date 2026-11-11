@@ -10473,8 +10473,8 @@ local function getShootTrack(char, name)
 	if not track then
 		local anims = ReplicatedStorage:FindFirstChild("Animations")
 		local anim = anims and anims:FindFirstChild(name)
-		local animator = char and char:FindFirstChildOfClass("Animator")
-		local human = char and char:FindFirstChild("Humanoid")
+		local human = char and char:FindFirstChildOfClass("Humanoid")
+		local animator = human and human:FindFirstChildOfClass("Animator")
 		local loader = animator or human
 		if anim and loader then
 			track = loader:LoadAnimation(anim)
@@ -10538,14 +10538,26 @@ local function solveShot(ball, target, bend, powerPct)
 	local hold = math.clamp((powerPct or 85) / 100, 0.01, 1)
 	local curve = "None"
 	if (bend or 0) > 0 then
-		-- flight time that bends the ball `bend` studs: |14.4 - 16*T| = bend
-		local T = 0.9 + bend / 16
-		local holdNeeded = (flat.Magnitude / T - 32) / 81
-		hold = math.clamp(holdNeeded, 0.75, 1)
-		hold = math.min(hold, math.max((powerPct or 85) / 100, 0.75))
-		local T2 = flat.Magnitude / (32 + 81 * hold)
-		local D = 14.4 - 16 * T2 -- net landing offset along the aim's right
-		if D < -0.5 then
+		-- charge that lands the ball `bend` studs off the aim line, then pick the
+		-- closest achievable bend between the curve floor (0.75s - the game's own
+		-- charged-shot gate) and the power slider
+		local dist = flat.Magnitude
+		local lo = 0.75
+		local hi = math.min(math.max((powerPct or 85) / 100, lo), 1)
+		local function landingOffset(h)
+			return 14.4 - 16 * dist / (32 + 81 * h)
+		end
+		local holdNeeded = (16 * dist / (14.4 + bend) - 32) / 81
+		local best, bestErr = hold, math.huge
+		for _, h in ipairs({ math.clamp(holdNeeded, lo, hi), lo, hi }) do
+			local err = math.abs(math.abs(landingOffset(h)) - bend)
+			if err < bestErr then
+				bestErr, best = err, h
+			end
+		end
+		hold = best
+		local D = landingOffset(hold) -- net landing offset along the aim's right
+		if math.abs(D) > 0.25 then
 			-- swing at the keeper's side of the line, curl back onto the target
 			local right = CFrame.lookAt(Vector3.zero, dir).RightVector
 			local keeper = enemyKeeperChar()
@@ -10566,7 +10578,7 @@ local function solveShot(ball, target, bend, powerPct)
 				dir = flat2.Unit
 			end
 		else
-			curve = "None" -- too close to bend at this charge - straight shot
+			curve = "None" -- landing offset rounds to zero - straight shot
 		end
 	end
 	return dir, hold, curve
