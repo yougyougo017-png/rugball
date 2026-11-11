@@ -15,6 +15,9 @@
 		134954408729617  Basketball Duels         duels
 		125942529011157  Throw A Football         taf bypass, then qb aimbot
 		96120449121277   PhysBox (HitBout)       physbox
+		335760407        TPS: Street Soccer      tps
+		75703135112691   TPS: Street Soccer      tps (match sub-place)
+		14315258385      Realistic Street Soccer rss
 
 	the taf bypass runs before the suites that need it, so its hooks are live
 	before any suite code touches the controllers.
@@ -41,6 +44,9 @@ Hub.ORDER = {
 	{ place = 134954408729617, label = "BASKETBALL DUELS", suites = { "duels" } },
 	{ place = 125942529011157, label = "THROW A FOOTBALL", suites = { "taf_bypass", "qb_aimbot" } },
 	{ place = 96120449121277,  label = "PHYSBOX HITBOUT",  suites = { "physbox" } },
+	{ place = 335760407,       label = "TPS STREET SOCCER", suites = { "tps" } },
+	{ place = 75703135112691, label = "TPS MATCH",         suites = { "tps" } },
+	{ place = 14315258385,    label = "RSS STREET SOCCER", suites = { "rss" } },
 }
 
 Hub.GAMES = {}
@@ -48,7 +54,7 @@ for _, g in ipairs(Hub.ORDER) do
 	Hub.GAMES[g.place] = g
 end
 
-Hub.SUITE_ORDER = { "football", "anime", "nba", "swish", "duels", "qb_aimbot", "taf_bypass", "physbox" }
+Hub.SUITE_ORDER = { "football", "anime", "nba", "swish", "duels", "qb_aimbot", "taf_bypass", "physbox", "tps", "rss" }
 
 Hub.SUITE_NAMES = {
 	football   = "football panel    |  aim / tackle / block",
@@ -59,6 +65,8 @@ Hub.SUITE_NAMES = {
 	qb_aimbot  = "qb aimbot         |  throw a football",
 	taf_bypass = "taf bypass        |  anticheat + speed",
 	physbox    = "physbox corner    |  autopilot / full power / inf stamina",
+	tps        = "tps street         |  auto shot / tackle / GK / esp",
+	rss        = "rss street          |  auto shot / pass / tackle / header / GK dive",
 }
 
 Hub.SUITE = {}
@@ -9440,6 +9448,2227 @@ end }
 print("[Corner] panel loaded - combo-king auto play, full power, dodges, anti-crouch, inf stamina | app state "
 	.. (app and "found" or "NOT found (input override off)")
 	.. (drawingOK and "" or " | Drawing unavailable - ESP off"))
+end
+
+--// embedded suite: tps  (from tps-panel.luau) =========================
+Hub.SUITE.tps = function()
+-- TPS: Street Soccer | STREET - auto shot, auto tackle, auto GK save, auto pass, powers, ball ESP
+-- places 335760407 + 75703135112691 | Rayfield Gen2 | replace-not-stack via _G.TpsStreetPanel
+-- rides only official paths: fires the game's own FE remotes (Kick / Tackle / Save / AutoPass /
+-- Powers / Settings) with the exact argument patterns its Backpack.Module client sends.
+-- never touches Net.Claim, never fires server->client events (WinR/WinB, GKEvent*, BombA...).
+
+local prev = _G.TpsStreetPanel
+local CFG = (prev and prev.cfg) or {}
+-- defaults merge: keeps saved settings across reloads, fills in fields added later
+for k, v in pairs({
+	autoShot = true,
+	shotRange = 7,
+	forcePower = false,
+	autoTackle = false,
+	tackleRange = 11,
+	autoGK = false,
+	gkRange = 12,
+	autoPass = false,
+	passRange = 60,
+	ballESP = true,
+	goalBeacons = true,
+	cooldown = 0.9,
+}) do
+	if CFG[k] == nil then
+		CFG[k] = v
+	end
+end
+if prev and prev.stop then
+	pcall(prev.stop)
+end
+_G.TpsStreetPanel = { cfg = CFG }
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+local LP = Players.LocalPlayer
+
+-- the card-name literal the game's own client hardcodes into every kick/tackle/save/pass remote
+local CARD = "Rock'n'roll Star"
+
+--// locators -------------------------------------------------------------------
+
+-- ball scan mirrors the game's own (Backpack.Module v1.SpecialKick + PlayerScripts.Col):
+-- parts named TPS / PSoccerBall under Workspace.Practice, Workspace.TPSSystem or Workspace itself.
+-- nearest one to us wins.
+local function findBall()
+	local best, bestD = nil, math.huge
+	local char = LP.Character
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	local function consider(c)
+		if c:IsA("BasePart") and (c.Name == "TPS" or c.Name == "PSoccerBall") then
+			local d = hrp and (c.Position - hrp.Position).Magnitude or 0
+			if d < bestD then
+				best, bestD = c, d
+			end
+		end
+	end
+	for _, rootName in ipairs({ "Practice", "TPSSystem" }) do
+		local root = Workspace:FindFirstChild(rootName)
+		if root then
+			for _, c in ipairs(root:GetChildren()) do
+				consider(c)
+			end
+		end
+	end
+	if not best then
+		for _, c in ipairs(Workspace:GetChildren()) do
+			consider(c)
+		end
+	end
+	return best, bestD
+end
+
+local function goalCenter(model)
+	if not model then
+		return nil
+	end
+	if model:IsA("BasePart") then
+		return model.Position
+	end
+	if model:IsA("Model") then
+		local ok, cf = pcall(function()
+			return model:GetBoundingBox()
+		end)
+		if ok and cf then
+			return cf.Position
+		end
+		for _, d in ipairs(model:GetDescendants()) do
+			if d:IsA("BasePart") then
+				return d.Position
+			end
+		end
+	end
+	return nil
+end
+
+-- which net we attack: blue team scores on RedGoal, red team on BlueGoal
+local function attackGoal()
+	local tc = LP.TeamColor
+	if tc == BrickColor.new("Bright blue") then
+		return Workspace:FindFirstChild("RedGoal")
+	elseif tc == BrickColor.new("Bright red") then
+		return Workspace:FindFirstChild("BlueGoal")
+	end
+	return nil
+end
+
+local function amKeeper()
+	local pg = LP:FindFirstChild("PlayerGui")
+	if not pg then
+		return false
+	end
+	local r, b = pg:FindFirstChild("RedGK"), pg:FindFirstChild("BlueGK")
+	return (r and r.Value == true) or (b and b.Value == true)
+end
+
+local function activated()
+	local pg = LP:FindFirstChild("PlayerGui")
+	local av = pg and pg:FindFirstChild("Activate")
+	return av == nil or av.Value ~= false
+end
+
+local function nearestTeammate()
+	local char = LP.Character
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	if not hrp then
+		return nil, nil
+	end
+	local best, bestD, bestName = nil, math.huge, nil
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p ~= LP and p.TeamColor == LP.TeamColor then
+			local phrp = p.Character and p.Character:FindFirstChild("HumanoidRootPart")
+			if phrp then
+				local d = (phrp.Position - hrp.Position).Magnitude
+				if d < bestD then
+					best, bestD, bestName = p, d, p.Name
+				end
+			end
+		end
+	end
+	return bestName, bestD
+end
+
+-- nearest OTHER player's character to a point (opponents and teammates both count,
+-- like a real challenger for the ball)
+local function nearestOtherTo(pos)
+	local best, bestD = nil, math.huge
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p ~= LP then
+			local phrp = p.Character and p.Character:FindFirstChild("HumanoidRootPart")
+			if phrp then
+				local d = (phrp.Position - pos).Magnitude
+				if d < bestD then
+					best, bestD = p, d
+				end
+			end
+		end
+	end
+	return best, bestD
+end
+
+--// official-path remote wrappers ----------------------------------------------
+-- every call below is a line-for-line copy of what the game's own Backpack.Module /
+-- PowersModule clients fire, same args in the same order. gates mirror theirs too.
+
+local function ballValid(ball)
+	-- Kick2Hit / TackleHit / SaveHit part checks
+	return ball ~= nil
+		and ball.Locked ~= true
+		and ball.Anchored ~= true
+		and ball.Parent ~= nil
+		and not ball.Parent:IsA("Accessory")
+		and ball.Parent:FindFirstChild("Humanoid") == nil
+end
+
+local function remotePaths()
+	local FE = Workspace:FindFirstChild("FE")
+	local sys = FE and FE:FindFirstChild("System")
+	local kickFolder = FE and FE:FindFirstChild("Kick")
+	local powers = FE and FE:FindFirstChild("Powers")
+	local bp = LP:FindFirstChild("Backpack")
+	if not (sys and kickFolder and powers and bp) then
+		return nil
+	end
+	return {
+		sys = sys,
+		kickFolder = kickFolder,
+		powers = powers,
+		bp = bp,
+		altName = sys:FindFirstChild("ALTNameA"),
+		kick = sys:FindFirstChild("Kick"),
+		tackle = sys:FindFirstChild("Tackle"),
+		save = sys:FindFirstChild("Save"),
+		autoPass = sys:FindFirstChild("AutoPass"),
+		remote = kickFolder:FindFirstChild("RemoteEvent"),
+		remote1 = kickFolder:FindFirstChild("RemoteEvent1"),
+		remote2 = kickFolder:FindFirstChild("RemoteEvent2"),
+	}
+end
+
+-- Kick2Hit replica: full charge values + the exact FE.System.Kick argument run
+local function fireKick(ball)
+	local R = remotePaths()
+	if not R or not ballValid(ball) then
+		return false
+	end
+	local bp = R.bp
+	if CFG.forcePower and bp:FindFirstChild("PowerActive") and bp.PowerActive.Value ~= true then
+		bp.PowerActive.Value = true
+	end
+	-- the game's own charge tops out here (Backpack.Module v1.Kick: i = 70)
+	bp.Speed.Value = 70
+	bp.Angle.Value = Vector3.new(4000000, 70 * 35 / 2, 4000000)
+	local Value_2 = bp.Speed.Value
+	local Value_3 = bp.Angle.Value
+	local Value_4 = bp.PowerActive.Value
+	local Value_5 = bp.Ground.Value
+	local Value_6 = bp.Curving.Value
+	R.remote:FireServer(ball)
+	R.kick:FireServer(LP.UserId, ball, Value_2, Value_3, Value_4, Value_5, Value_6, CARD, R.altName.Value, "power=95/100")
+	if bp.PowerActive.Value == true then
+		if ball.Name ~= "Bomb" then
+			bp.PowerActive.Value = false
+			local pg = LP:FindFirstChild("PlayerGui")
+			local start = pg and pg:FindFirstChild("Start")
+			local pw = start and start:FindFirstChild("PowerShot")
+			local timer = pw and pw:FindFirstChild("Timer")
+			if timer then
+				timer.Disabled = false
+			end
+		end
+		local fv = bp:FindFirstChild("FValue")
+		if R.remote1 and fv then
+			R.remote1:FireServer(ball, fv.Value)
+		end
+	end
+	return true
+end
+
+-- TackleHit replica
+local function fireTackle(ball)
+	local R = remotePaths()
+	if not R or not ballValid(ball) then
+		return false
+	end
+	R.remote:FireServer(ball)
+	R.tackle:FireServer(LP.UserId, ball, CARD, R.altName.Value, "power=95/100")
+	return true
+end
+
+-- SaveHit replica (keeper catch)
+local function fireSave(ball)
+	local R = remotePaths()
+	if not R or not ballValid(ball) then
+		return false
+	end
+	R.remote2:FireServer(ball)
+	R.save:FireServer(LP.UserId, ball, CARD, R.altName.Value, "power=95/100")
+	return true
+end
+
+-- PassHit replica: target name + my-HRP-to-their-HRP distance, exactly as the game computes it
+local function firePass(ball, targetName)
+	local R = remotePaths()
+	if not R or not ballValid(ball) or not targetName then
+		return false
+	end
+	local char = LP.Character
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	local target = Players:FindFirstChild(targetName)
+	local thrp = target and target.Character and target.Character:FindFirstChild("HumanoidRootPart")
+	if not (hrp and thrp) then
+		return false
+	end
+	local dist = (hrp.Position - thrp.Position).Magnitude
+	R.remote:FireServer(ball)
+	R.autoPass:FireServer(LP.UserId, ball, targetName, dist, R.bp.Ground.Value, CARD, R.altName.Value, "power=95/100")
+	return true
+end
+
+-- PowersModule replica: power id + the game's own count gate
+local POWER_IDS = { bomb = 1, wall = 2, spike = 3, burn = 4, supercurve = 5 }
+local function firePower(id)
+	local R = remotePaths()
+	if not R then
+		return false
+	end
+	local data = ReplicatedStorage:FindFirstChild("Data")
+	local mine = data and data:FindFirstChild(LP.Name)
+	local count = mine and mine:FindFirstChild(id)
+	if count and count.Value < 1 then
+		return false, "no " .. id .. "s left"
+	end
+	R.powers.Power:FireServer(POWER_IDS[id])
+	return true
+end
+
+--// visuals --------------------------------------------------------------------
+
+local espHL, espBall
+local beaconR, beaconB
+local distStat
+
+local function clearESP()
+	if espHL then
+		pcall(function() espHL:Destroy() end)
+	end
+	espHL, espBall = nil, nil
+end
+
+local function clearBeacons()
+	if beaconR then
+		pcall(function() beaconR:Destroy() end)
+	end
+	if beaconB then
+		pcall(function() beaconB:Destroy() end)
+	end
+	beaconR, beaconB = nil, nil
+end
+
+local function makeBeacon(name, color)
+	local h = Instance.new("Highlight")
+	h.Name = name
+	h.FillColor = color
+	h.FillTransparency = 0.6
+	h.OutlineColor = color
+	h.OutlineTransparency = 0
+	h.DepthMode = Enum.HighlightDepthMode.Occluded
+	return h
+end
+
+local function updateVisuals(ball)
+	if CFG.ballESP and ball then
+		if ball ~= espBall or not espHL or not espHL.Parent then
+			clearESP()
+			espHL = Instance.new("Highlight")
+			espHL.Name = "TpsStreetBallESP"
+			espHL.FillColor = Color3.fromRGB(255, 170, 0)
+			espHL.FillTransparency = 0.35
+			espHL.OutlineColor = Color3.fromRGB(255, 255, 255)
+			espHL.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+			espHL.Adornee = ball
+			espHL.Parent = Workspace
+			espBall = ball
+		end
+	elseif espHL then
+		clearESP()
+	end
+
+	if CFG.goalBeacons then
+		if not beaconR or not beaconR.Parent then
+			beaconR = makeBeacon("TpsStreetBeaconR", Color3.fromRGB(255, 60, 60))
+			beaconR.Parent = Workspace
+		end
+		if not beaconB or not beaconB.Parent then
+			beaconB = makeBeacon("TpsStreetBeaconB", Color3.fromRGB(60, 120, 255))
+			beaconB.Parent = Workspace
+		end
+		local r, b = Workspace:FindFirstChild("RedGoal"), Workspace:FindFirstChild("BlueGoal")
+		if beaconR.Adornee ~= r then
+			beaconR.Adornee = r
+		end
+		if beaconB.Adornee ~= b then
+			beaconB.Adornee = b
+		end
+	else
+		clearBeacons()
+	end
+end
+
+--// main loop ------------------------------------------------------------------
+
+local dead = false
+local lastAct = { kick = 0, tackle = 0, save = 0, pass = 0 }
+local lastAny = 0
+local lastErrAt = 0
+local loopConn
+local keyConn
+
+local function aimAtGoal()
+	local char = LP.Character
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	if not hrp then
+		return
+	end
+	local gp = goalCenter(attackGoal())
+	if not gp then
+		return
+	end
+	local flat = Vector3.new(gp.X - hrp.Position.X, 0, gp.Z - hrp.Position.Z)
+	if flat.Magnitude > 1 then
+		hrp.CFrame = CFrame.lookAt(hrp.Position, hrp.Position + flat.Unit)
+	end
+end
+
+local function step()
+	if dead then
+		return
+	end
+	local now = os.clock()
+	local ball, ballDist = findBall()
+	updateVisuals(ball)
+	if distStat then
+		pcall(function() distStat:Set(math.floor(ballDist or 0)) end)
+	end
+	if not ball or not activated() then
+		return
+	end
+	local char = LP.Character
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	if not hrp or not char:FindFirstChild("Humanoid") or char.Humanoid.Health == 0 then
+		return
+	end
+	local keeper = amKeeper()
+
+	-- keeper: auto save when the ball closes in (SaveHit's own keeper gate)
+	if CFG.autoGK and keeper and ballDist <= CFG.gkRange then
+		if now - lastAct.save >= CFG.cooldown and now - lastAny >= 0.3 then
+			if fireSave(ball) then
+				lastAct.save, lastAny = now, now
+			end
+		end
+		return
+	end
+
+	-- field player: shot > tackle > pass, one action at a time
+	if CFG.autoShot and not keeper and ballDist <= CFG.shotRange then
+		if now - lastAct.kick >= CFG.cooldown and now - lastAny >= 0.3 then
+			aimAtGoal()
+			if fireKick(ball) then
+				lastAct.kick, lastAny = now, now
+			end
+		end
+		return
+	end
+
+	if CFG.autoTackle and not keeper and ballDist <= CFG.tackleRange then
+		local other, otherD = nearestOtherTo(ball.Position)
+		-- steal it off whoever is closer to it than we are
+		if other and otherD < ballDist and now - lastAct.tackle >= CFG.cooldown + 0.3 and now - lastAny >= 0.3 then
+			if fireTackle(ball) then
+				lastAct.tackle, lastAny = now, now
+			end
+		end
+		return
+	end
+
+	if CFG.autoPass and not keeper and ballDist <= CFG.shotRange then
+		local name, d = nearestTeammate()
+		if name and d and d <= CFG.passRange and d > 5 then
+			if now - lastAct.pass >= CFG.cooldown and now - lastAny >= 0.3 then
+				if firePass(ball, name) then
+					lastAct.pass, lastAny = now, now
+				end
+			end
+		end
+	end
+end
+
+loopConn = RunService.Heartbeat:Connect(function()
+	local ok, err = pcall(step)
+	if not ok and os.clock() - lastErrAt > 5 then
+		lastErrAt = os.clock()
+		warn("[Street] loop error: " .. tostring(err))
+	end
+end)
+
+--// lifecycle ------------------------------------------------------------------
+
+local FLAGS = { "autoshot", "forcethepower", "autotackle", "autogk", "autopass", "ballesp", "goalbeacons" }
+
+local function panic()
+	CFG.autoShot = false
+	CFG.forcePower = false
+	CFG.autoTackle = false
+	CFG.autoGK = false
+	CFG.autoPass = false
+	CFG.ballESP = false
+	CFG.goalBeacons = false
+	clearESP()
+	clearBeacons()
+	if window then
+		for _, f in ipairs(FLAGS) do
+			pcall(function() window:Set(f, false) end)
+		end
+	end
+	print("[Street] panic: hands off - everything off")
+end
+
+local window
+
+local function shutdown()
+	if dead then
+		return
+	end
+	dead = true
+	if loopConn then
+		loopConn:Disconnect()
+		loopConn = nil
+	end
+	if keyConn then
+		keyConn:Disconnect()
+		keyConn = nil
+	end
+	clearESP()
+	clearBeacons()
+	if window then
+		pcall(function() window:Unload() end)
+	end
+	_G.TpsStreetPanel = nil
+	print("[Street] unloaded")
+end
+
+keyConn = UserInputService.InputBegan:Connect(function(i, gp)
+	if gp then
+		return
+	end
+	if i.KeyCode == Enum.KeyCode.P then
+		panic()
+	end
+end)
+
+--// UI -------------------------------------------------------------------------
+
+local Rayfield
+pcall(function() Rayfield = loadstring(game:HttpGet("https://sirius.menu/gen2"))() end)
+
+local function buildUI()
+	if not Rayfield then
+		return
+	end
+	local w = Rayfield:CreateWindow({
+		Name = "TPS STREET SOCCER | STREET",
+		LoadingTitle = "STREET",
+		LoadingSubtitle = "auto shot, tackle, GK, ball ESP",
+		KeySystem = false,
+	})
+	window = w
+	local play = w:CreateTab({ name = "PLAY" })
+	local view = w:CreateTab({ name = "VIEW" })
+	local sys = w:CreateTab({ name = "SYS" })
+
+	play:CreateToggle({ name = "auto shot", description = "ball in range -> face their net and let it rip at the game's own full charge (Speed 70). keeper? it stays off, exactly like the game's own kick gate", flag = "autoshot", value = CFG.autoShot, callback = function(v) CFG.autoShot = v end })
+	play:CreateSlider({ name = "shot range", description = "studs from you to the ball before the auto shot fires - keep it inside a real stride", flag = "shotrange", range = { 3, 15 }, increment = .5, value = CFG.shotRange, suffix = " st", callback = function(v) CFG.shotRange = v end })
+	play:CreateToggle({ name = "force power shot", description = "arm the power shot on every kick (sets the game's own PowerActive flag first) - off by default so you burn it only when you want", flag = "forcethepower", value = CFG.forcePower, callback = function(v) CFG.forcePower = v end })
+	play:CreateSlider({ name = "action cooldown", description = "seconds between same-type actions, keeps the rhythm human", flag = "cooldown", range = { .3, 3 }, increment = .1, value = CFG.cooldown, suffix = " s", callback = function(v) CFG.cooldown = v end })
+
+	play:CreateSection({ name = "DEFENSE" })
+	play:CreateToggle({ name = "auto tackle", description = "an opponent closer to the ball than you inside range -> strip it with the game's own tackle remote", flag = "autotackle", value = CFG.autoTackle, callback = function(v) CFG.autoTackle = v end })
+	play:CreateSlider({ name = "tackle range", description = "studs to the ball before tackles trigger", flag = "tacklerange", range = { 4, 20 }, increment = .5, value = CFG.tackleRange, suffix = " st", callback = function(v) CFG.tackleRange = v end })
+	play:CreateToggle({ name = "auto GK save", description = "you're in goal and the ball closes in -> keeper catch via the game's own save remote (SaveHit)", flag = "autogk", value = CFG.autoGK, callback = function(v) CFG.autoGK = v end })
+	play:CreateSlider({ name = "GK range", description = "studs to the ball before the save fires", flag = "gkrange", range = { 4, 25 }, increment = .5, value = CFG.gkRange, suffix = " st", callback = function(v) CFG.gkRange = v end })
+	play:CreateToggle({ name = "auto pass", description = "ball at your feet and a teammate open -> quick pass through the game's own AutoPass remote, target + distance computed the way PassHit does", flag = "autopass", value = CFG.autoPass, callback = function(v) CFG.autoPass = v end })
+	play:CreateSlider({ name = "pass range", description = "max teammate distance for a pass", flag = "passrange", range = { 10, 120 }, increment = 5, value = CFG.passRange, suffix = " st", callback = function(v) CFG.passRange = v end })
+
+	play:CreateSection({ name = "POWERS" })
+	play:CreateButton({ name = "drop bomb", description = "the game's own power remote (id 1), only while you have one", callback = function() local ok, why = firePower("bomb") if not ok then print("[Street] " .. (why or "no path")) end end })
+	play:CreateButton({ name = "raise wall", description = "power remote (id 2)", callback = function() local ok, why = firePower("wall") if not ok then print("[Street] " .. (why or "no path")) end end })
+	play:CreateButton({ name = "throw spikes", description = "power remote (id 3)", callback = function() local ok, why = firePower("spike") if not ok then print("[Street] " .. (why or "no path")) end end })
+	play:CreateButton({ name = "set burn", description = "power remote (id 4)", callback = function() local ok, why = firePower("burn") if not ok then print("[Street] " .. (why or "no path")) end end })
+	play:CreateButton({ name = "super curve", description = "power remote (id 5) - arms it if you carry one", callback = function() local ok, why = firePower("supercurve") if not ok then print("[Street] " .. (why or "no path")) end end })
+
+	view:CreateToggle({ name = "ball ESP", description = "orange glow on the live ball - re-locks the moment it respawns", flag = "ballesp", value = CFG.ballESP, callback = function(v) CFG.ballESP = v if not v then clearESP() end end })
+	view:CreateToggle({ name = "goal beacons", description = "red + blue glow on both nets", flag = "goalbeacons", value = CFG.goalBeacons, callback = function(v) CFG.goalBeacons = v if not v then clearBeacons() end end })
+	distStat = view:CreateStat({ name = "ball distance", value = 0, suffix = " st" })
+
+	sys:CreateButton({ name = "panic (P)", description = "everything off, hands back to you", callback = panic })
+	sys:CreateButton({ name = "unload panel", description = "tear everything down", callback = shutdown })
+end
+
+buildUI()
+
+_G.TpsStreetPanel = {
+	cfg = CFG,
+	window = window,
+	stop = shutdown,
+	panic = panic,
+	ball = findBall,
+	goal = attackGoal,
+	keeper = amKeeper,
+	fireKick = fireKick,
+	fireTackle = fireTackle,
+	fireSave = fireSave,
+	firePass = firePass,
+	firePower = firePower,
+	state = function()
+		local ball, d = findBall()
+		return {
+			place = game.PlaceId,
+			team = tostring(LP.TeamColor),
+			keeper = amKeeper(),
+			ball = ball and ball.Name .. "@" .. tostring(ball.Position) or nil,
+			ballDist = d,
+			attackGoal = goalCenter(attackGoal()) and tostring(goalCenter(attackGoal())) or nil,
+			paths = remotePaths() ~= nil,
+		}
+	end,
+}
+
+print("[Street] panel loaded - auto shot, tackles, GK saves, passes, powers, ball ESP | paths "
+	.. (remotePaths() and "ok" or "missing (lobby place?)"))
+end
+
+--// embedded suite: rss  (from rss-panel.luau) =========================
+Hub.SUITE.rss = function()
+-- Realistic Street Soccer | STREET - auto shot (power + curve + kick anims), auto
+-- pass, auto tackle, auto header, auto GK dive, auto grab, auto crossover, ball ESP,
+-- goal beacons
+-- place 14315258385 | Rayfield Gen2 | replace-not-stack via _G.RssStreetPanel
+-- rides only official paths: fires the game's own Remotes (ShootTheBaII / Pass / Action /
+-- the attribute grab remote) with the exact argument patterns its StarterCharacterScripts
+-- controller sends, and gates on the same Bools/states its own clients check.
+-- never touches Remotes.Tackle or Remotes.ShootTheBall (never fired by the PC client -
+-- decoy names), never fires GKHitbox / MatchAborted style server->client events.
+
+local prev = _G.RssStreetPanel
+local CFG = (prev and prev.cfg) or {}
+-- defaults merge: keeps saved settings across reloads, fills in fields added later
+for k, v in pairs({
+	autoPlay = false,
+	autoShot = true,
+	shotRange = 8,
+	shotGoalRange = 90,
+	shotPower = 85,
+	shotCurve = 0,
+	powerMode = false,
+	autoPass = false,
+	passRange = 60,
+	autoTackle = false,
+	tackleRange = 8,
+	autoHeader = false,
+	autoCrossover = false,
+	crossoverRange = 9,
+	autoGrab = true,
+	autoGK = false,
+	gkRange = 16,
+	ballESP = true,
+	goalBeacons = true,
+	playerESP = false,
+	cooldown = 0.9,
+}) do
+	if CFG[k] == nil then
+		CFG[k] = v
+	end
+end
+if prev and prev.stop then
+	pcall(prev.stop)
+end
+_G.RssStreetPanel = { cfg = CFG }
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+local TweenService = game:GetService("TweenService")
+local Debris = game:GetService("Debris")
+local LP = Players.LocalPlayer
+
+-- the game's own shared ball library: getBall / teamOf / state come straight from it
+local BallContext
+pcall(function()
+	BallContext = require(ReplicatedStorage:WaitForChild("BallContext"))
+end)
+
+--// locators -------------------------------------------------------------------
+
+-- getBall replica (non-tutorial: the single Workspace ball part)
+local function findBall()
+	if BallContext then
+		local ok, b = pcall(BallContext.getBall, LP)
+		if ok and b then
+			return b
+		end
+	end
+	return Workspace:FindFirstChild("ball")
+end
+
+local function myBools(char)
+	return char and char:FindFirstChild("Bools")
+end
+
+-- BallContext.state replica: round states live in workspace.Bools.<name>.Value
+local function state(name)
+	local f = Workspace:FindFirstChild("Bools")
+	local v = f and f:FindFirstChild(name)
+	return v and v.Value == true or false
+end
+
+local HOME = BrickColor.new(141) -- BallContext.HOME
+local AWAY = BrickColor.new(23) -- BallContext.AWAY
+
+local function amPlaying()
+	-- Fans / neutral never act; only the two field teams do
+	local tc = LP.TeamColor
+	return tc == HOME or tc == AWAY
+end
+
+local function teamColor()
+	return LP.TeamColor
+end
+
+-- team 23 (Away) scores on HomeGoal, team 141 (Home) on AwayGoal (mobile ShootScript)
+local function attackGoal()
+	if teamColor() == AWAY then
+		return Workspace:FindFirstChild("HomeGoal")
+	elseif teamColor() == HOME then
+		return Workspace:FindFirstChild("AwayGoal")
+	end
+	return nil
+end
+
+local function ownGoal()
+	if teamColor() == HOME then
+		return Workspace:FindFirstChild("HomeGoal")
+	elseif teamColor() == AWAY then
+		return Workspace:FindFirstChild("AwayGoal")
+	end
+	return nil
+end
+
+local function goalCenter(model)
+	if not model then
+		return nil
+	end
+	if model:IsA("BasePart") then
+		return model.Position
+	end
+	local ok, cf = pcall(function()
+		return model:GetBoundingBox()
+	end)
+	if ok and cf then
+		return cf.Position
+	end
+	for _, d in ipairs(model:GetDescendants()) do
+		if d:IsA("BasePart") then
+			return d.Position
+		end
+	end
+	return nil
+end
+
+-- the designated keepers, straight from the game's own round bools
+local function keeperBool()
+	local f = Workspace:FindFirstChild("Bools")
+	return f and f:FindFirstChild("HPG"), f and f:FindFirstChild("APG")
+end
+
+local function amKeeper()
+	local hpg, apg = keeperBool()
+	return (hpg and hpg.Value == LP) or (apg and apg.Value == LP)
+end
+
+local function enemyKeeperChar()
+	local hpg, apg = keeperBool()
+	local kp
+	if teamColor() == HOME then
+		kp = apg and apg.Value
+	else
+		kp = hpg and hpg.Value
+	end
+	return kp and kp.Character or nil
+end
+
+-- the game's own target set for aiming (mobile ShootScript uses Goal.Targets)
+local function goalTargets(goalModel)
+	local t = goalModel and goalModel:FindFirstChild("Targets")
+	if not t then
+		return {}
+	end
+	local out = {}
+	for _, c in ipairs(t:GetChildren()) do
+		if c:IsA("BasePart") then
+			table.insert(out, c)
+		end
+	end
+	return out
+end
+
+-- FindClosestPlayer replica (StarterCharacterScripts controller): closest teammate
+-- to a point 190 studs ahead of the camera, keepers and self excluded, FieldBots included
+local function findClosestTeammate()
+	local char = LP.Character
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	local cam = Workspace:FindFirstChild("Camera") or Workspace.CurrentCamera
+	if not (hrp and cam) then
+		return nil, nil
+	end
+	local probe = hrp.Position + cam.CFrame.LookVector * 190
+	local best, bestD = nil, math.huge
+	local hpg, apg = keeperBool()
+	for _, p in ipairs(Players:GetPlayers()) do
+		local phrp = p.Character and p.Character:FindFirstChild("HumanoidRootPart")
+		if
+			phrp
+			and p ~= LP
+			and p.TeamColor == teamColor()
+			and p ~= (hpg and hpg.Value)
+			and p ~= (apg and apg.Value)
+		then
+			local d = (phrp.Position - probe).Magnitude
+			if d < bestD then
+				best, bestD = p, d
+			end
+		end
+	end
+	local fieldBots = Workspace:FindFirstChild("FieldBots")
+	if fieldBots then
+		for _, bot in ipairs(fieldBots:GetChildren()) do
+			local bb = bot:FindFirstChild("BotBools")
+			local bhrp = bot:FindFirstChild("HumanoidRootPart")
+			if bb and bhrp and bb:FindFirstChild("TeamColor") and bb.TeamColor.Value == teamColor() then
+				local d = (bhrp.Position - probe).Magnitude
+				if d < bestD then
+					best, bestD = bot, d
+				end
+			end
+		end
+	end
+	return best, bestD
+end
+
+local function nearestOpponentTo(pos)
+	local best, bestD = nil, math.huge
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p ~= LP and p.TeamColor ~= teamColor() and p.TeamColor ~= BrickColor.new("White") then
+			local phrp = p.Character and p.Character:FindFirstChild("HumanoidRootPart")
+			if phrp then
+				local d = (phrp.Position - pos).Magnitude
+				if d < bestD then
+					best, bestD = p, d
+				end
+			end
+		end
+	end
+	return best, bestD
+end
+
+-- nearest opponent standing in the carry path (players and enemy FieldBots),
+-- in front of us along dir and inside range - the one a crossover would beat
+local function defenderAhead(hrp, dir, range)
+	local best, bestD = nil, math.huge
+	local function consider(phrp)
+		if not phrp then
+			return
+		end
+		local rel = Vector3.new(phrp.Position.X - hrp.Position.X, 0, phrp.Position.Z - hrp.Position.Z)
+		local d = rel.Magnitude
+		if d > 0.5 and d < range and rel.Unit:Dot(dir) > 0.5 and d < bestD then
+			best, bestD = phrp, d
+		end
+	end
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p ~= LP and p.TeamColor ~= teamColor() and p.TeamColor ~= BrickColor.new("White") then
+			consider(p.Character and p.Character:FindFirstChild("HumanoidRootPart"))
+		end
+	end
+	local fieldBots = Workspace:FindFirstChild("FieldBots")
+	if fieldBots then
+		for _, bot in ipairs(fieldBots:GetChildren()) do
+			local bb = bot:FindFirstChild("BotBools")
+			local bhrp = bot:FindFirstChild("HumanoidRootPart")
+			if bb and bhrp and bb:FindFirstChild("TeamColor") and bb.TeamColor.Value ~= teamColor() then
+				consider(bhrp)
+			end
+		end
+	end
+	return best, bestD
+end
+
+-- a pressing defender: one closing on us fast while we carry, mid-tackle lunge
+-- (their own Tackling flag - exactly what the game's E-key raises), or standing in
+-- our stride. any direction - presses come from behind and the side too
+local function findPress(hrp, range)
+	local best
+	local myVel = hrp.AssemblyLinearVelocity
+	local flatVel = Vector3.new(myVel.X, 0, myVel.Z)
+	local mySpeed = flatVel.Magnitude
+	local function consider(phrp)
+		if not phrp then
+			return
+		end
+		local rel = Vector3.new(phrp.Position.X - hrp.Position.X, 0, phrp.Position.Z - hrp.Position.Z)
+		local d = rel.Magnitude
+		if d < 0.5 or d > range then
+			return
+		end
+		local unit = rel.Unit
+		local relVel = phrp.AssemblyLinearVelocity - myVel
+		local closing = -Vector3.new(relVel.X, 0, relVel.Z):Dot(unit) -- + = gap shrinking
+		-- their committed tackle lunge is the strongest press signal there is
+		local holder = phrp.Parent
+		local pb = holder and (holder:FindFirstChild("Bools") or holder:FindFirstChild("BotBools"))
+		local tackleFlag = pb and pb:FindFirstChild("Tackling")
+		local lunging = tackleFlag ~= nil and tackleFlag.Value == true
+		local score
+		if lunging then
+			score = 100 + (range - d) -- they've committed: beat it now
+		elseif closing > 8 then
+			score = closing * 2 + (range - d) -- sprinting onto us: it's a press
+		elseif mySpeed > 6 and unit:Dot(flatVel.Unit) > 0.6 and d <= range * 0.8 then
+			score = range - d -- parked in our stride as we run at them
+		else
+			return
+		end
+		if not best or score > best.score then
+			best = { hrp = phrp, dist = d, closing = closing, lunging = lunging, score = score }
+		end
+	end
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p ~= LP and p.TeamColor ~= teamColor() and p.TeamColor ~= BrickColor.new("White") then
+			consider(p.Character and p.Character:FindFirstChild("HumanoidRootPart"))
+		end
+	end
+	local fieldBots = Workspace:FindFirstChild("FieldBots")
+	if fieldBots then
+		for _, bot in ipairs(fieldBots:GetChildren()) do
+			local bb = bot:FindFirstChild("BotBools")
+			local bhrp = bot:FindFirstChild("HumanoidRootPart")
+			if bb and bhrp and bb:FindFirstChild("TeamColor") and bb.TeamColor.Value ~= teamColor() then
+				consider(bhrp)
+			end
+		end
+	end
+	return best
+end
+
+-- entity helpers that work for both players and FieldBots (the game's own teamOf does the same)
+local function entChar(ent)
+	if not ent then
+		return nil
+	end
+	if ent:IsA("Player") then
+		return ent.Character
+	end
+	if ent:IsA("Model") then
+		return ent
+	end
+	return nil
+end
+
+local function entTeam(ent)
+	if not ent then
+		return nil
+	end
+	if BallContext then
+		local ok, t = pcall(BallContext.teamOf, ent)
+		if ok and t then
+			return t
+		end
+	end
+	if ent:IsA("Player") then
+		return ent.TeamColor
+	end
+	local bb = ent:FindFirstChild("BotBools")
+	local tc = bb and bb:FindFirstChild("TeamColor")
+	return tc and tc.Value or nil
+end
+
+--// official-path remote wrappers ----------------------------------------------
+-- every call below is a copy of what the game's own StarterCharacterScripts
+-- controller fires, same args in the same order, gated the same way it gates them.
+
+local Remotes = ReplicatedStorage:FindFirstChild("Remotes")
+
+local function remotePaths()
+	if not Remotes then
+		return nil
+	end
+	local shoot = Remotes:FindFirstChild("ShootTheBaII") -- capital i's: the PC client's remote
+	local pass = Remotes:FindFirstChild("Pass")
+	local action = Remotes:FindFirstChild("Action")
+	if not (shoot and pass and action) then
+		return nil
+	end
+	-- the grab remote is found by attribute exactly like the controller finds it
+	local grab
+	for _, v in ipairs(Remotes:GetChildren()) do
+		if v:IsA("RemoteEvent") and v:GetAttribute("Attribute") then
+			grab = v
+		end
+	end
+	return { shoot = shoot, pass = pass, action = action, grab = grab }
+end
+
+local function ballValid(ball)
+	return ball ~= nil and ball.Parent ~= nil and not ball.Anchored
+end
+
+-- i possess the ball: welded at my feet with me as creator (the controller's own shot gate)
+local function possessing(ball)
+	local weld = ball and ball:FindFirstChild("playerWeld")
+	local creator = ball and ball:FindFirstChild("creator")
+	return weld ~= nil and creator ~= nil and creator.Value == LP
+end
+
+local function booleansClean(char)
+	local b = myBools(char)
+	if not b then
+		return false
+	end
+	local t, d, k = b:FindFirstChild("Tackled"), b:FindFirstChild("Debounce"), b:FindFirstChild("Tackling")
+	return (t and t.Value ~= true) and (d and d.Value ~= true) and (k and k.Value ~= true)
+end
+
+--// shot animation + curve (the controller's own kick anims and curve physics) ---
+
+local shootTrackCache = {}
+
+local function getShootTrack(char, name)
+	local perChar = shootTrackCache[char]
+	if not perChar then
+		perChar = {}
+		shootTrackCache[char] = perChar
+	end
+	local track = perChar[name]
+	if not track then
+		local anims = ReplicatedStorage:FindFirstChild("Animations")
+		local anim = anims and anims:FindFirstChild(name)
+		local animator = char and char:FindFirstChildOfClass("Animator")
+		local human = char and char:FindFirstChild("Humanoid")
+		local loader = animator or human
+		if anim and loader then
+			track = loader:LoadAnimation(anim)
+			perChar[name] = track
+		end
+	end
+	return track
+end
+
+-- the controller plays its kick right before the shot fires: RShoot on a quick
+-- release, the direction variants on charged shots, RPowerShoot on powershots -
+-- all at its Action4 priority
+local function playShootAnim(char, aimDir, hold, power)
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	if not (hrp and aimDir) then
+		return
+	end
+	local name = "RShoot"
+	if power then
+		name = "RPowerShoot"
+	elseif hold and hold > 0.5 then
+		-- aim angle in the character's object space picks the variant
+		local obj = hrp.CFrame:VectorToObjectSpace(aimDir)
+		local ang = math.deg(math.atan2(obj.X, -obj.Z))
+		if ang <= -135 or ang >= 135 then
+			name = "RShootBackward"
+		elseif ang <= -40 then
+			name = "RShootLeft"
+		else
+			name = "RShoot2"
+		end
+	end
+	local chosen = getShootTrack(char, name)
+	for _, n in ipairs({ "RShoot", "RShoot2", "RShootLeft", "RShootBackward", "RPowerShoot" }) do
+		local t = getShootTrack(char, n)
+		if t and t ~= chosen and t.IsPlaying then
+			pcall(function()
+				t:Stop()
+			end)
+		end
+	end
+	if chosen then
+		chosen.Priority = Enum.AnimationPriority.Action4
+		chosen:Play()
+	end
+end
+
+-- solve a shot: aim direction, charge seconds, curve side - bending `bend` studs
+-- around the keeper and still landing on the target. curve model is the game's own
+-- (aim beam predict): +20 st/s lateral kick on the curve side, -90 st/s^2 back for
+-- 0.4s, net landing offset 14.4 - 16*flightTime along the aim's right
+local function solveShot(ball, target, bend, powerPct)
+	if not (ball and target) then
+		return nil
+	end
+	local flat = Vector3.new(target.X - ball.Position.X, 0, target.Z - ball.Position.Z)
+	if flat.Magnitude < 2 then
+		return nil
+	end
+	local dir = flat.Unit
+	local hold = math.clamp((powerPct or 85) / 100, 0.01, 1)
+	local curve = "None"
+	if (bend or 0) > 0 then
+		-- flight time that bends the ball `bend` studs: |14.4 - 16*T| = bend
+		local T = 0.9 + bend / 16
+		local holdNeeded = (flat.Magnitude / T - 32) / 81
+		hold = math.clamp(holdNeeded, 0.75, 1)
+		hold = math.min(hold, math.max((powerPct or 85) / 100, 0.75))
+		local T2 = flat.Magnitude / (32 + 81 * hold)
+		local D = 14.4 - 16 * T2 -- net landing offset along the aim's right
+		if D < -0.5 then
+			-- swing at the keeper's side of the line, curl back onto the target
+			local right = CFrame.lookAt(Vector3.zero, dir).RightVector
+			local keeper = enemyKeeperChar()
+			local khrp = keeper and keeper:FindFirstChild("HumanoidRootPart")
+			local side = 1
+			if khrp then
+				local lat = Vector3.new(
+					khrp.Position.X - ball.Position.X,
+					0,
+					khrp.Position.Z - ball.Position.Z
+				):Dot(right)
+				side = lat >= 0 and 1 or -1
+			end
+			curve = side > 0 and "Right" or "Left"
+			local aimPoint = target - D * side * right
+			local flat2 = Vector3.new(aimPoint.X - ball.Position.X, 0, aimPoint.Z - ball.Position.Z)
+			if flat2.Magnitude > 2 then
+				dir = flat2.Unit
+			end
+		else
+			curve = "None" -- too close to bend at this charge - straight shot
+		end
+	end
+	return dir, hold, curve
+end
+
+-- shot replica (controller mouserelease PC form): aim unit, ball CFrame, charge
+-- seconds, aim again, false, false, curve side, nil, powershot flag - with the
+-- controller's own kick animation and its Curve value lifecycle
+local function fireShot(ball, aimDir, hold, curve)
+	local R = remotePaths()
+	if not R or not ballValid(ball) then
+		return false
+	end
+	local char = LP.Character
+	if not char then
+		return false
+	end
+	hold = math.clamp(hold or 0.85, 0.01, 1)
+	curve = curve or "None"
+	local b = myBools(char)
+	local curveObj = b and b:FindFirstChild("Curve")
+	if curve ~= "None" and curveObj then
+		curveObj.Value = curve -- the game's own client holds this while curving
+	end
+	playShootAnim(char, aimDir, hold)
+	R.shoot:FireServer(aimDir, ball.CFrame, hold, aimDir, false, false, curve, nil, false)
+	if curve ~= "None" and curveObj then
+		curveObj.Value = "None" -- the game's own scripts reset it after the shot
+	end
+	return true
+end
+
+-- full power shot replica (controller charged powershot path, power 1)
+local function firePowerShot(ball, aimDir)
+	local R = remotePaths()
+	if not R or not ballValid(ball) then
+		return false
+	end
+	local char = LP.Character
+	local head = char and char:FindFirstChild("Head")
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	if not (head and hrp) then
+		return false
+	end
+	local cf = CFrame.new(ball.Position.X, head.CFrame.Y, ball.Position.Z)
+	R.shoot:FireServer(aimDir - Vector3.new(0, 0.11, 0), cf, 1, hrp.CFrame.LookVector * 2000, false, true)
+	return true
+end
+
+-- pass replica (controller pass(): FindClosestPlayer + ball CFrame)
+local function firePass(ball)
+	local R = remotePaths()
+	if not R or not ballValid(ball) then
+		return false
+	end
+	local target = findClosestTeammate()
+	if not target then
+		return false
+	end
+	R.pass:FireServer(target, ball.CFrame)
+	return true
+end
+
+-- tackle replica (controller E-key path: Action "TackIe", capital i as the game spells it)
+local function fireTackle()
+	local R = remotePaths()
+	if not R then
+		return false
+	end
+	R.action:FireServer("TackIe")
+	return true
+end
+
+-- header replica (controller headerOld: BicycleKick while a pass is inbound, else Header)
+local function fireHeader(ball)
+	local R = remotePaths()
+	if not R then
+		return false
+	end
+	if ball and ball:FindFirstChild("PassBV") then
+		R.action:FireServer("BicycleKick")
+	else
+		R.action:FireServer("Header")
+	end
+	return true
+end
+
+-- deke replica (controller deke() / Q-key Dribble): the game's own dribble-skill
+-- action - the server plays whichever skill you have equipped (crossover, ronaldo
+-- chop, elastico, stepover...), the client just fires "Deke" under these exact gates
+local function fireDeke(ball)
+	local R = remotePaths()
+	if not R or not ballValid(ball) then
+		return false
+	end
+	local char = LP.Character
+	local b = myBools(char)
+	if not (char and b) then
+		return false
+	end
+	local iframe = b:FindFirstChild("iframe")
+	local ddelay = b:FindFirstChild("dribbleDebounce")
+	local headerFlag = b:FindFirstChild("Header")
+	local lb = char:FindFirstChild("LocalBool")
+	local charging = lb and lb:FindFirstChild("PowerShoot")
+	if
+		possessing(ball)
+		and booleansClean(char)
+		and not (iframe and iframe.Value == true)
+		and not (ddelay and ddelay.Value == true)
+		and not (headerFlag and headerFlag.Value == true)
+		and not (charging and charging.Value == true)
+		and state("FreeKick") == false
+		and not state("Penalty")
+		and not amKeeper()
+	then
+		R.action:FireServer("Deke")
+		return true
+	end
+	return false
+end
+
+-- dive replica (controller rightdive/leftdive/frontdive): the Action remote plus the
+-- exact client physics the game applies - BodyVelocity 35 studs/s for 0.8s + keeper gyro
+local function fireDive(side)
+	local R = remotePaths()
+	if not R then
+		return false
+	end
+	local char = LP.Character
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	if not hrp then
+		return false
+	end
+	local human = char:FindFirstChild("Humanoid")
+	if human then
+		human:SetStateEnabled(Enum.HumanoidStateType.Jumping, false)
+	end
+	R.action:FireServer(side, hrp.CFrame)
+	local bv = Instance.new("BodyVelocity")
+	bv.Parent = hrp
+	if side == "LeftDive" then
+		bv.Velocity = hrp.CFrame.RightVector * -35
+	elseif side == "FrontDive" then
+		bv.Velocity = hrp.CFrame.LookVector * 35
+	else
+		bv.Velocity = hrp.CFrame.RightVector * 35
+	end
+	bv.MaxForce = Vector3.new(4000000, 0, 4000000)
+	Debris:AddItem(bv, 0.8)
+	TweenService:Create(bv, TweenInfo.new(0.5, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut), {
+		Velocity = bv.Velocity * 0.1,
+	}):Play()
+	local gyro = Instance.new("BodyGyro")
+	gyro.Name = "GKGyro"
+	gyro.Parent = hrp
+	gyro.P = 950000
+	gyro.MaxTorque = Vector3.new(0, 100000, 0)
+	gyro.CFrame = hrp.CFrame
+	Debris:AddItem(gyro, 0.8)
+	task.delay(1, function()
+		if human and human.Parent then
+			human:SetStateEnabled(Enum.HumanoidStateType.Jumping, true)
+		end
+	end)
+	return true
+end
+
+-- grab replica (controller ball-touch path): the attribute remote + GrabTick, exactly
+-- how the game's own client picks up an incoming pass
+local function fireGrab(ball, dist)
+	local R = remotePaths()
+	if not R or not R.grab or not ballValid(ball) then
+		return false
+	end
+	local char = LP.Character
+	local b = myBools(char)
+	local gt = b and b:FindFirstChild("GrabTick")
+	if gt then
+		gt.Value = tick()
+	end
+	R.grab:FireServer(dist)
+	return true
+end
+
+--// aim -------------------------------------------------------------------------
+
+-- pick the goal target farthest from the enemy keeper (else the nearest opponent)
+local function bestTarget()
+	local goal = attackGoal()
+	local targets = goalTargets(goal)
+	if #targets == 0 then
+		return goalCenter(goal)
+	end
+	local keeper = enemyKeeperChar()
+	local keeperHrp = keeper and keeper:FindFirstChild("HumanoidRootPart")
+	local refPos
+	if keeperHrp then
+		refPos = keeperHrp.Position
+	else
+		local ball = findBall()
+		local opp, _ = nearestOpponentTo(ball and ball.Position or (goalCenter(goal) or Vector3.zero))
+		refPos = opp and opp.Character and opp.Character:FindFirstChild("HumanoidRootPart")
+			and opp.Character.HumanoidRootPart.Position
+			or nil
+	end
+	local best, bestD = nil, -1
+	for _, t in ipairs(targets) do
+		local d = refPos and (refPos - t.Position).Magnitude or 0
+		if d > bestD then
+			best, bestD = t, d
+		end
+	end
+	return best and best.Position or goalCenter(goal)
+end
+
+-- mobile ShootScript aim math: unit from the ball to the chosen target
+local function aimDir(ball)
+	local tp = bestTarget()
+	if not tp then
+		return nil
+	end
+	local delta = tp - ball.Position
+	if delta.Magnitude < 0.5 then
+		return nil
+	end
+	return delta.Unit
+end
+
+-- face a point flat on the ground, like the game's own movement does
+local function face(char, pos)
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	if not hrp or not pos then
+		return
+	end
+	local flat = Vector3.new(pos.X - hrp.Position.X, 0, pos.Z - hrp.Position.Z)
+	if flat.Magnitude > 1 then
+		hrp.CFrame = CFrame.lookAt(hrp.Position, hrp.Position + flat.Unit)
+	end
+end
+
+--// visuals --------------------------------------------------------------------
+
+local espHL, espBall
+local beaconAtk, beaconOwn
+local playerHLs = {}
+local distStat, speedStat
+
+local function clearESP()
+	if espHL then
+		pcall(function()
+			espHL:Destroy()
+		end)
+	end
+	espHL, espBall = nil, nil
+end
+
+local function clearBeacons()
+	for _, b in ipairs({ beaconAtk, beaconOwn }) do
+		if b then
+			pcall(function()
+				b:Destroy()
+			end)
+		end
+	end
+	beaconAtk, beaconOwn = nil, nil
+end
+
+local function clearPlayerESP()
+	for _, h in pairs(playerHLs) do
+		pcall(function()
+			h:Destroy()
+		end)
+	end
+	playerHLs = {}
+end
+
+local function makeBeacon(name, color)
+	local h = Instance.new("Highlight")
+	h.Name = name
+	h.FillColor = color
+	h.FillTransparency = 0.6
+	h.OutlineColor = color
+	h.OutlineTransparency = 0
+	h.DepthMode = Enum.HighlightDepthMode.Occluded
+	return h
+end
+
+local function updateVisuals(ball)
+	if CFG.ballESP and ball then
+		if ball ~= espBall or not espHL or not espHL.Parent then
+			clearESP()
+			espHL = Instance.new("Highlight")
+			espHL.Name = "RssStreetBallESP"
+			espHL.FillColor = Color3.fromRGB(255, 170, 0)
+			espHL.FillTransparency = 0.35
+			espHL.OutlineColor = Color3.fromRGB(255, 255, 255)
+			espHL.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+			espHL.Adornee = ball
+			espHL.Parent = Workspace
+			espBall = ball
+		end
+	elseif espHL then
+		clearESP()
+	end
+
+	if CFG.goalBeacons then
+		if not beaconAtk or not beaconAtk.Parent then
+			beaconAtk = makeBeacon("RssStreetBeaconAtk", Color3.fromRGB(60, 255, 90))
+			beaconAtk.Parent = Workspace
+		end
+		if not beaconOwn or not beaconOwn.Parent then
+			beaconOwn = makeBeacon("RssStreetBeaconOwn", Color3.fromRGB(255, 60, 60))
+			beaconOwn.Parent = Workspace
+		end
+		local a, o = attackGoal(), ownGoal()
+		if beaconAtk.Adornee ~= a then
+			beaconAtk.Adornee = a
+		end
+		if beaconOwn.Adornee ~= o then
+			beaconOwn.Adornee = o
+		end
+	else
+		clearBeacons()
+	end
+
+	if CFG.playerESP then
+		local seen = {}
+		for _, p in ipairs(Players:GetPlayers()) do
+			if p ~= LP and p.Character then
+				seen[p] = true
+				local h = playerHLs[p]
+				if not h or not h.Parent then
+					h = Instance.new("Highlight")
+					h.Name = "RssStreetPlayerESP"
+					h.FillTransparency = 0.55
+					h.DepthMode = Enum.HighlightDepthMode.Occluded
+					h.Adornee = p.Character
+					h.Parent = Workspace
+					playerHLs[p] = h
+				end
+				local mate = p.TeamColor == teamColor()
+				h.FillColor = mate and Color3.fromRGB(60, 255, 90) or Color3.fromRGB(255, 60, 60)
+				h.OutlineColor = h.FillColor
+				h.Enabled = p.TeamColor == HOME or p.TeamColor == AWAY
+			end
+		end
+		for p, h in pairs(playerHLs) do
+			if not seen[p] or not p.Character then
+				pcall(function()
+					h:Destroy()
+				end)
+				playerHLs[p] = nil
+			end
+		end
+	else
+		clearPlayerESP()
+	end
+end
+
+--// auto play movement ---------------------------------------------------------
+-- plain Humanoid:MoveTo walking - the same motion WASD produces, no remote involved.
+
+local lastMoveTarget, lastMoveAt = nil, 0
+local veerUntil, veerPos = 0, nil
+
+local function moveTo(char, pos)
+	local humanoid = char and char:FindFirstChild("Humanoid")
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	if not (humanoid and hrp and pos) then
+		return
+	end
+	local flat = Vector3.new(pos.X, hrp.Position.Y, pos.Z)
+	if not lastMoveTarget or (flat - lastMoveTarget).Magnitude > 1.5 or os.clock() - lastMoveAt > 1 then
+		lastMoveTarget = flat
+		lastMoveAt = os.clock()
+		humanoid:MoveTo(flat)
+	end
+end
+
+local function moveUnlocked()
+	-- the game freezes players during cutscenes and celebrations; don't fight it
+	return not state("Cutscene") and not state("freezeplay")
+end
+
+local function keeperAutoMove(char, ball)
+	local goalPos = goalCenter(ownGoal())
+	if not goalPos then
+		return
+	end
+	-- hold the line: stand a few studs off our goal center, on the ball's line
+	local dir = ball.Position - goalPos
+	local flat = Vector3.new(dir.X, 0, dir.Z)
+	if flat.Magnitude > 1 then
+		moveTo(char, goalPos + flat.Unit * 4)
+	end
+end
+
+local function fieldAutoMove(char, ball, ballDist, iHaveBall)
+	local goalPos = goalCenter(attackGoal())
+	local weld = ball:FindFirstChild("playerWeld")
+	local creator = ball:FindFirstChild("creator")
+	local holder = creator and creator.Value
+
+	if iHaveBall and goalPos then
+		-- fresh off a crossover: cut past the defender's shoulder before resuming
+		if os.clock() < veerUntil and veerPos then
+			moveTo(char, veerPos)
+			return
+		end
+		-- carry: drive straight at the corner we're going to hit
+		moveTo(char, bestTarget() or goalPos)
+		return
+	end
+
+	if weld and holder and holder ~= LP then
+		local holderTeam = entTeam(holder)
+		local holderChar = entChar(holder)
+		local holderHrp = holderChar and holderChar:FindFirstChild("HumanoidRootPart")
+		if holderTeam ~= teamColor() then
+			-- hunt the carrier
+			if holderHrp then
+				moveTo(char, holderHrp.Position)
+			end
+		elseif goalPos and holderHrp then
+			-- support run: get open ahead of the pass, toward their net
+			local dir = goalPos - holderHrp.Position
+			local flat = Vector3.new(dir.X, 0, dir.Z)
+			if flat.Magnitude > 8 then
+				moveTo(char, holderHrp.Position + flat.Unit * 12)
+			end
+		end
+		return
+	end
+
+	-- free ball or incoming pass: intercept with a small lead on its ground velocity
+	local vel = ball.AssemblyLinearVelocity
+	local flatVel = Vector3.new(vel.X, 0, vel.Z)
+	if flatVel.Magnitude > 1 then
+		local lead = math.clamp(ballDist / 24, 0.05, 0.6)
+		moveTo(char, ball.Position + flatVel * lead)
+	else
+		moveTo(char, ball.Position)
+	end
+end
+
+--// main loop ------------------------------------------------------------------
+
+local dead = false
+local lastAct = { shot = 0, pass = 0, tackle = 0, header = 0, grab = 0, dive = 0, deke = 0 }
+local lastAny = 0
+local lastErrAt = 0
+local loopConn
+local keyConn
+
+local function predictedCross(ball, goalPos)
+	-- where the ball will be when it reaches our goal depth, flat-projected
+	local v = ball.AssemblyLinearVelocity
+	if v.Magnitude < 1 then
+		return ball.Position, v.Magnitude
+	end
+	local toGoal = goalPos - ball.Position
+	local flat = Vector3.new(toGoal.X, 0, toGoal.Z)
+	local t = flat.Magnitude / math.max(Vector3.new(v.X, 0, v.Z).Magnitude, 1)
+	t = math.clamp(t, 0.05, 1.2)
+	return ball.Position + v * t, v.Magnitude
+end
+
+local function step()
+	if dead then
+		return
+	end
+	local now = os.clock()
+	local ball = findBall()
+	local ballDist
+	local char = LP.Character
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	if hrp and ball then
+		ballDist = (ball.Position - hrp.Position).Magnitude
+	end
+	updateVisuals(ball)
+	if distStat and ballDist then
+		pcall(function()
+			distStat:Set(math.floor(ballDist))
+		end)
+	end
+	if speedStat and ball then
+		pcall(function()
+			speedStat:Set(math.floor(ball.AssemblyLinearVelocity.Magnitude))
+		end)
+	end
+	if not (ball and hrp and ballDist) then
+		return
+	end
+	if not char:FindFirstChild("Humanoid") or char.Humanoid.Health == 0 then
+		return
+	end
+	if not amPlaying() then
+		return -- Fans / neutral: hands off
+	end
+	local keeper = amKeeper()
+	local b = myBools(char)
+
+	-- keeper: auto dive when a live shot closes on our net (dive path's own gates)
+	if keeper then
+		if CFG.autoPlay and moveUnlocked() then
+			keeperAutoMove(char, ball)
+		end
+		if (CFG.autoGK or CFG.autoPlay) and ball.creator and ball.creator.Value ~= LP and not state("Penalty") then
+			local goalPos = goalCenter(ownGoal())
+			local v = ball.AssemblyLinearVelocity
+			local speed = v.Magnitude
+			local toGoal = goalPos and (goalPos - ball.Position) or Vector3.zero
+			local closing = speed > 18 and toGoal.Magnitude > 1 and v:Dot(toGoal.Unit) > 0.5
+			if closing and ballDist <= CFG.gkRange and now - lastAct.dive >= 1 and now - lastAny >= 0.3 then
+				face(char, ball.Position) -- keepers track the ball, like real play
+				local cross, _ = predictedCross(ball, goalPos or ball.Position)
+				local myLateral = (hrp.Position - ball.Position):Dot(hrp.CFrame.RightVector)
+				local crossLateral = (cross - ball.Position):Dot(hrp.CFrame.RightVector)
+				local diff = crossLateral - myLateral
+				local side
+				if math.abs(diff) > 2 then
+					side = diff > 0 and "RightDive" or "LeftDive"
+				elseif ballDist < 8 and speed > 25 then
+					side = "FrontDive"
+				end
+				if side and fireDive(side) then
+					lastAct.dive, lastAny = now, now
+				end
+			end
+		end
+		return
+	end
+
+	-- field player: shot > header > grab > tackle > pass, one action at a time
+	local iHaveBall = possessing(ball)
+
+	if CFG.autoPlay and moveUnlocked() then
+		fieldAutoMove(char, ball, ballDist, iHaveBall)
+	end
+
+	-- auto crossover: a defender presses while we carry - sprinting onto us, lunging
+	-- a tackle (their own Tackling flag), or parked in our stride -> the game's own
+	-- Deke action, then a cut away from the press toward their net
+	if (CFG.autoCrossover or CFG.autoPlay) and iHaveBall then
+		local press = findPress(hrp, CFG.crossoverRange)
+		if press then
+			local goalPos = goalCenter(attackGoal())
+			local goalDist = goalPos and (goalPos - ball.Position).Magnitude or math.huge
+			-- a committed lunge gets beaten right away; a closing sprint only while
+			-- we're still driving out - once we're in range we just shoot instead
+			if
+				(press.lunging or goalDist > CFG.shotGoalRange)
+				and booleansClean(char)
+				and state("FreeKick") == false
+				and not state("Penalty")
+				and not state("Kickoff")
+				and now - lastAct.deke >= 4 -- the game's own deke cooldown
+				and now - lastAny >= 0.3
+				and fireDeke(ball)
+			then
+				lastAct.deke, lastAny = now, now
+				-- cut away from the presser's approach, weighted toward their net
+				local away = Vector3.new(
+					hrp.Position.X - press.hrp.Position.X,
+					0,
+					hrp.Position.Z - press.hrp.Position.Z
+				)
+				away = away.Magnitude > 0.5 and away.Unit or Vector3.new(hrp.CFrame.LookVector.X, 0, hrp.CFrame.LookVector.Z)
+				local goalDir
+				if goalPos then
+					goalDir = Vector3.new(goalPos.X - hrp.Position.X, 0, goalPos.Z - hrp.Position.Z)
+					goalDir = goalDir.Magnitude > 1 and goalDir.Unit or nil
+				end
+				local escape = goalDir and (away + goalDir * 1.3).Unit or away
+				veerPos = hrp.Position + escape * 9
+				veerUntil = now + 0.8
+				lastMoveTarget = nil
+			end
+		end
+	end
+
+	if (CFG.autoShot or CFG.autoPlay) and iHaveBall and ballDist <= CFG.shotRange then
+		local goalPos = goalCenter(attackGoal())
+		local goalDist = goalPos and (goalPos - ball.Position).Magnitude or math.huge
+		local powerFlag = char:FindFirstChild("LocalBool")
+		local charging = powerFlag and powerFlag:FindFirstChild("PowerShoot")
+		if
+			goalDist <= CFG.shotGoalRange
+			and booleansClean(char)
+			and state("FreeKick") == false
+			and not state("Penalty")
+			and not state("Kickoff")
+			and not (charging and charging.Value == true)
+			and now - lastAct.shot >= CFG.cooldown
+			and now - lastAny >= 0.3
+		then
+			local dir = aimDir(ball)
+			if dir then
+				if CFG.powerMode then
+					face(char, bestTarget()) -- LookVector feeds the power shot's 4th arg
+					playShootAnim(char, aimDir(ball), 1, true)
+					if firePowerShot(ball, aimDir(ball)) then
+						lastAct.shot, lastAny = now, now
+					end
+				else
+					local sdir, hold, curve = solveShot(ball, bestTarget(), CFG.shotCurve, CFG.shotPower)
+					if sdir then
+						face(char, ball.Position + sdir * 10) -- the kick anim reads facing
+						if fireShot(ball, sdir, hold, curve) then
+							lastAct.shot, lastAny = now, now
+						end
+					end
+				end
+			end
+		end
+		return
+	end
+
+	-- auto header: the game's own signals - header flag up, ball above 5.5 studs,
+	-- someone else's ball, clean bools, not a restart
+	if CFG.autoHeader and not iHaveBall then
+		local headerFlag = b and b:FindFirstChild("Header")
+		if
+			headerFlag
+			and headerFlag.Value == true
+			and ball.Position.Y >= 5.5
+			and ballDist <= 6.5
+			and ball.creator
+			and ball.creator.Value ~= LP
+			and booleansClean(char)
+			and not state("Penalty")
+			and not state("Kickoff")
+			and now - lastAct.header >= 3
+			and now - lastAny >= 0.3
+		then
+			if fireHeader(ball) then
+				lastAct.header, lastAny = now, now
+			end
+		end
+	end
+
+	-- auto grab: the game's own touch-grab for incoming passes (PassBV on the ball)
+	if (CFG.autoGrab or CFG.autoPlay) and not iHaveBall then
+		if
+			ball:FindFirstChild("PassBV")
+			and not ball:FindFirstChild("playerWeld")
+			and ballDist <= 4.5
+			and state("cantGrab") == false
+			and not state("Penalty")
+			and now - lastAct.grab >= 0.2
+			and now - lastAny >= 0.1
+		then
+			if fireGrab(ball, ballDist) then
+				lastAct.grab, lastAny = now, now
+			end
+		end
+	end
+
+	-- auto tackle: strip an opponent in possession, through the game's own action
+	if (CFG.autoTackle or CFG.autoPlay) and not iHaveBall then
+		local weld = ball:FindFirstChild("playerWeld")
+		local creator = ball:FindFirstChild("creator")
+		local holder = creator and creator.Value
+		if
+			weld
+			and holder
+			and holder ~= LP
+			and entTeam(holder) ~= teamColor()
+			and ballDist <= CFG.tackleRange
+			and booleansClean(char)
+			and not state("Penalty")
+			and not state("Kickoff")
+			and now - lastAct.tackle >= CFG.cooldown + 0.3
+			and now - lastAny >= 0.3
+		then
+			if fireTackle() then
+				lastAct.tackle, lastAny = now, now
+			end
+		end
+		return
+	end
+
+	-- auto pass: ball at our feet and a teammate open ahead of the camera
+	if CFG.autoPass and iHaveBall then
+		local target, _ = findClosestTeammate()
+		local thrp = target
+			and (target:IsA("Player") and target.Character or target):FindFirstChild("HumanoidRootPart")
+		if
+			target
+			and thrp
+			and booleansClean(char)
+			and (thrp.Position - hrp.Position).Magnitude <= CFG.passRange
+			and (thrp.Position - hrp.Position).Magnitude > 5
+			and now - lastAct.pass >= CFG.cooldown
+			and now - lastAny >= 0.3
+		then
+			if firePass(ball) then
+				lastAct.pass, lastAny = now, now
+			end
+		end
+	end
+end
+
+loopConn = RunService.Heartbeat:Connect(function()
+	local ok, err = pcall(step)
+	if not ok and os.clock() - lastErrAt > 5 then
+		lastErrAt = os.clock()
+		warn("[RSS] loop error: " .. tostring(err))
+	end
+end)
+
+--// lifecycle ------------------------------------------------------------------
+
+local FLAGS = {
+	"autoplay",
+	"autoshot",
+	"powershot",
+	"autopass",
+	"autotackle",
+	"autoheader",
+	"autocrossover",
+	"autograb",
+	"autogk",
+	"ballesp",
+	"goalbeacons",
+	"playeresp",
+}
+
+local function panic()
+	CFG.autoPlay = false
+	CFG.autoShot = false
+	CFG.powerMode = false
+	CFG.autoPass = false
+	CFG.autoTackle = false
+	CFG.autoHeader = false
+	CFG.autoCrossover = false
+	CFG.autoGrab = false
+	CFG.autoGK = false
+	CFG.ballESP = false
+	CFG.goalBeacons = false
+	CFG.playerESP = false
+	clearESP()
+	clearBeacons()
+	clearPlayerESP()
+	if window then
+		for _, f in ipairs(FLAGS) do
+			pcall(function()
+				window:Set(f, false)
+			end)
+		end
+	end
+	print("[RSS] panic: hands off - everything off")
+end
+
+local window
+
+local function shutdown()
+	if dead then
+		return
+	end
+	dead = true
+	if loopConn then
+		loopConn:Disconnect()
+		loopConn = nil
+	end
+	if keyConn then
+		keyConn:Disconnect()
+		keyConn = nil
+	end
+	clearESP()
+	clearBeacons()
+	clearPlayerESP()
+	if window then
+		pcall(function()
+			window:Unload()
+		end)
+	end
+	_G.RssStreetPanel = nil
+	print("[RSS] unloaded")
+end
+
+keyConn = UserInputService.InputBegan:Connect(function(i, gp)
+	if gp then
+		return
+	end
+	if i.KeyCode == Enum.KeyCode.P then
+		panic()
+	end
+end)
+
+--// UI -------------------------------------------------------------------------
+
+local Rayfield
+pcall(function()
+	Rayfield = loadstring(game:HttpGet("https://sirius.menu/gen2"))()
+end)
+
+local function buildUI()
+	if not Rayfield then
+		return
+	end
+	local w = Rayfield:CreateWindow({
+		Name = "RSS STREET | STREET",
+		LoadingTitle = "STREET",
+		LoadingSubtitle = "power + curve shots, pass, tackle, header, GK dive, grab, crossover, ESP",
+		KeySystem = false,
+	})
+	window = w
+	local play = w:CreateTab({ name = "PLAY" })
+	local view = w:CreateTab({ name = "VIEW" })
+	local sys = w:CreateTab({ name = "SYS" })
+
+	play:CreateToggle({
+		name = "auto play",
+		description = "full autopilot - chases loose balls and incoming passes, carries the ball at their net, beats pressing defenders with the equipped dribble skill, and lets the shot fly in range, hunts opposing carriers, makes support runs off teammates, holds the goal line when you're keeper - plain walking plus the game's own remotes, nothing else",
+		flag = "autoplay",
+		value = CFG.autoPlay,
+		callback = function(v)
+			CFG.autoPlay = v
+			lastMoveTarget = nil
+		end,
+	})
+	play:CreateToggle({
+		name = "auto shot",
+		description = "ball at your feet -> aim at the corner of their net and let it fly through the game's own ShootTheBaII remote, the exact charged form its controller sends - with its own kick animation, your power setting behind it and your curve bending around the keeper",
+		flag = "autoshot",
+		value = CFG.autoShot,
+		callback = function(v)
+			CFG.autoShot = v
+		end,
+	})
+	play:CreateToggle({
+		name = "power shot mode",
+		description = "auto shot uses the controller's fully charged powershot form (power 1) instead of the quick tap",
+		flag = "powershot",
+		value = CFG.powerMode,
+		callback = function(v)
+			CFG.powerMode = v
+		end,
+	})
+	play:CreateSlider({
+		name = "shot range",
+		description = "studs from you to the ball before the auto shot fires - keep it inside a real stride",
+		flag = "shotrange",
+		range = { 3, 15 },
+		increment = 0.5,
+		value = CFG.shotRange,
+		suffix = " st",
+		callback = function(v)
+			CFG.shotRange = v
+		end,
+	})
+	play:CreateSlider({
+		name = "shot power",
+		description = "charge behind the auto shot, 1-100 - the hold time its controller sends; 85 is its quick tap, 100 the full 1 second charge",
+		flag = "shotpower",
+		range = { 1, 100 },
+		increment = 1,
+		value = CFG.shotPower,
+		suffix = " pwr",
+		callback = function(v)
+			CFG.shotPower = v
+		end,
+	})
+	play:CreateSlider({
+		name = "shot curve",
+		description = "banana bend in studs, 0-40 - the shot swings at the keeper's side and curls back onto the corner, through the game's own curve argument (charged shots only; power shot mode can't curve)",
+		flag = "shotcurve",
+		range = { 0, 40 },
+		increment = 1,
+		value = CFG.shotCurve,
+		suffix = " st",
+		callback = function(v)
+			CFG.shotCurve = v
+		end,
+	})
+	play:CreateSlider({
+		name = "shot release distance",
+		description = "max ball-to-net distance before the shot lets fly - the carry drives at the net until inside this",
+		flag = "shotgoalrange",
+		range = { 20, 140 },
+		increment = 5,
+		value = CFG.shotGoalRange,
+		suffix = " st",
+		callback = function(v)
+			CFG.shotGoalRange = v
+		end,
+	})
+	play:CreateSlider({
+		name = "action cooldown",
+		description = "seconds between same-type actions, keeps the rhythm human",
+		flag = "cooldown",
+		range = { 0.3, 3 },
+		increment = 0.1,
+		value = CFG.cooldown,
+		suffix = " s",
+		callback = function(v)
+			CFG.cooldown = v
+		end,
+	})
+
+	play:CreateSection({ name = "SKILLS" })
+	play:CreateToggle({
+		name = "auto crossover",
+		description = "carrying the ball and a defender presses - sprinting onto you, lunging a tackle, or parked in your stride -> the game's own Deke action (your equipped dribble skill) then a cut away from the press toward their net - the exact Action the controller's Q-key sends, same 4 second cooldown",
+		flag = "autocrossover",
+		value = CFG.autoCrossover,
+		callback = function(v)
+			CFG.autoCrossover = v
+		end,
+	})
+	play:CreateSlider({
+		name = "crossover range",
+		description = "studs to a pressing defender before the crossover triggers",
+		flag = "crossoverrange",
+		range = { 4, 15 },
+		increment = 0.5,
+		value = CFG.crossoverRange,
+		suffix = " st",
+		callback = function(v)
+			CFG.crossoverRange = v
+		end,
+	})
+
+	play:CreateSection({ name = "TEAM PLAY" })
+	play:CreateToggle({
+		name = "auto pass",
+		description = "ball at your feet and a teammate open ahead of the camera -> the game's own Pass remote with the teammate its FindClosestPlayer picks",
+		flag = "autopass",
+		value = CFG.autoPass,
+		callback = function(v)
+			CFG.autoPass = v
+		end,
+	})
+	play:CreateSlider({
+		name = "pass range",
+		description = "max teammate distance for a pass",
+		flag = "passrange",
+		range = { 10, 120 },
+		increment = 5,
+		value = CFG.passRange,
+		suffix = " st",
+		callback = function(v)
+			CFG.passRange = v
+		end,
+	})
+	play:CreateToggle({
+		name = "auto header",
+		description = "the game's own header signals line up (header flag + ball above 5.5 studs) -> Header, or BicycleKick on an incoming pass, exactly like the controller's spacebar path",
+		flag = "autoheader",
+		value = CFG.autoHeader,
+		callback = function(v)
+			CFG.autoHeader = v
+		end,
+	})
+	play:CreateToggle({
+		name = "auto grab",
+		description = "a pass is coming in (PassBV on the ball) and it's within reach -> pick it up through the game's own attribute grab remote, GrabTick and all",
+		flag = "autograb",
+		value = CFG.autoGrab,
+		callback = function(v)
+			CFG.autoGrab = v
+		end,
+	})
+
+	play:CreateSection({ name = "DEFENSE" })
+	play:CreateToggle({
+		name = "auto tackle",
+		description = "an opponent carries the ball inside range -> strip it with the game's own tackle action (the real TackIe action, not the decoy remote)",
+		flag = "autotackle",
+		value = CFG.autoTackle,
+		callback = function(v)
+			CFG.autoTackle = v
+		end,
+	})
+	play:CreateSlider({
+		name = "tackle range",
+		description = "studs to the ball before tackles trigger",
+		flag = "tacklerange",
+		range = { 4, 15 },
+		increment = 0.5,
+		value = CFG.tackleRange,
+		suffix = " st",
+		callback = function(v)
+			CFG.tackleRange = v
+		end,
+	})
+	play:CreateToggle({
+		name = "auto GK dive",
+		description = "you're in goal and a shot closes on the net -> read its crossing point and dive left / right / front through the game's own dive action, with the same 35-stud lunge the game applies",
+		flag = "autogk",
+		value = CFG.autoGK,
+		callback = function(v)
+			CFG.autoGK = v
+		end,
+	})
+	play:CreateSlider({
+		name = "GK range",
+		description = "studs to the ball before dives trigger",
+		flag = "gkrange",
+		range = { 6, 30 },
+		increment = 1,
+		value = CFG.gkRange,
+		suffix = " st",
+		callback = function(v)
+			CFG.gkRange = v
+		end,
+	})
+
+	view:CreateToggle({
+		name = "ball ESP",
+		description = "orange glow on the live ball - re-locks the moment it respawns",
+		flag = "ballesp",
+		value = CFG.ballESP,
+		callback = function(v)
+			CFG.ballESP = v
+			if not v then
+				clearESP()
+			end
+		end,
+	})
+	view:CreateToggle({
+		name = "goal beacons",
+		description = "green glow on the net you attack, red on your own",
+		flag = "goalbeacons",
+		value = CFG.goalBeacons,
+		callback = function(v)
+			CFG.goalBeacons = v
+			if not v then
+				clearBeacons()
+			end
+		end,
+	})
+	view:CreateToggle({
+		name = "player ESP",
+		description = "teammates green, opponents red",
+		flag = "playeresp",
+		value = CFG.playerESP,
+		callback = function(v)
+			CFG.playerESP = v
+			if not v then
+				clearPlayerESP()
+			end
+		end,
+	})
+	distStat = view:CreateStat({ name = "ball distance", value = 0, suffix = " st" })
+	speedStat = view:CreateStat({ name = "ball speed", value = 0, suffix = " sps" })
+
+	sys:CreateButton({ name = "panic (P)", description = "everything off, hands back to you", callback = panic })
+	sys:CreateButton({ name = "unload panel", description = "tear everything down", callback = shutdown })
+end
+
+buildUI()
+
+_G.RssStreetPanel = {
+	cfg = CFG,
+	window = window,
+	stop = shutdown,
+	panic = panic,
+	ball = findBall,
+	attackGoal = attackGoal,
+	ownGoal = ownGoal,
+	keeper = amKeeper,
+	playing = amPlaying,
+	bestTarget = bestTarget,
+	fireShot = fireShot,
+	solveShot = solveShot,
+	firePowerShot = firePowerShot,
+	firePass = firePass,
+	fireTackle = fireTackle,
+	fireHeader = fireHeader,
+	fireDive = fireDive,
+	fireGrab = fireGrab,
+	fireDeke = fireDeke,
+	defenderAhead = defenderAhead,
+	findPress = findPress,
+	state = function()
+		local ball = findBall()
+		local char = LP.Character
+		local hrp = char and char:FindFirstChild("HumanoidRootPart")
+		return {
+			place = game.PlaceId,
+			team = tostring(teamColor()),
+			playing = amPlaying(),
+			keeper = amKeeper(),
+			ball = ball and ball.Name .. "@" .. tostring(ball.Position) or nil,
+			ballDist = ball and hrp and (ball.Position - hrp.Position).Magnitude or nil,
+			possession = ball and possessing(ball) or false,
+			autoPlay = CFG.autoPlay,
+			autoCrossover = CFG.autoCrossover,
+			shotPower = CFG.shotPower,
+			shotCurve = CFG.shotCurve,
+			attackGoal = goalCenter(attackGoal()) and tostring(goalCenter(attackGoal())) or nil,
+			paths = remotePaths() ~= nil,
+		}
+	end,
+}
+
+print("[RSS] panel loaded - auto play, power/curve shots, pass, tackle, header, GK dive, grab, crossover, ESP | paths "
+	.. (remotePaths() and "ok" or "missing")
+	.. (amPlaying() and (amKeeper() and " | keeper" or " | field") or " | spectating (join Home/Away)"))
 end
 
 --// dispatch -------------------------------------------------------------------
