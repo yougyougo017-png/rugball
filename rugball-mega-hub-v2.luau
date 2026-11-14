@@ -17,6 +17,7 @@
 		96120449121277   PhysBox (HitBout)       physbox
 		335760407        TPS: Street Soccer      tps
 		75703135112691   TPS: Street Soccer      tps (match sub-place)
+		82886081053523   Track & Field Legends   track
 		14315258385      Realistic Street Soccer rss
 
 	the taf bypass runs before the suites that need it, so its hooks are live
@@ -46,6 +47,7 @@ Hub.ORDER = {
 	{ place = 96120449121277,  label = "PHYSBOX HITBOUT",  suites = { "physbox" } },
 	{ place = 335760407,       label = "TPS STREET SOCCER", suites = { "tps" } },
 	{ place = 75703135112691, label = "TPS MATCH",         suites = { "tps" } },
+	{ place = 82886081053523, label = "TRACK & FIELD",     suites = { "track" } },
 	{ place = 14315258385,    label = "RSS STREET SOCCER", suites = { "rss" } },
 }
 
@@ -54,7 +56,7 @@ for _, g in ipairs(Hub.ORDER) do
 	Hub.GAMES[g.place] = g
 end
 
-Hub.SUITE_ORDER = { "football", "anime", "nba", "swish", "duels", "qb_aimbot", "taf_bypass", "physbox", "tps", "rss" }
+Hub.SUITE_ORDER = { "football", "anime", "nba", "swish", "duels", "qb_aimbot", "taf_bypass", "physbox", "tps", "track", "rss" }
 
 Hub.SUITE_NAMES = {
 	football   = "football panel    |  aim / tackle / block",
@@ -66,6 +68,7 @@ Hub.SUITE_NAMES = {
 	taf_bypass = "taf bypass        |  anticheat + speed",
 	physbox    = "physbox corner    |  autopilot / full power / inf stamina",
 	tps        = "tps street         |  auto shot / tackle / GK / esp",
+	track      = "track & field      |  auto race / auto field timing",
 	rss        = "rss street          |  auto shot / pass / tackle / header / GK dive",
 }
 
@@ -10057,11 +10060,798 @@ print("[Street] panel loaded - auto shot, tackles, GK saves, passes, powers, bal
 	.. (remotePaths() and "ok" or "missing (lobby place?)"))
 end
 
+--// embedded suite: track  (from track-panel.luau) =====================
+Hub.SUITE.track = function()
+-- Track & Field Legends | auto race + auto field timing
+-- place 82886081053523 | Rayfield Gen2 | replace-not-stack via _G.TrackFieldPanel
+--
+-- fires only the game's own remotes with its own argument shapes:
+--   RaceJoin("solo"|"ranked", eventId) starts a race/field comp
+--   RaceInput({ raceId, t, up }) grades race notes against server time
+--   FieldInput({ compId, t, up }) grades field notes against server time
+-- race notes come from the game's shared RaceRules.buildPlan; field notes from
+-- FieldRules.plan. every scheduled timestamp is the note's own server target,
+-- so the server sees err = 0 and grades Perfect.
+--
+-- auto-rejoin is opt-in. race and field auto-join never run at the same time:
+-- auto race owns the loop while it is on.
+
+local prev = _G.TrackFieldPanel
+local CFG = (prev and prev.cfg) or {}
+for k, v in pairs({
+	autoRace = false,
+	autoField = false,
+	autoRejoin = true,
+	joinMode = "solo",
+	raceEvent = "100m",
+	fieldEvent = "LJ",
+	startOffset = 0.002,
+	dipOffset = 0.19,
+	autoTrain = false,
+}) do
+	if CFG[k] == nil then CFG[k] = v end
+end
+if prev and prev.stop then pcall(prev.stop) end
+_G.TrackFieldPanel = { cfg = CFG }
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local LP = Players.LocalPlayer
+
+local Remotes = ReplicatedStorage:FindFirstChild("Remotes")
+local RaceUpdate = Remotes and Remotes:FindFirstChild("RaceUpdate")
+local RaceJoin = Remotes and Remotes:FindFirstChild("RaceJoin")
+local RaceInput = Remotes and Remotes:FindFirstChild("RaceInput")
+local FieldUpdate = Remotes and Remotes:FindFirstChild("FieldUpdate")
+local FieldInput = Remotes and Remotes:FindFirstChild("FieldInput")
+local Training = Remotes and Remotes:FindFirstChild("Training")
+
+local Shared = ReplicatedStorage:FindFirstChild("Shared")
+local RaceRules, FieldRules
+if Shared then
+	local ok1, m1 = pcall(function()
+		return require(Shared:WaitForChild("RaceRules", 5))
+	end)
+	if ok1 then RaceRules = m1 end
+	local ok2, m2 = pcall(function()
+		return require(Shared:WaitForChild("FieldRules", 5))
+	end)
+	if ok2 then FieldRules = m2 end
+end
+
+if not (RaceRules and FieldRules and RaceUpdate and RaceJoin and RaceInput and FieldUpdate and FieldInput) then
+	warn("[TRACK] Track & Field remotes not found in place " .. tostring(game.PlaceId))
+	_G.TrackFieldPanel = { cfg = CFG }
+	return
+end
+
+local dead = false
+local function srvNow()
+	return workspace:GetServerTimeNow()
+end
+
+local function at(t, fn)
+	local d = t - srvNow()
+	if d <= 0 then
+		task.spawn(fn)
+	else
+		task.delay(d, fn)
+	end
+end
+
+local stats = _G.TrackFieldStats or {}
+_G.TrackFieldStats = stats
+for k, v in pairs({
+	races = 0,
+	raceGrades = 0,
+	racePerfect = 0,
+	fieldAttempts = 0,
+	fieldGrades = 0,
+	fieldPerfect = 0,
+	lastTime = 0,
+	lastPlace = 0,
+	lastReaction = 0,
+	lastStartGrade = "",
+}) do
+	if stats[k] == nil then stats[k] = v end
+end
+
+local race = { id = nil, event = nil, points = nil, lane = nil, gunAt = nil, startAt = nil, skip = nil, speed = nil, plan = nil, token = 0 }
+local field = { comp = nil, event = nil, slot = nil, board = nil, bar = nil, plan = nil, token = 0 }
+local lastRaceJoin = 0
+local lastFieldJoin = 0
+local lastFieldEnd = 0
+
+local statusRace = "idle"
+local statusField = "idle"
+local ui = {}
+local shutdown
+
+local function notify(text)
+	print("[TRACK] " .. tostring(text))
+	if ui.window and ui.window.Notify then
+		pcall(function()
+			ui.window:Notify({ title = "TRACK", content = tostring(text), duration = 4 })
+		end)
+	end
+end
+
+--// race -----------------------------------------------------------------------
+
+local function raceFire(t, up)
+	if race.id and not dead then
+		pcall(function()
+			RaceInput:FireServer({ raceId = race.id, t = t, up = up })
+		end)
+	end
+end
+
+local function clearRace()
+	race.token = race.token + 1
+	race.id = nil
+	race.event = nil
+	race.points = nil
+	race.lane = nil
+	race.gunAt = nil
+	race.startAt = nil
+	race.plan = nil
+end
+
+local function scheduleStart()
+	local token = race.token
+	local t = (race.gunAt or srvNow()) + (tonumber(CFG.startOffset) or 0.002)
+	statusRace = string.format("set  gun + %.3f", t - race.gunAt)
+	at(t, function()
+		if dead or token ~= race.token then return end
+		raceFire(t, false)
+		statusRace = string.format("start pressed  %.3f", t - race.gunAt)
+	end)
+end
+
+local function buildRacePlan()
+	local token = race.token
+	local tries = 0
+	local function go()
+		if dead or token ~= race.token then return end
+		if race.plan then return end
+		if not (race.startAt and race.event and race.points) then
+			tries = tries + 1
+			if tries < 40 then
+				task.delay(0.1, go)
+			end
+			return
+		end
+		local ok, plan = pcall(RaceRules.buildPlan, race.event, race.startAt, race.points, race.gunAt, race.skip, race.speed)
+		if not ok or type(plan) ~= "table" then
+			warn("[TRACK] buildPlan failed: " .. tostring(plan))
+			return
+		end
+		race.plan = plan
+		statusRace = string.format("%d race notes", #plan)
+		for _, n in ipairs(plan) do
+			local t = n.target
+			at(t, function()
+				if dead or token ~= race.token then return end
+				raceFire(t, false)
+			end)
+			if n.kind == "slide" and n.endAt then
+				local e = n.endAt
+				at(e, function()
+					if dead or token ~= race.token then return end
+					raceFire(e, true)
+				end)
+			end
+		end
+	end
+	go()
+end
+
+local function onRaceMessage(m)
+	if type(m) ~= "table" then return end
+	local typ = m.type
+
+	if typ == "Lineup" then
+		local mine
+		for _, l in ipairs(m.lanes or {}) do
+			if l.userId == LP.UserId then
+				mine = l
+				break
+			end
+		end
+		if not mine then return end
+		race.token = race.token + 1
+		race.id = m.raceId
+		race.event = m.event
+		race.skip = m.skip
+		race.speed = m.speed
+		race.points = mine.points
+		race.lane = mine.lane
+		race.gunAt = nil
+		race.startAt = nil
+		race.plan = nil
+		stats.races = stats.races + 1
+		statusRace = string.format("lineup  %s  lane %s", tostring(race.event), tostring(race.lane))
+		return
+	end
+
+	if not race.id then return end
+	if m.raceId and m.raceId ~= race.id then return end
+
+	if typ == "Set" then
+		race.gunAt = m.gunAt
+		if race.gunAt then scheduleStart() end
+	elseif typ == "Gun" then
+		if not race.gunAt then
+			race.gunAt = m.gunAt
+			if race.gunAt then scheduleStart() end
+		end
+	elseif typ == "Start" then
+		race.startAt = m.startAt
+		stats.lastReaction = m.reaction or 0
+		stats.lastStartGrade = tostring(m.grade or "")
+		buildRacePlan()
+	elseif typ == "Dip" then
+		local token = race.token
+		local t = (m.target or srvNow()) + (tonumber(CFG.dipOffset) or 0)
+		at(t, function()
+			if dead or token ~= race.token then return end
+			raceFire(t, false)
+			statusRace = "dip"
+		end)
+	elseif typ == "Graded" then
+		if m.grade then
+			stats.raceGrades = stats.raceGrades + 1
+			if m.grade == "Perfect" then stats.racePerfect = stats.racePerfect + 1 end
+			statusRace = string.format("%s  %s", tostring(m.role or "note"), tostring(m.grade))
+		end
+	elseif typ == "Finish" then
+		if race.lane == nil or m.lane == race.lane then
+			stats.lastTime = m.time or 0
+			stats.lastPlace = m.place or 0
+		end
+	elseif typ == "End" then
+		if m.raceId == race.id then
+			clearRace()
+			statusRace = "ended"
+		end
+	end
+end
+
+--// field ----------------------------------------------------------------------
+
+local function fieldFire(comp, t, up)
+	if comp and not dead then
+		pcall(function()
+			FieldInput:FireServer({ compId = comp, t = t, up = up })
+		end)
+	end
+end
+
+local function fieldSlotOf(m)
+	local athletes = m.athletes
+	if type(athletes) ~= "table" then return nil end
+	for k, v in pairs(athletes) do
+		if type(v) == "table" then
+			local uid = v.userId or (type(v.info) == "table" and v.info.userId)
+			if uid == LP.UserId then
+				return v.slot or (type(v.info) == "table" and v.info.slot) or k
+			end
+		end
+	end
+	return nil
+end
+
+local function clearField()
+	field.token = field.token + 1
+	field.comp = nil
+	field.event = nil
+	field.slot = nil
+	field.board = nil
+	field.bar = nil
+	field.plan = nil
+end
+
+local function buildFieldPlan(m, token, comp)
+	local eventId = field.event
+	local points = m.points
+	local startAt = m.startAt
+	if not (eventId and points and startAt) then return end
+	local bar = m.bar or field.bar
+	local ok, plan = pcall(FieldRules.plan, eventId, points, startAt, { board = field.board, bar = bar })
+	if not ok or type(plan) ~= "table" or type(plan.notes) ~= "table" then
+		warn("[TRACK] FieldRules.plan failed: " .. tostring(plan))
+		return
+	end
+	field.plan = plan
+	stats.fieldAttempts = stats.fieldAttempts + 1
+	statusField = string.format("%s  %d notes", eventId, #plan.notes)
+	for _, n in ipairs(plan.notes) do
+		local t = n.target
+		at(t, function()
+			if dead or token ~= field.token then return end
+			fieldFire(comp, t, false)
+		end)
+		if n.kind == "slide" and n.endAt then
+			local e = n.endAt
+			at(e, function()
+				if dead or token ~= field.token then return end
+				fieldFire(comp, e, true)
+			end)
+		end
+	end
+end
+
+local function onFieldMessage(m)
+	if type(m) ~= "table" then return end
+	local typ = m.type
+
+	if typ == "FLineup" then
+		if m.replay == true then return end
+		local slot = fieldSlotOf(m)
+		if not slot then return end
+		field.token = field.token + 1
+		field.comp = m.compId
+		field.event = m.event
+		field.slot = slot
+		field.board = m.board
+		field.bar = m.bar
+		field.plan = nil
+		statusField = string.format("comp %s  %s  slot %s", tostring(m.compId), tostring(m.event), tostring(slot))
+		return
+	end
+
+	if not field.comp then return end
+	if m.compId and m.compId ~= field.comp then return end
+
+	if typ == "FAttempt" then
+		if field.slot ~= nil and m.slot ~= nil and tostring(m.slot) ~= tostring(field.slot) then return end
+		if m.human == false then return end
+		field.token = field.token + 1
+		local token = field.token
+		buildFieldPlan(m, token, field.comp)
+	elseif typ == "FGraded" then
+		if m.grade then
+			stats.fieldGrades = stats.fieldGrades + 1
+			if m.grade == "Perfect" then stats.fieldPerfect = stats.fieldPerfect + 1 end
+			statusField = string.format("%s  %s", tostring(m.role or "note"), tostring(m.grade))
+		end
+	elseif typ == "FEnd" then
+		if m.compId == field.comp then
+			clearField()
+			lastFieldEnd = os.clock()
+			statusField = "ended"
+		end
+	end
+end
+
+--// joining --------------------------------------------------------------------
+
+local function fireJoin(kind)
+	if dead or not RaceJoin then return end
+	if kind == "field" then
+		RaceJoin:FireServer(CFG.joinMode, CFG.fieldEvent)
+		statusField = "joining " .. tostring(CFG.fieldEvent)
+	else
+		RaceJoin:FireServer(CFG.joinMode, CFG.raceEvent)
+		statusRace = "joining " .. tostring(CFG.raceEvent)
+	end
+end
+
+local function leaveNow()
+	if dead or not RaceJoin then return end
+	pcall(function()
+		if field.comp and FieldInput then
+			FieldInput:FireServer({ retire = true, compId = field.comp })
+		end
+	end)
+	pcall(function() RaceJoin:FireServer("leave") end)
+	pcall(function() RaceJoin:FireServer("watch", nil) end)
+	clearRace()
+	clearField()
+	statusRace = "left"
+	statusField = "left"
+end
+
+local function joinRace(force)
+	if dead or not RaceJoin then return end
+	local nowC = os.clock()
+	if nowC - lastRaceJoin < 1.0 then return end
+	lastRaceJoin = nowC
+	if force and LP:GetAttribute("InRace") == true then
+		leaveNow()
+		task.delay(1.2, function()
+			if not dead then fireJoin("race") end
+		end)
+	else
+		fireJoin("race")
+	end
+end
+
+local function joinField(force)
+	if dead or not RaceJoin then return end
+	local nowC = os.clock()
+	if nowC - lastFieldJoin < 1.0 then return end
+	lastFieldJoin = nowC
+	if force and LP:GetAttribute("InRace") == true then
+		leaveNow()
+		task.delay(1.2, function()
+			if not dead then fireJoin("field") end
+		end)
+	else
+		fireJoin("field")
+	end
+end
+
+--// engine loop ----------------------------------------------------------------
+
+task.spawn(function()
+	while not dead do
+		task.wait(2)
+		if not dead then
+			if CFG.autoRace and CFG.autoRejoin and not race.id then
+				local inRace = LP:GetAttribute("InRace") == true
+				if inRace and os.clock() - lastRaceJoin > 10 then
+					joinRace(true)
+				elseif not inRace then
+					joinRace(false)
+				end
+			elseif CFG.autoField and not CFG.autoRace and CFG.autoRejoin and not field.comp then
+				if os.clock() - lastFieldEnd > 6 then
+					joinField(LP:GetAttribute("InRace") == true)
+				end
+			end
+		end
+	end
+end)
+
+local function panic()
+	CFG.autoRace = false
+	CFG.autoField = false
+	CFG.autoRejoin = false
+	CFG.autoTrain = false
+	race.token = race.token + 1
+	field.token = field.token + 1
+	if Training then
+		pcall(function() Training:FireServer("auto", false) end)
+	end
+	for _, flag in ipairs({ "tf_autoRace", "tf_autoField", "tf_autoRejoin", "tf_autoTrain" }) do
+		if ui.window then
+			pcall(function() ui.window:Set(flag, false) end)
+		end
+	end
+	statusRace = "panic - hands off"
+	statusField = "panic - hands off"
+	print("[TRACK] panic: auto race/field/rejoin/train off")
+end
+
+--// ui -------------------------------------------------------------------------
+
+local Rayfield
+pcall(function()
+	Rayfield = loadstring(game:HttpGet("https://sirius.menu/gen2"))()
+end)
+
+local function buildUI()
+	if not Rayfield then return end
+	local w = Rayfield:CreateWindow({
+		Name = "TRACK // LEGENDS",
+		LoadingTitle = "TRACK & FIELD",
+		LoadingSubtitle = "auto race + auto field  -  server-time notes",
+		KeySystem = false,
+	})
+	ui.window = w
+	pcall(function()
+		w:ChangeTheme({
+			WindowColor = ColorSequence.new{
+				ColorSequenceKeypoint.new(0, Color3.fromRGB(8, 12, 20)),
+				ColorSequenceKeypoint.new(1, Color3.fromRGB(18, 30, 46)),
+			},
+			ShadowColor = Color3.fromRGB(2, 4, 10),
+			CornerRoundness = UDim.new(0, 16),
+			ElementCornerRadius = UDim.new(0, 10),
+			PillCornerRadius = UDim.new(1, 0),
+			ElementGradient = ColorSequence.new{
+				ColorSequenceKeypoint.new(0, Color3.fromRGB(16, 26, 42)),
+				ColorSequenceKeypoint.new(1, Color3.fromRGB(22, 38, 58)),
+			},
+			ElementStrokeGradient = ColorSequence.new{
+				ColorSequenceKeypoint.new(0, Color3.fromRGB(0, 229, 255)),
+				ColorSequenceKeypoint.new(1, Color3.fromRGB(255, 46, 156)),
+			},
+			ElementStroke = Color3.fromRGB(40, 70, 100),
+			ElementStrokeHover = Color3.fromRGB(0, 229, 255),
+			AccentColor = Color3.fromRGB(0, 229, 255),
+			AccentStroke = Color3.fromRGB(122, 252, 255),
+			AccentGlow = 0.55,
+			SliderProgress = ColorSequence.new{
+				ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 46, 156)),
+				ColorSequenceKeypoint.new(1, Color3.fromRGB(0, 229, 255)),
+			},
+			SliderBackground = Color3.fromRGB(18, 30, 46),
+			SliderBackgroundHover = Color3.fromRGB(28, 44, 64),
+			SliderHandle = Color3.fromRGB(255, 255, 255),
+			SliderStroke = Color3.fromRGB(122, 252, 255),
+			ToggleTrack = Color3.fromRGB(10, 16, 26),
+			ToggleTrackTransparency = 0.7,
+			ToggleKnobOff = Color3.fromRGB(130, 140, 160),
+			ContentColor = Color3.fromRGB(236, 242, 255),
+			TitlingColor = Color3.fromRGB(255, 255, 255),
+			ElementTextHoverColor = Color3.fromRGB(0, 229, 255),
+			StatBackground = Color3.fromRGB(12, 22, 36),
+			TabBackground = ColorSequence.new(Color3.fromRGB(22, 38, 58), Color3.fromRGB(12, 20, 32)),
+			TabStroke = ColorSequence.new(Color3.fromRGB(0, 229, 255), Color3.fromRGB(255, 46, 156)),
+			TabColor = Color3.fromRGB(240, 245, 255),
+			FieldGlow = Color3.fromRGB(0, 229, 255),
+			DropdownHighlight = Color3.fromRGB(0, 229, 255),
+		})
+	end)
+
+	local raceTab = w:CreateTab({ name = "RACE" })
+	local fieldTab = w:CreateTab({ name = "FIELD" })
+	local sysTab = w:CreateTab({ name = "SYS" })
+
+	ui.raceCard = raceTab:CreateText({ name = "race  |  idle", text = "no lineup yet" })
+	raceTab:CreateToggle({
+		name = "auto race",
+		description = "watch RaceUpdate, press the start at gun + offset, then fire every RaceRules note at its exact server target and the dip at the calibrated offset. auto-rejoin is controlled on SYS.",
+		flag = "tf_autoRace",
+		value = CFG.autoRace,
+		callback = function(v)
+			CFG.autoRace = v
+			if v then
+				joinRace(LP:GetAttribute("InRace") == true)
+			end
+		end,
+	})
+	local raceOptions = {}
+	if type(RaceRules.EVENTS) == "table" then
+		for k in pairs(RaceRules.EVENTS) do
+			table.insert(raceOptions, tostring(k))
+		end
+	else
+		for _, k in ipairs({ "100m", "i60m", "200m", "400m", "800m", "1500m", "110mH", "400mH", "i60mH", "300m", "4x100m", "4x400m", "i4x200m", "i4x400m" }) do
+			table.insert(raceOptions, k)
+		end
+	end
+	table.sort(raceOptions)
+	local raceDefault = CFG.raceEvent
+	local hasRaceDefault = false
+	for _, k in ipairs(raceOptions) do
+		if k == raceDefault then hasRaceDefault = true end
+	end
+	if not hasRaceDefault and raceOptions[1] then
+		raceDefault = raceOptions[1]
+		CFG.raceEvent = raceDefault
+	end
+	raceTab:CreateDropdown({
+		name = "race event",
+		description = "any race the solo/ranked board offers. relays use the same plan and the same server targets.",
+		flag = "tf_raceEvent",
+		options = raceOptions,
+		value = raceDefault,
+		callback = function(v)
+			CFG.raceEvent = tostring(v)
+		end,
+	})
+	raceTab:CreateDropdown({
+		name = "join mode",
+		description = "solo is the quiet heat. ranked is the trophy heat. both are the game's own RaceJoin paths.",
+		flag = "tf_joinMode",
+		options = { "solo", "ranked" },
+		value = CFG.joinMode,
+		callback = function(v)
+			CFG.joinMode = tostring(v)
+		end,
+	})
+	raceTab:CreateButton({
+		name = "join race now",
+		description = "leave any stuck results/watch state, then fire RaceJoin with the selected mode and event.",
+		callback = function()
+			joinRace(true)
+		end,
+	})
+	raceTab:CreateButton({
+		name = "leave race / comp",
+		description = "retire the field comp if one is live, then RaceJoin leave + watch nil to clear InRace.",
+		callback = leaveNow,
+	})
+	raceTab:CreateSlider({
+		name = "start offset",
+		description = "seconds after the gun for the start press. 0.002 is the server's perfect reaction window.",
+		flag = "tf_startOffset",
+		range = { 0, 0.05 },
+		increment = 0.001,
+		value = CFG.startOffset,
+		suffix = " s",
+		callback = function(v)
+			CFG.startOffset = v
+		end,
+	})
+	raceTab:CreateSlider({
+		name = "dip offset",
+		description = "seconds added to the Dip target. the shipped client target and the grading target differ by about 0.19s.",
+		flag = "tf_dipOffset",
+		range = { 0, 0.4 },
+		increment = 0.005,
+		value = CFG.dipOffset,
+		suffix = " s",
+		callback = function(v)
+			CFG.dipOffset = v
+		end,
+	})
+	raceTab:CreateSection({ name = "SESSION" })
+	ui.statRaces = raceTab:CreateStat({ name = "races", value = stats.races })
+	ui.statRacePerfect = raceTab:CreateStat({ name = "perfect notes", value = stats.racePerfect })
+	ui.statReaction = raceTab:CreateStat({ name = "reaction", value = math.floor((stats.lastReaction or 0) * 1000) / 1000, suffix = " s" })
+	ui.statTime = raceTab:CreateStat({ name = "last time", value = stats.lastTime or 0, suffix = " s" })
+
+	ui.fieldCard = fieldTab:CreateText({ name = "field  |  idle", text = "no comp yet" })
+	fieldTab:CreateToggle({
+		name = "auto field",
+		description = "scan FLineup for your own slot, then only accept FAttempt for that slot and that comp. every FieldRules note fires at its server target, slides release at endAt.",
+		flag = "tf_autoField",
+		value = CFG.autoField,
+		callback = function(v)
+			CFG.autoField = v
+			if v then
+				joinField(LP:GetAttribute("InRace") == true)
+			end
+		end,
+	})
+	local fieldOptions = { "LJ", "TJ", "HJ", "PV", "SP", "DT", "HT", "JT", "iLJ", "iTJ", "iHJ", "iPV", "iSP", "iWT" }
+	local fieldDefault = CFG.fieldEvent
+	local hasFieldDefault = false
+	for _, k in ipairs(fieldOptions) do
+		if k == fieldDefault then hasFieldDefault = true end
+	end
+	if not hasFieldDefault then
+		fieldDefault = fieldOptions[1]
+		CFG.fieldEvent = fieldDefault
+	end
+	fieldTab:CreateDropdown({
+		name = "field event",
+		description = "jumps, throws and indoor variants. the game's FieldRules decides the approach, notes and slide windows.",
+		flag = "tf_fieldEvent",
+		options = fieldOptions,
+		value = fieldDefault,
+		callback = function(v)
+			CFG.fieldEvent = tostring(v)
+		end,
+	})
+	fieldTab:CreateButton({
+		name = "join field now",
+		description = "RaceJoin solo/ranked with the selected field event, then wait for the FLineup that contains your userId.",
+		callback = function()
+			joinField(true)
+		end,
+	})
+	fieldTab:CreateSection({ name = "SESSION" })
+	ui.statFieldAttempts = fieldTab:CreateStat({ name = "attempts", value = stats.fieldAttempts })
+	ui.statFieldPerfect = fieldTab:CreateStat({ name = "perfect notes", value = stats.fieldPerfect })
+
+	sysTab:CreateToggle({
+		name = "auto rejoin",
+		description = "after End/FEnd, clear the results state and join the next selected race or field event. race owns the loop whenever auto race is on.",
+		flag = "tf_autoRejoin",
+		value = CFG.autoRejoin,
+		callback = function(v)
+			CFG.autoRejoin = v
+		end,
+	})
+	sysTab:CreateToggle({
+		name = "auto training (pass)",
+		description = "the game gates Training auto behind the AUTO-TRAIN pass. without it this toggle refuses and points you at SHOP > PASSES.",
+		flag = "tf_autoTrain",
+		value = CFG.autoTrain,
+		callback = function(v)
+			if v and LP:GetAttribute("Pass_autotrain") ~= true then
+				CFG.autoTrain = false
+				if ui.window then pcall(function() ui.window:Set("tf_autoTrain", false) end) end
+				notify("AUTO-TRAIN is a game pass: SHOP > PASSES")
+				return
+			end
+			CFG.autoTrain = v
+			if Training then
+				pcall(function() Training:FireServer("auto", v) end)
+			end
+		end,
+	})
+	sysTab:CreateButton({ name = "panic (P)", description = "kill auto race, field, rejoin and training; stop every pending note.", callback = panic })
+	sysTab:CreateButton({ name = "unload panel", description = "tear everything down and keep your settings.", callback = function()
+		if shutdown then shutdown() end
+	end })
+
+	local keyConn
+	keyConn = UserInputService.InputBegan:Connect(function(input, gp)
+		if gp then return end
+		if input.KeyCode == Enum.KeyCode.P then
+			panic()
+		end
+	end)
+	ui.keyConn = keyConn
+end
+
+local function syncUI()
+	if ui.raceCard then
+		pcall(function()
+			ui.raceCard:SetTitle("race  |  " .. (race.id and tostring(race.event) or "idle"))
+			ui.raceCard:Set(statusRace)
+		end)
+	end
+	if ui.fieldCard then
+		pcall(function()
+			ui.fieldCard:SetTitle("field  |  " .. (field.comp and tostring(field.event) or "idle"))
+			ui.fieldCard:Set(statusField)
+		end)
+	end
+	if ui.statRaces then pcall(function() ui.statRaces:Set(stats.races) end) end
+	if ui.statRacePerfect then pcall(function() ui.statRacePerfect:Set(stats.racePerfect) end) end
+	if ui.statReaction then pcall(function() ui.statReaction:Set(math.floor((stats.lastReaction or 0) * 1000) / 1000) end) end
+	if ui.statTime then pcall(function() ui.statTime:Set(math.floor((stats.lastTime or 0) * 100) / 100) end) end
+	if ui.statFieldAttempts then pcall(function() ui.statFieldAttempts:Set(stats.fieldAttempts) end) end
+	if ui.statFieldPerfect then pcall(function() ui.statFieldPerfect:Set(stats.fieldPerfect) end) end
+end
+
+local lastSync = 0
+local syncConn = RunService.Heartbeat:Connect(function()
+	local now = os.clock()
+	if now - lastSync >= 0.25 then
+		lastSync = now
+		pcall(syncUI)
+	end
+end)
+
+local raceConn = RaceUpdate.OnClientEvent:Connect(onRaceMessage)
+local fieldConn = FieldUpdate.OnClientEvent:Connect(onFieldMessage)
+
+shutdown = function()
+	if dead then return end
+	dead = true
+	clearRace()
+	clearField()
+	if raceConn then pcall(function() raceConn:Disconnect() end) end
+	if fieldConn then pcall(function() fieldConn:Disconnect() end) end
+	if syncConn then pcall(function() syncConn:Disconnect() end) end
+	if ui.keyConn then pcall(function() ui.keyConn:Disconnect() end) end
+	if ui.window then pcall(function() ui.window:Unload() end) end
+	if Training and CFG.autoTrain then
+		pcall(function() Training:FireServer("auto", false) end)
+	end
+	_G.TrackFieldPanel = { cfg = CFG }
+	print("[TRACK] unloaded")
+end
+
+buildUI()
+-- a saved auto-train toggle must not stay on when the pass is not owned
+if CFG.autoTrain and LP:GetAttribute("Pass_autotrain") ~= true then
+	CFG.autoTrain = false
+	if ui.window then pcall(function() ui.window:Set("tf_autoTrain", false) end) end
+	notify("AUTO-TRAIN is a game pass: SHOP > PASSES")
+end
+_G.TrackFieldPanel = {
+	cfg = CFG,
+	window = ui.window,
+	stop = shutdown,
+	panic = panic,
+	joinRace = joinRace,
+	joinField = joinField,
+	leave = leaveNow,
+	race = race,
+	field = field,
+	stats = stats,
+}
+
+print(string.format("[TRACK] panel loaded - auto race/field, dip %.3f, start %.3f | %s", CFG.dipOffset, CFG.startOffset, CFG.joinMode))
+end
+
+
 --// embedded suite: rss  (from rss-panel.luau) =========================
 Hub.SUITE.rss = function()
--- Realistic Street Soccer | STREET - auto shot (power + curve + kick anims), auto
--- pass, auto tackle, auto header, auto GK dive, auto grab, auto crossover, ball ESP,
--- goal beacons
+-- Realistic Street Soccer | STREET - auto shot (the game's own curve + kick anims),
+-- auto pass, auto tackle, auto header, auto GK dive, auto grab, auto crossover,
+-- ball ESP, goal beacons
 -- place 14315258385 | Rayfield Gen2 | replace-not-stack via _G.RssStreetPanel
 -- rides only official paths: fires the game's own Remotes (ShootTheBaII / Pass / Action /
 -- the attribute grab remote) with the exact argument patterns its StarterCharacterScripts
@@ -10074,11 +10864,13 @@ local CFG = (prev and prev.cfg) or {}
 -- defaults merge: keeps saved settings across reloads, fills in fields added later
 for k, v in pairs({
 	autoPlay = false,
+	autoTeam = false,
 	autoShot = true,
 	shotRange = 8,
 	shotGoalRange = 90,
 	shotPower = 85,
 	shotCurve = 0,
+	curveComp = 0,
 	powerMode = false,
 	autoPass = false,
 	passRange = 60,
@@ -10102,6 +10894,9 @@ end
 if prev and prev.stop then
 	pcall(prev.stop)
 end
+-- the game's own curve is a direction, not a magnitude: the bend amount is the
+-- game's, so this flag is just on or off (an older build stored studs here)
+CFG.shotCurve = (tonumber(CFG.shotCurve) or 0) > 0.5 and 1 or 0
 _G.RssStreetPanel = { cfg = CFG }
 
 local Players = game:GetService("Players")
@@ -10141,6 +10936,31 @@ local function state(name)
 	local f = Workspace:FindFirstChild("Bools")
 	local v = f and f:FindFirstChild(name)
 	return v and v.Value == true or false
+end
+
+-- absolute server time - every schedule in this panel runs off the server's
+-- clock, so a lag spike or a long frame never drifts a cooldown
+local function nowT()
+	return workspace:GetServerTimeNow()
+end
+
+-- the game's own round flags - when this changes the round turned over, and
+-- the generation token cancels whatever was still scheduled for the old one
+local function roundSignature()
+	local b = Workspace:FindFirstChild("Bools")
+	local function v(n)
+		local x = b and b:FindFirstChild(n)
+		return x and tostring(x.Value) or "-"
+	end
+	return table.concat({
+		v("Kickoff"),
+		v("Intermission"),
+		v("Cutscene"),
+		v("freezeplay"),
+		v("startgame"),
+		v("homeGoals"),
+		v("awayGoals"),
+	}, "|")
 end
 
 local HOME = BrickColor.new(141) -- BallContext.HOME
@@ -10436,7 +11256,43 @@ local function remotePaths()
 			grab = v
 		end
 	end
-	return { shoot = shoot, pass = pass, action = action, grab = grab }
+	-- the game's own team pick: its role-select buttons fire exactly this one
+	local teamChange = Remotes:FindFirstChild("TeamChange")
+	return { shoot = shoot, pass = pass, action = action, grab = grab, teamChange = teamChange }
+end
+
+-- join a field side the way the game does it: its own MenuV2 role-select
+-- buttons fire Remotes.TeamChange with the side colour and the role, and they
+-- only offer a side that is under three players and not a full step behind.
+-- BrickColor 141 is the home side, 23 the away side.
+local function joinFieldTeam()
+	local R = remotePaths()
+	if not R or not R.teamChange then
+		return false
+	end
+	local b = Workspace:FindFirstChild("Bools")
+	local home = b and b:FindFirstChild("homePlrCount")
+	local away = b and b:FindFirstChild("awayPlrCount")
+	local hc = home and home.Value or 0
+	local ac = away and away.Value or 0
+	local homeOk = hc ~= 3 and hc <= ac + 1
+	local awayOk = ac ~= 3 and ac <= hc + 1
+	local color
+	if homeOk and (not awayOk or hc <= ac) then
+		color = BrickColor.new(141)
+	elseif awayOk then
+		color = BrickColor.new(23)
+	else
+		return false
+	end
+	if state("Cutscene") or state("freezeplay") or state("Intermission") then
+		return false
+	end
+	if LP:GetAttribute("InTutorial") == true then
+		return false
+	end
+	R.teamChange:FireServer(color, "Player")
+	return true
 end
 
 local function ballValid(ball)
@@ -10460,6 +11316,21 @@ local function booleansClean(char)
 end
 
 --// shot animation + curve (the controller's own kick anims and curve physics) ---
+
+-- round generation token: a new round bumps it, so work scheduled for the
+-- previous one is dropped instead of firing into the next round
+local roundGen = 0
+
+-- the game's own curve: its client sets Character.Bools.Curve.Value to
+-- "Left"/"Right" while the shot is aimed and sends that string in the shoot
+-- remote's 7th argument - the server bends the ball that way. the ball itself
+-- is server-simulated (a client-side velocity write does not move it), so the
+-- game's own curve is the only thing that bends it.
+local CURVE_CHARGE_GATE = 0.7 -- the game's own charged-shot threshold
+
+-- what the last shot actually sent, so a curve can be checked against the
+-- ball's own path after the fact
+local lastShot = nil
 
 local shootTrackCache = {}
 
@@ -10522,10 +11393,9 @@ local function playShootAnim(char, aimDir, hold, power)
 	end
 end
 
--- solve a shot: aim direction, charge seconds, curve side - bending `bend` studs
--- around the keeper and still landing on the target. curve model is the game's own
--- (aim beam predict): +20 st/s lateral kick on the curve side, -90 st/s^2 back for
--- 0.4s, net landing offset 14.4 - 16*flightTime along the aim's right
+-- solve a shot: aim direction, charge seconds, curve side + side sign. `bend` is
+-- studs of sideways travel the curve engine will add, and the aim is offset the
+-- other way so the ball still lands on the corner once it has bent
 local function solveShot(ball, target, bend, powerPct)
 	if not (ball and target) then
 		return nil
@@ -10535,59 +11405,49 @@ local function solveShot(ball, target, bend, powerPct)
 		return nil
 	end
 	local dir = flat.Unit
-	local hold = math.clamp((powerPct or 85) / 100, 0.01, 1)
-	local curve = "None"
-	if (bend or 0) > 0 then
-		-- charge that lands the ball `bend` studs off the aim line, then pick the
-		-- closest achievable bend between the curve floor (0.75s - the game's own
-		-- charged-shot gate) and the power slider
-		local dist = flat.Magnitude
-		local lo = 0.75
-		local hi = math.min(math.max((powerPct or 85) / 100, lo), 1)
-		local function landingOffset(h)
-			return 14.4 - 16 * dist / (32 + 81 * h)
+	local hold = math.clamp((powerPct or 85) / 100, 0.15, 1)
+	local curve, side = "None", 0
+	if (bend or 0) > 0.5 then
+		-- swing at the keeper's side of the line; the aim leans away so the
+		-- bend lands back on the target
+		local right = CFrame.lookAt(Vector3.zero, dir).RightVector
+		local keeper = enemyKeeperChar()
+		local khrp = keeper and keeper:FindFirstChild("HumanoidRootPart")
+		side = 1
+		if khrp then
+			local lat = Vector3.new(
+				khrp.Position.X - ball.Position.X,
+				0,
+				khrp.Position.Z - ball.Position.Z
+			):Dot(right)
+			side = lat >= 0 and 1 or -1
 		end
-		local holdNeeded = (16 * dist / (14.4 + bend) - 32) / 81
-		local best, bestErr = hold, math.huge
-		for _, h in ipairs({ math.clamp(holdNeeded, lo, hi), lo, hi }) do
-			local err = math.abs(math.abs(landingOffset(h)) - bend)
-			if err < bestErr then
-				bestErr, best = err, h
-			end
-		end
-		hold = best
-		local D = landingOffset(hold) -- net landing offset along the aim's right
-		if math.abs(D) > 0.25 then
-			-- swing at the keeper's side of the line, curl back onto the target
-			local right = CFrame.lookAt(Vector3.zero, dir).RightVector
-			local keeper = enemyKeeperChar()
-			local khrp = keeper and keeper:FindFirstChild("HumanoidRootPart")
-			local side = 1
-			if khrp then
-				local lat = Vector3.new(
-					khrp.Position.X - ball.Position.X,
-					0,
-					khrp.Position.Z - ball.Position.Z
-				):Dot(right)
-				side = lat >= 0 and 1 or -1
-			end
-			curve = side > 0 and "Right" or "Left"
-			local aimPoint = target - D * side * right
-			local flat2 = Vector3.new(aimPoint.X - ball.Position.X, 0, aimPoint.Z - ball.Position.Z)
-			if flat2.Magnitude > 2 then
-				dir = flat2.Unit
-			end
+		curve = side > 0 and "Right" or "Left"
+		if hold < CURVE_CHARGE_GATE then
+			curve = "None" -- the game only bends a charged shot
 		else
-			curve = "None" -- landing offset rounds to zero - straight shot
+			-- the game's curve pushes the ball sideways on its way to the goal,
+			-- so the aim leans back by the compensation amount to keep the shot
+			-- on the corner the panel aimed at
+			local travel = CFG.curveComp or 0
+			if travel > 0 then
+				local aimPoint = target - right * (side * travel)
+				local flat2 = Vector3.new(aimPoint.X - ball.Position.X, 0, aimPoint.Z - ball.Position.Z)
+				if flat2.Magnitude > 2 then
+					dir = flat2.Unit
+				end
+			end
 		end
 	end
-	return dir, hold, curve
+	return dir, hold, curve, side
 end
 
 -- shot replica (controller mouserelease PC form): aim unit, ball CFrame, charge
 -- seconds, aim again, false, false, curve side, nil, powershot flag - with the
--- controller's own kick animation and its Curve value lifecycle
-local function fireShot(ball, aimDir, hold, curve)
+-- controller's own kick animation. the curve side is the game's own: its
+-- client sets Character.Bools.Curve.Value while the shot is aimed and sends
+-- that string here, and the server bends the ball that way.
+local function fireShot(ball, aimDir, hold, curve, side)
 	local R = remotePaths()
 	if not R or not ballValid(ball) then
 		return false
@@ -10597,17 +11457,18 @@ local function fireShot(ball, aimDir, hold, curve)
 		return false
 	end
 	hold = math.clamp(hold or 0.85, 0.01, 1)
-	curve = curve or "None"
-	local b = myBools(char)
-	local curveObj = b and b:FindFirstChild("Curve")
-	if curve ~= "None" and curveObj then
-		curveObj.Value = curve -- the game's own client holds this while curving
-	end
+	local curveArg = (curve == "Left" or curve == "Right") and curve or "None"
 	playShootAnim(char, aimDir, hold)
-	R.shoot:FireServer(aimDir, ball.CFrame, hold, aimDir, false, false, curve, nil, false)
-	if curve ~= "None" and curveObj then
-		curveObj.Value = "None" -- the game's own scripts reset it after the shot
+	local bools = myBools(char)
+	local flag = bools and bools:FindFirstChild("Curve")
+	if flag then
+		flag.Value = curveArg
 	end
+	R.shoot:FireServer(aimDir, ball.CFrame, hold, aimDir, false, false, curveArg, nil, false)
+	if flag then
+		flag.Value = "None"
+	end
+	lastShot = { curve = curveArg, hold = hold, at = nowT() }
 	return true
 end
 
@@ -10952,9 +11813,9 @@ local function moveTo(char, pos)
 		return
 	end
 	local flat = Vector3.new(pos.X, hrp.Position.Y, pos.Z)
-	if not lastMoveTarget or (flat - lastMoveTarget).Magnitude > 1.5 or os.clock() - lastMoveAt > 1 then
+	if not lastMoveTarget or (flat - lastMoveTarget).Magnitude > 1.5 or nowT() - lastMoveAt > 1 then
 		lastMoveTarget = flat
-		lastMoveAt = os.clock()
+		lastMoveAt = nowT()
 		humanoid:MoveTo(flat)
 	end
 end
@@ -10985,7 +11846,7 @@ local function fieldAutoMove(char, ball, ballDist, iHaveBall)
 
 	if iHaveBall and goalPos then
 		-- fresh off a crossover: cut past the defender's shoulder before resuming
-		if os.clock() < veerUntil and veerPos then
+		if nowT() < veerUntil and veerPos then
 			moveTo(char, veerPos)
 			return
 		end
@@ -11028,9 +11889,11 @@ end
 --// main loop ------------------------------------------------------------------
 
 local dead = false
-local lastAct = { shot = 0, pass = 0, tackle = 0, header = 0, grab = 0, dive = 0, deke = 0 }
+local lastAct = { shot = 0, pass = 0, tackle = 0, header = 0, grab = 0, dive = 0, deke = 0, team = 0 }
 local lastAny = 0
 local lastErrAt = 0
+local lastRoundSig = nil
+local lastSigAt = 0
 local loopConn
 local keyConn
 
@@ -11051,7 +11914,18 @@ local function step()
 	if dead then
 		return
 	end
-	local now = os.clock()
+	local now = nowT()
+	-- the round turned over: bump the generation token, so anything the old
+	-- round still had scheduled is dropped instead of firing into the new one
+	if now - lastSigAt >= 0.25 then
+		lastSigAt = now
+		local sig = roundSignature()
+		if sig ~= lastRoundSig then
+			lastRoundSig = sig
+			roundGen = roundGen + 1
+			lastAny = now
+		end
+	end
 	local ball = findBall()
 	local ballDist
 	local char = LP.Character
@@ -11077,6 +11951,13 @@ local function step()
 		return
 	end
 	if not amPlaying() then
+		-- the action layer is dead while we sit on the fans side - the game's
+		-- own team pick puts us back on a field side when it is asked to
+		if CFG.autoTeam and now - lastAct.team >= 5 then
+			if joinFieldTeam() then
+				lastAct.team = now
+			end
+		end
 		return -- Fans / neutral: hands off
 	end
 	local keeper = amKeeper()
@@ -11179,16 +12060,20 @@ local function step()
 			local dir = aimDir(ball)
 			if dir then
 				if CFG.powerMode then
-					face(char, bestTarget()) -- LookVector feeds the power shot's 4th arg
-					playShootAnim(char, aimDir(ball), 1, true)
-					if firePowerShot(ball, aimDir(ball)) then
-						lastAct.shot, lastAny = now, now
+					local sdir, _, _, side = solveShot(ball, bestTarget(), CFG.shotCurve, CFG.shotPower)
+					sdir = sdir or aimDir(ball)
+					if sdir then
+						face(char, ball.Position + sdir * 10) -- LookVector feeds the power shot's 4th arg
+						playShootAnim(char, sdir, 1, true)
+						if firePowerShot(ball, sdir) then
+							lastAct.shot, lastAny = now, now
+						end
 					end
 				else
-					local sdir, hold, curve = solveShot(ball, bestTarget(), CFG.shotCurve, CFG.shotPower)
+					local sdir, hold, curve, side = solveShot(ball, bestTarget(), CFG.shotCurve, CFG.shotPower)
 					if sdir then
 						face(char, ball.Position + sdir * 10) -- the kick anim reads facing
-						if fireShot(ball, sdir, hold, curve) then
+						if fireShot(ball, sdir, hold, curve, side) then
 							lastAct.shot, lastAny = now, now
 						end
 					end
@@ -11285,8 +12170,8 @@ end
 
 loopConn = RunService.Heartbeat:Connect(function()
 	local ok, err = pcall(step)
-	if not ok and os.clock() - lastErrAt > 5 then
-		lastErrAt = os.clock()
+	if not ok and nowT() - lastErrAt > 5 then
+		lastErrAt = nowT()
 		warn("[RSS] loop error: " .. tostring(err))
 	end
 end)
@@ -11295,6 +12180,7 @@ end)
 
 local FLAGS = {
 	"autoplay",
+	"autoteam",
 	"autoshot",
 	"powershot",
 	"autopass",
@@ -11310,6 +12196,7 @@ local FLAGS = {
 
 local function panic()
 	CFG.autoPlay = false
+	CFG.autoTeam = false
 	CFG.autoShot = false
 	CFG.powerMode = false
 	CFG.autoPass = false
@@ -11382,15 +12269,60 @@ local function buildUI()
 		return
 	end
 	local w = Rayfield:CreateWindow({
-		Name = "RSS STREET | STREET",
-		LoadingTitle = "STREET",
-		LoadingSubtitle = "power + curve shots, pass, tackle, header, GK dive, grab, crossover, ESP",
+		Name = "RSS // STREET",
+		LoadingTitle = "RSS STREET",
+		LoadingSubtitle = "neon curve engine - shots, passing, defense, ESP",
 		KeySystem = false,
 	})
 	window = w
-	local play = w:CreateTab({ name = "PLAY" })
-	local view = w:CreateTab({ name = "VIEW" })
-	local sys = w:CreateTab({ name = "SYS" })
+	pcall(function()
+		w:ChangeTheme({
+			WindowColor = ColorSequence.new{
+				ColorSequenceKeypoint.new(0, Color3.fromRGB(10, 8, 22)),
+				ColorSequenceKeypoint.new(1, Color3.fromRGB(26, 14, 52)),
+			},
+			ShadowColor = Color3.fromRGB(4, 2, 12),
+			CornerRoundness = UDim.new(0, 16),
+			ElementCornerRadius = UDim.new(0, 10),
+			PillCornerRadius = UDim.new(1, 0),
+			ElementGradient = ColorSequence.new{
+				ColorSequenceKeypoint.new(0, Color3.fromRGB(22, 16, 44)),
+				ColorSequenceKeypoint.new(1, Color3.fromRGB(30, 20, 58)),
+			},
+			ElementStrokeGradient = ColorSequence.new{
+				ColorSequenceKeypoint.new(0, Color3.fromRGB(94, 68, 190)),
+				ColorSequenceKeypoint.new(1, Color3.fromRGB(0, 229, 255)),
+			},
+			ElementStroke = Color3.fromRGB(70, 50, 140),
+			ElementStrokeHover = Color3.fromRGB(0, 229, 255),
+			AccentColor = Color3.fromRGB(0, 229, 255),
+			AccentStroke = Color3.fromRGB(122, 252, 255),
+			AccentGlow = 0.55,
+			SliderProgress = ColorSequence.new{
+				ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 46, 156)),
+				ColorSequenceKeypoint.new(1, Color3.fromRGB(0, 229, 255)),
+			},
+			SliderBackground = Color3.fromRGB(26, 18, 50),
+			SliderBackgroundHover = Color3.fromRGB(36, 26, 70),
+			SliderHandle = Color3.fromRGB(255, 255, 255),
+			SliderStroke = Color3.fromRGB(122, 252, 255),
+			ToggleTrack = Color3.fromRGB(14, 10, 30),
+			ToggleTrackTransparency = 0.75,
+			ToggleKnobOff = Color3.fromRGB(130, 120, 170),
+			ContentColor = Color3.fromRGB(236, 232, 255),
+			TitlingColor = Color3.fromRGB(255, 255, 255),
+			ElementTextHoverColor = Color3.fromRGB(0, 229, 255),
+			StatBackground = Color3.fromRGB(16, 12, 34),
+			TabBackground = ColorSequence.new(Color3.fromRGB(28, 20, 56), Color3.fromRGB(18, 12, 38)),
+			TabStroke = ColorSequence.new(Color3.fromRGB(0, 229, 255), Color3.fromRGB(120, 60, 220)),
+			TabColor = Color3.fromRGB(240, 238, 255),
+			FieldGlow = Color3.fromRGB(0, 229, 255),
+			DropdownHighlight = Color3.fromRGB(0, 229, 255),
+		})
+	end)
+	local play = w:CreateTab({ name = "◈ PLAY" })
+	local view = w:CreateTab({ name = "◉ VIEW" })
+	local sys = w:CreateTab({ name = "⚙ SYS" })
 
 	play:CreateToggle({
 		name = "auto play",
@@ -11400,6 +12332,15 @@ local function buildUI()
 		callback = function(v)
 			CFG.autoPlay = v
 			lastMoveTarget = nil
+		end,
+	})
+	play:CreateToggle({
+		name = "auto team pick",
+		description = "when the game parks you on the fans side - between rounds, or after a goal - pick yourself back onto a field side through the game's own team remote, with the same side limit the game's own role select uses. off by default: it never takes a slot you did not ask for",
+		flag = "autoteam",
+		value = CFG.autoTeam,
+		callback = function(v)
+			CFG.autoTeam = v
 		end,
 	})
 	play:CreateToggle({
@@ -11444,16 +12385,25 @@ local function buildUI()
 			CFG.shotPower = v
 		end,
 	})
-	play:CreateSlider({
+	play:CreateToggle({
 		name = "shot curve",
-		description = "banana bend in studs, 0-40 - the shot swings at the keeper's side and curls back onto the corner, through the game's own curve argument (charged shots only; power shot mode can't curve)",
+		description = "the game's own bend: the shot is sent with the curve side the game expects ('Left'/'Right' in the shoot remote) so the server curves it around the keeper - it needs a charged shot, so keep the power at 70 or more",
 		flag = "shotcurve",
-		range = { 0, 40 },
-		increment = 1,
-		value = CFG.shotCurve,
+		value = CFG.shotCurve == 1,
+		callback = function(v)
+			CFG.shotCurve = v and 1 or 0
+		end,
+	})
+	play:CreateSlider({
+		name = "curve compensation",
+		description = "studs the aim leans back by, so a bent shot still lands on the corner the panel aimed at - 0 leaves the raw bend, raise it if the shot is sailing wide of the corner",
+		flag = "curvecomp",
+		range = { 0, 12 },
+		increment = 0.5,
+		value = CFG.curveComp,
 		suffix = " st",
 		callback = function(v)
-			CFG.shotCurve = v
+			CFG.curveComp = v
 		end,
 	})
 	play:CreateSlider({
@@ -11656,6 +12606,18 @@ _G.RssStreetPanel = {
 	fireDeke = fireDeke,
 	defenderAhead = defenderAhead,
 	findPress = findPress,
+	joinFieldTeam = joinFieldTeam,
+	now = nowT,
+	curveState = function()
+		return {
+			gen = roundGen,
+			signature = lastRoundSig,
+			chargeGate = CURVE_CHARGE_GATE,
+			curve = CFG.shotCurve,
+			compensation = CFG.curveComp,
+			lastShot = lastShot,
+		}
+	end,
 	state = function()
 		local ball = findBall()
 		local char = LP.Character
@@ -11678,7 +12640,7 @@ _G.RssStreetPanel = {
 	end,
 }
 
-print("[RSS] panel loaded - auto play, power/curve shots, pass, tackle, header, GK dive, grab, crossover, ESP | paths "
+print("[RSS] panel loaded - auto play, curve shots, pass, tackle, header, GK dive, grab, crossover, ESP | paths "
 	.. (remotePaths() and "ok" or "missing")
 	.. (amPlaying() and (amKeeper() and " | keeper" or " | field") or " | spectating (join Home/Away)"))
 end
