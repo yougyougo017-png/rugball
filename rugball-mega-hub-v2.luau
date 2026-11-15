@@ -19,6 +19,8 @@
 		75703135112691   TPS: Street Soccer      tps (match sub-place)
 		82886081053523   Track & Field Legends   track
 		14315258385      Realistic Street Soccer rss
+		124780003623150  Realistic Ragdoll MMA   mma
+		101880234193261  Car Soccer              carsoccer
 
 	the taf bypass runs before the suites that need it, so its hooks are live
 	before any suite code touches the controllers.
@@ -49,6 +51,8 @@ Hub.ORDER = {
 	{ place = 75703135112691, label = "TPS MATCH",         suites = { "tps" } },
 	{ place = 82886081053523, label = "TRACK & FIELD",     suites = { "track" } },
 	{ place = 14315258385,    label = "RSS STREET SOCCER", suites = { "rss" } },
+	{ place = 124780003623150, label = "REALISTIC RAGDOLL MMA", suites = { "mma" } },
+	{ place = 101880234193261, label = "CAR SOCCER", suites = { "carsoccer" } },
 }
 
 Hub.GAMES = {}
@@ -56,7 +60,7 @@ for _, g in ipairs(Hub.ORDER) do
 	Hub.GAMES[g.place] = g
 end
 
-Hub.SUITE_ORDER = { "football", "anime", "nba", "swish", "duels", "qb_aimbot", "taf_bypass", "physbox", "tps", "track", "rss" }
+Hub.SUITE_ORDER = { "football", "anime", "nba", "swish", "duels", "qb_aimbot", "taf_bypass", "physbox", "tps", "track", "rss", "mma", "carsoccer" }
 
 Hub.SUITE_NAMES = {
 	football   = "football panel    |  aim / tackle / block",
@@ -70,6 +74,8 @@ Hub.SUITE_NAMES = {
 	tps        = "tps street         |  auto shot / tackle / GK / esp",
 	track      = "track & field      |  auto race / auto field timing",
 	rss        = "rss street          |  auto shot / pass / tackle / header / GK dive",
+	mma        = "mma panel         |  fight / ground / subs + hud",
+	carsoccer  = "car soccer        |  autopilot / boost / ball path",
 }
 
 Hub.SUITE = {}
@@ -12643,6 +12649,2053 @@ _G.RssStreetPanel = {
 print("[RSS] panel loaded - auto play, curve shots, pass, tackle, header, GK dive, grab, crossover, ESP | paths "
 	.. (remotePaths() and "ok" or "missing")
 	.. (amPlaying() and (amKeeper() and " | keeper" or " | field") or " | spectating (join Home/Away)"))
+end
+
+--// embedded suite: mma  (from mma-panel.luau) =========================
+Hub.SUITE.mma = function()
+-- Realistic Ragdoll MMA | max-mode fight panel
+-- place 124780003623150 | Rayfield Gen2 | replace-not-stack via _G.RagdollMmaPanel
+--
+-- this game is a client-authoritative boxing sim: damage, contact and knockdowns are
+-- all resolved on the client from its own Match/Fighter state. so there is nothing to
+-- spoof over the wire -- the panel drives the game's own methods:
+--   Match:playerStrike(move)        strike, using Match:aim() (camera raycast -> zone)
+--   Match:playerShoot()             takedown shot (0.3s later resolveContact -> drive)
+--   Match:sprawlPress()             clinch press, works as attacker and defender
+--   Match:groundMash()              ground mash / sub escape / sub finish
+--   Match:groundStrikeInput(move)   ground and pound (jab/cross/lhook/rhook)
+--   Match:groundOption(index)        index into Match:groundMenu(player), 1-based
+--   Match:debugMove                 camera-relative movement hook read by readMovement
+--   Touch.block                     guard state read by readMovement
+--   match.camYaw / camPitch         the game's own aim state (also turns the fighter)
+--
+-- nothing here invents remotes, writes career data, or fires fake server events.
+
+local prev = _G.RagdollMmaPanel
+local CFG = (prev and prev.cfg) or {}
+for k, v in pairs({
+	autoFight = false,
+	autoAim = true,
+	aimZone = "head",
+	autoBlock = true,
+	autoCounter = true,
+	autoTakedown = false,
+	takedownStamina = 40,
+	autoGround = true,
+	autoSub = true,
+	autoSprawl = true,
+	pressRate = 12,
+	autoSkip = true,
+	aggro = 60,
+	staminaFloor = 20,
+	strikeStyle = "smart",
+	hud = true,
+	hudBars = true,
+	hudNames = true,
+	hudAlerts = true,
+	logSize = 6,
+}) do
+	if CFG[k] == nil then CFG[k] = v end
+end
+if prev and prev.stop then
+	pcall(prev.stop)
+end
+_G.RagdollMmaPanel = { cfg = CFG }
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local LP = Players.LocalPlayer
+
+local ROFC = ReplicatedStorage:FindFirstChild("ROFC")
+if not ROFC then
+	warn("[MMA] ROFC modules not found in place " .. tostring(game.PlaceId))
+	_G.RagdollMmaPanel = { cfg = CFG }
+	return
+end
+
+local function tryRequire(name)
+	local m = ROFC:FindFirstChild(name)
+	if not m then return nil end
+	local ok, mod = pcall(require, m)
+	if ok then return mod end
+	return nil
+end
+
+local Match = tryRequire("Match")
+local Touch = tryRequire("Touch")
+local Config = tryRequire("Config")
+local Util = tryRequire("Util")
+local Cinema = tryRequire("Cinema")
+
+if not (Match and Touch and Config and Util) then
+	warn("[MMA] required modules missing (Match/Touch/Config/Util)")
+	_G.RagdollMmaPanel = { cfg = CFG }
+	return
+end
+
+local Remotes = ReplicatedStorage:FindFirstChild("ROFCRemotes")
+local GetCareer = Remotes and Remotes:FindFirstChild("GetCareer")
+local GetProfile = Remotes and Remotes:FindFirstChild("GetProfile")
+
+local dead = false
+local ui = {}
+local status = "idle  |  no match"
+local match = nil
+local nextScan = 0
+local lastState = {}
+
+local function now()
+	return os.clock()
+end
+
+local function flat(v)
+	return Vector3.new(v.X, 0, v.Z)
+end
+
+local function fmtTime(t)
+	if Util and Util.formatTime then
+		local ok, s = pcall(Util.formatTime, t)
+		if ok then return s end
+	end
+	return string.format("%d:%02d", math.max(0, math.floor(t)) // 60, math.max(0, math.floor(t)) % 60)
+end
+
+--// session stats ---------------------------------------------------------------
+
+local stats = _G.RagdollMmaStats or {}
+_G.RagdollMmaStats = stats
+for k, v in pairs({
+	fights = 0, wins = 0, losses = 0, koWins = 0, koLosses = 0,
+	strikes = 0, landed = 0, damage = 0, takedowns = 0, tdConceded = 0, knockdowns = 0, subs = 0,
+}) do
+	if stats[k] == nil then stats[k] = v end
+end
+
+local log = {}
+local function pushLog(text)
+	table.insert(log, 1, os.date("%H:%M:%S") .. "  " .. text)
+	while #log > math.max(3, CFG.logSize) do
+		table.remove(log)
+	end
+end
+
+local notify = function(text)
+	print("[MMA] " .. tostring(text))
+end
+
+--// match capture ---------------------------------------------------------------
+
+local function isMatch(v)
+	if type(v) ~= "table" then return false end
+	local ok, mt = pcall(getmetatable, v)
+	return ok and mt == Match and rawget(v, "player") ~= nil
+end
+
+-- the game keeps every live Match in a RenderStepped closure upvalue; walking those
+-- upvalues is cheap and exact, and it catches a panel loaded mid-fight.
+local function scanForMatch()
+	if filtergc then
+		local ok, found = pcall(filtergc, "table", { Metatable = Match }, true)
+		if ok and isMatch(found) and not found.closed and not found.finish and found.state ~= "ended" then return found end
+		local okAll, all = pcall(filtergc, "table", { Metatable = Match }, false)
+		if okAll and type(all) == "table" then
+			for _, v in ipairs(all) do
+				if isMatch(v) and not v.closed and not v.finish and v.state ~= "ended" then
+					if v.state == "fight" or v.controls then return v end
+				end
+			end
+		end
+	end
+	for _, sig in ipairs({ RunService.RenderStepped, RunService.Heartbeat, RunService.Stepped }) do
+		local ok, conns = pcall(getconnections, sig)
+		if ok and type(conns) == "table" then
+			for _, c in ipairs(conns) do
+				local f = c.Function
+				if f then
+					for i = 1, 16 do
+						local oku, a, b = pcall(debug.getupvalue, f, i)
+						if not oku then break end
+						if a == nil and b == nil then break end
+						if isMatch(a) and not a.finish and a.state ~= "ended" then return a end
+						if isMatch(b) and not b.finish and b.state ~= "ended" then return b end
+					end
+				end
+			end
+		end
+	end
+	return nil
+end
+
+local function resetWatch()
+	lastState = { thrown = 0, landed = 0, damage = 0, td = 0, tdP = 0, kdO = 0, kdP = 0, finished = false, round = 0 }
+end
+
+local function adopt(m)
+	if match == m and not m.closed then return end
+	match = m
+	resetWatch()
+	if m.finish then lastState.finished = true end
+	status = "match captured"
+	pushLog("match captured (round " .. tostring(m.round) .. ", " .. tostring(m.rounds) .. " rounds)")
+	notify("match captured")
+end
+
+local oldNew = Match.new
+local hookNew = function(cfg)
+	local m = oldNew(cfg)
+	if isMatch(m) then
+		task.defer(adopt, m)
+	end
+	return m
+end
+Match.new = hookNew
+
+--// aim -------------------------------------------------------------------------
+
+local function aimPoint(m, zone)
+	local o = m.opp
+	if not o or not o.rig then return nil end
+	local ok, p = pcall(function()
+		if zone == "body" then
+			return o.rig:point("body")
+		elseif zone == "legs" then
+			return o.rig.bones.ShinL.world.Position
+		end
+		return o.rig:point("head")
+	end)
+	if ok then return p end
+	return nil
+end
+
+-- camYaw/camPitch are the game's own camera state: step() feeds them into the camera
+-- and into player.yaw, and Match:aim() raycasts along the resulting camera CFrame.
+local function aimAt(m, zone)
+	local tgt = aimPoint(m, zone)
+	local camPos = m.camPos
+	if not tgt or not camPos then return end
+	local d = tgt - camPos
+	local horiz = flat(d).Magnitude
+	if horiz < 0.25 then return end
+	local yaw = Util.yawOf(d)
+	if Util.dampAngle then
+		m.camYaw = Util.dampAngle(m.camYaw, yaw, 14, 1 / 60)
+	else
+		m.camYaw = yaw
+	end
+	m.camPitch = Util.clamp(math.atan2(d.Y, horiz), -1.3, 0.75)
+end
+
+-- exact-aim frame for the strike itself: aim() reads CurrentCamera.CFrame, so write it
+-- once right before the call (the game rewrites the camera every RenderStepped anyway).
+local function strikeAt(m, move, zone)
+	local tgt = aimPoint(m, zone)
+	local cam = workspace.CurrentCamera
+	if tgt and cam then
+		local pos = cam.CFrame.Position
+		local d = tgt - pos
+		if flat(d).Magnitude > 0.2 then
+			cam.CFrame = CFrame.lookAt(pos, tgt)
+		end
+	end
+	local ok, res = pcall(m.playerStrike, m, move)
+	return ok and res
+end
+
+--// fighter helpers -------------------------------------------------------------
+
+local function strikeDef(move)
+	local s = Config.Strikes
+	return s and s[move]
+end
+
+local function canThrow(f, move)
+	if not f or f.down or f.rig.ragdolled or f.mode ~= "fight" then return false end
+	if f.shot or f.clinch then return false end
+	if (f.slipT or -1) >= 0 then return false end
+	if (f.bodyHurtT or 0) > 0.3 then return false end
+	if f.time < (f.shotRecover or -1) then return false end
+	if f.stamina < math.max(1, CFG.staminaFloor) then return false end
+	local def = strikeDef(move)
+	if not def then return false end
+	if f.stamina < def.stamina then return false end
+	if def.kind == "knee" and f.stamina < 8 then return false end
+	local ok, striking = pcall(function() return f:isStriking() end)
+	if ok and striking then return false end
+	return true
+end
+
+local function pickStrike(m, dist, reach)
+	local o = m.opp
+	local p = m.player
+	local style = CFG.strikeStyle
+	local stamina = p.stamina
+
+	if style == "jab" then return "jab" end
+
+	local rocked = (o.rockedT or 0) > 0
+	local gas = o.stamina < 30
+
+	if style == "smart" then
+		if stamina < 26 then return "jab" end
+		if rocked then
+			if stamina >= 11 and dist > reach * 0.55 then return "rkick" end
+			if stamina >= 4.6 then return "rhook" end
+		end
+		if gas and stamina >= 6.5 and dist > reach * 0.5 then return "lkick" end
+		if dist > reach * 0.82 then
+			if stamina >= 8 and math.random() < 0.45 then return "rkick" end
+			if stamina >= 6.5 and math.random() < 0.5 then return "lkick" end
+			return "jab"
+		end
+		if dist < reach * 0.45 and stamina >= 20 and math.random() < 0.35 then return "knee" end
+		local pool = { "jab", "cross", "jab", "cross", "lhook", "rhook", "jab", "cross" }
+		return pool[math.random(1, #pool)]
+	end
+
+	if style == "power" then
+		if stamina < 5 then return "jab" end
+		local pool = { "cross", "rhook", "lhook", "cross" }
+		return pool[math.random(1, #pool)]
+	end
+
+	if style == "kicks" then
+		if stamina < 8 then return "jab" end
+		local pool = { "lkick", "rkick", "lkick", "jab" }
+		return pool[math.random(1, #pool)]
+	end
+
+	if style == "combo" then
+		local pool = { "jab", "cross", "jab", "cross", "lhook", "rhook" }
+		return pool[math.random(1, #pool)]
+	end
+
+	return "jab"
+end
+
+-- any opponent strike in windup or extend, with the opponent close enough to matter.
+local function incomingStrike(m)
+	local o = m.opp
+	local p = m.player
+	if not o or not p then return false, nil end
+	local dist = flat(o.pos - p.pos).Magnitude
+	local reach = (p.d and p.d.reach or 1.1) + 1.4 * (p.s or 1)
+	if dist > reach then return false, nil end
+	local ok, strikes = pcall(function() return o.strikes end)
+	if not ok or type(strikes) ~= "table" then return false, nil end
+	for limb, st in pairs(strikes) do
+		local def = st.def or strikeDef(st.kind)
+		local speed = st.speed or 1
+		if def then
+			local windup = (def.windup or 0.1) / math.max(0.1, speed)
+			local extend = (def.extend or 0.12) / math.max(0.1, speed)
+			if st.t < windup + extend + 0.02 then
+				return true, limb
+			end
+		end
+	end
+	return false, nil
+end
+
+--// ground menu handling --------------------------------------------------------
+
+local POS_RANK = { guard = 1, half = 2, side = 3, mount = 4, back = 5 }
+local SUB_PREF = { rnc = 6, armbar = 5, armtri = 5, americana = 4, kimura = 3, triangle = 4, gArmbar = 4, bKimura = 3 }
+
+local function menuOf(m, f)
+	local ok, menu = pcall(function() return m:groundMenu(f) end)
+	if ok and type(menu) == "table" then return menu end
+	return nil
+end
+
+-- score one menu entry. sub options win when stamina allows; passes climb the position
+-- ladder; the bottom player prefers a sweep and then standing up.
+local function scoreOption(entry, isTop, gnd)
+	local action = entry[1]
+	local target = entry[2]
+	if action == "sub" then
+		if not CFG.autoSub then return -1 end
+		return 60 + (SUB_PREF[target] or 1) * 5
+	end
+	if action == "pass" then
+		if not isTop then return -1 end
+		return 30 + (POS_RANK[target] or 0) * 12 + (target == "back" and 8 or 0)
+	end
+	if action == "esc" then return 90 end
+	if action == "up" then return 25 + (gnd and gnd.pos == "back" and 20 or 0) end
+	if action == "rev" then return 45 end
+	if action == "subrev" then return 80 end
+	if action == "stand" then return 18 end
+	return 5
+end
+
+local function bestOption(m, f, gnd)
+	local menu = menuOf(m, f)
+	if not menu then return nil end
+	local isTop = gnd.top == f
+	local bestIndex, bestScore, bestAction
+	for i, entry in ipairs(menu) do
+		if type(entry) == "table" then
+			local s = scoreOption(entry, isTop, gnd)
+			if s > (bestScore or -1) then
+				bestIndex, bestScore, bestAction = i, s, entry[1]
+			end
+		end
+	end
+	return bestIndex, bestScore, bestAction
+end
+
+--// automation ------------------------------------------------------------------
+
+local nextMoveClear = 0
+local lastTry = 0
+local lastGroundStrike = 0
+local lastGroundOpt = 0
+local lastSprawl = 0
+local lastSkip = 0
+local lastTakedown = 0
+local function setMove(vec)
+	match.debugMove = vec
+	nextMoveClear = now() + 0.25
+end
+
+local function setBlock(on)
+	if Touch.block ~= on then
+		Touch.block = on
+	end
+end
+
+local function fightTick(m)
+	local p, o = m.player, m.opp
+	if not (p and o and p.rig and o.rig) then return end
+	if m.state ~= "fight" or m.finish or not m.controls then return end
+	if p.down or o.down or p.rig.ragdolled or o.rig.ragdolled then return end
+	if m.gnd or m.drive then return end
+
+	if CFG.autoAim then
+		aimAt(m, CFG.aimZone)
+	end
+
+	local delta = flat(o.pos - p.pos)
+	local dist = delta.Magnitude
+	local reach = (p.d and p.d.reach or 1.1) + 0.75 * (p.s or 1)
+	local want = reach * (0.60 + 0.55 * (CFG.aggro / 100))
+
+	local fwd, side = 0, 0
+	if dist > want + 0.05 then
+		fwd = -1
+	elseif dist < want * 0.6 then
+		fwd = 0.8
+	end
+	-- small orbit so the AI cannot just line us up, and so we stay off the fence
+	local t = now()
+	side = math.sin(t * 1.3) * 0.25
+	setMove(Vector3.new(side, 0, fwd))
+
+	local threat = false
+	if CFG.autoBlock then
+		threat = incomingStrike(m)
+	end
+	setBlock(threat ~= false)
+
+	local allowStrike = (not CFG.autoBlock) or (not threat) or (not CFG.autoCounter)
+	if allowStrike and dist <= reach * 1.0 and now() - lastTry > 0.09 then
+		local move = pickStrike(m, dist, reach)
+		if canThrow(p, move) then
+			lastTry = now()
+			strikeAt(m, move, CFG.aimZone)
+		end
+	end
+
+	if CFG.autoTakedown and now() - lastTakedown > 0.55 and p.stamina >= CFG.takedownStamina then
+		local ok, can = pcall(function() return m:canShoot(p) end)
+		local shootRange = 3.4 * ((p.s or 1) + (o.s or 1)) / 2
+		local pressured = (o.rockedT or 0) > 0 or o.stamina < 35 or (o.hp.head < 35) or math.random() < 0.02
+		if ok and can and pressured and dist <= shootRange * 0.92 then
+			local ok2 = pcall(m.playerShoot, m)
+			if ok2 then
+				lastTakedown = now()
+				pushLog("takedown shot at " .. string.format("%.1fm", dist))
+			end
+		end
+	end
+end
+
+local function groundTick(m)
+	local p = m.player
+	local gnd = m.gnd
+	if not (p and gnd) or m.finish then return end
+	if not m.controls then return end
+
+	local inSub = gnd.c and gnd.c.kind == "sub"
+	local top = gnd.top == p
+	local bottom = gnd.bottom == p
+	if not (top or bottom) then return end
+	pcall(function() m.debugMove = nil end)
+
+	-- submission: we are either finishing one or defending one
+	if inSub then
+		if gnd.c.by == p then
+			if now() - lastSprawl > 1 / math.max(1, CFG.pressRate) then
+				lastSprawl = now()
+				pcall(m.groundMash, m)
+			end
+		elseif gnd.c.vs == p then
+			if now() - lastGroundOpt > 0.45 then
+				lastGroundOpt = now()
+				local menu = menuOf(m, p)
+				local escIndex
+				if menu then
+					for i, entry in ipairs(menu) do
+						if type(entry) == "table" and entry[1] == "esc" then escIndex = i break end
+					end
+				end
+				if escIndex then pcall(m.groundOption, m, escIndex) end
+			end
+			if now() - lastSprawl > 1 / math.max(1, CFG.pressRate) then
+				lastSprawl = now()
+				pcall(m.groundMash, m)
+			end
+		end
+		return
+	end
+
+	if not CFG.autoGround then return end
+
+	-- top: ground and pound, and climb / submit when the moment is right
+	if top then
+		local staminaOk = p.stamina > 28
+		if now() - lastGroundOpt > 0.5 then
+			local index, score, action = bestOption(m, p, gnd)
+			local shouldMove = index ~= nil and staminaOk
+				and ((action == "sub" and p.stamina > 40)
+					or (action == "pass" and (score or 0) >= 54 and math.random() < 0.35))
+			if shouldMove then
+				lastGroundOpt = now()
+				pcall(m.groundOption, m, index)
+			end
+		end
+		if gnd.pos ~= "back" and not gnd.trans and now() - lastGroundStrike > 0.24 then
+			lastGroundStrike = now()
+			local moves = { "jab", "cross", "lhook", "rhook" }
+			pcall(m.groundStrikeInput, m, moves[math.random(1, #moves)])
+		end
+		return
+	end
+
+	-- bottom: escape the position, take the sweep, or attack from the guard
+	if bottom then
+		if now() - lastGroundOpt > 0.55 then
+			local index, _, action = bestOption(m, p, gnd)
+			local fire = false
+			if index then
+				if action == "rev" and p.stamina > 34 then
+					fire = true
+				elseif action == "sub" and CFG.autoSub and p.stamina > 34 and math.random() < 0.45 then
+					fire = true
+				elseif action == "up" and math.random() < 0.6 then
+					fire = true
+				end
+			end
+			if fire then
+				lastGroundOpt = now()
+				pcall(m.groundOption, m, index)
+			end
+		end
+		if now() - lastSprawl > 1 / math.max(1, CFG.pressRate) then
+			lastSprawl = now()
+			pcall(m.groundMash, m)
+		end
+	end
+end
+
+local function driveTick(m)
+	local drv = m.drive
+	if not drv or m.finish then return end
+	local p = m.player
+	if drv.att ~= p and drv.def ~= p then return end
+	if not CFG.autoSprawl then return end
+	local gap = 1 / math.max(1, CFG.pressRate)
+	if now() - lastSprawl >= gap then
+		lastSprawl = now()
+		pcall(m.sprawlPress, m)
+	end
+end
+
+local function skipTick()
+	if not CFG.autoSkip then return end
+	if match and match.finish then return end
+	if now() - lastSkip < 0.35 then return end
+	if Cinema and Cinema.skippable then
+		lastSkip = now()
+		pcall(Cinema.requestSkip)
+	end
+end
+
+--// log watchers ----------------------------------------------------------------
+
+local function statFor(m, f)
+	local ok, s = pcall(function() return m:statsFor(f) end)
+	if ok and type(s) == "table" then return s end
+	return nil
+end
+
+local function sumStat(m, f, key)
+	local total = 0
+	if type(m.stats) == "table" and f and f.side then
+		for _, r in pairs(m.stats) do
+			local s = type(r) == "table" and r[f.side]
+			if type(s) == "table" and type(s[key]) == "number" then
+				total = total + s[key]
+			end
+		end
+	end
+	return total
+end
+
+local function watch(m)
+	local p = m.player
+	local o = m.opp
+	if not (p and o) then return end
+	local ps = statFor(m, p)
+	local os_ = statFor(m, o)
+
+	if ps then
+		if (ps.landed or 0) > (lastState.landed or 0) then
+			lastState.landed = ps.landed
+		end
+		if (ps.thrown or 0) > (lastState.thrown or 0) then
+			lastState.thrown = ps.thrown
+		end
+		if (ps.damage or 0) > (lastState.damage or 0) then
+			lastState.damage = ps.damage
+		end
+		if (ps.takedowns or 0) > (lastState.tdP or 0) then
+			lastState.tdP = ps.takedowns
+			stats.takedowns = stats.takedowns + 1
+			pushLog("takedown completed")
+		end
+	end
+	if os_ then
+		if (os_.takedowns or 0) > (lastState.td or 0) then
+			lastState.td = os_.takedowns
+			stats.tdConceded = (stats.tdConceded or 0) + 1
+			pushLog("opponent completed a takedown")
+		end
+	end
+
+	if (m.round or 0) > (lastState.round or 0) then
+		lastState.round = m.round
+		pushLog("round " .. tostring(m.round) .. " started")
+	end
+
+	if (o.knockdowns or 0) > (lastState.kdO or 0) then
+		lastState.kdO = o.knockdowns
+		stats.knockdowns = stats.knockdowns + 1
+		pushLog("knockdown scored  #" .. tostring(o.knockdowns))
+	end
+	if (p.knockdowns or 0) > (lastState.kdP or 0) then
+		lastState.kdP = p.knockdowns
+		pushLog("you were dropped  #" .. tostring(p.knockdowns))
+	end
+
+	if m.finish and not lastState.finished then
+		lastState.finished = true
+		local f = m.finish
+		local won = f.winner == p
+		stats.fights = stats.fights + 1
+		if won then
+			stats.wins = stats.wins + 1
+			if f.kind == "sub" then
+				stats.subs = (stats.subs or 0) + 1
+			elseif f.kind ~= "decision" then
+				stats.koWins = stats.koWins + 1
+			end
+		elseif f.winner == o then
+			stats.losses = stats.losses + 1
+			if f.kind ~= "decision" and f.kind ~= "sub" then stats.koLosses = stats.koLosses + 1 end
+		end
+		stats.strikes = stats.strikes + sumStat(m, p, "thrown")
+		stats.landed = stats.landed + sumStat(m, p, "landed")
+		stats.damage = stats.damage + math.floor(sumStat(m, p, "damage"))
+		pushLog(string.format(
+			"fight over: %s  (%s)",
+			won and "WIN" or (f.winner == o and "LOSS" or "DRAW"),
+			tostring(f.method or f.kind)
+		))
+	end
+end
+
+--// HUD -------------------------------------------------------------------------
+
+local drawings = {}
+local hud = {}
+
+local function newDrawing(cls)
+	local ok, d = pcall(function()
+		local obj = Drawing.new(cls)
+		return obj
+	end)
+	if ok and d then
+		table.insert(drawings, d)
+		return d
+	end
+	return nil
+end
+
+local function buildHud()
+	if #drawings > 0 then return end
+	local function mk(cls)
+		local d = newDrawing(cls)
+		if d then
+			d.Visible = false
+			if d.Thickness ~= nil then pcall(function() d.Thickness = 1 end) end
+			if d.Font ~= nil then pcall(function() d.Font = 2 end) end
+			if d.Center ~= nil then pcall(function() d.Center = true end) end
+		end
+		return d
+	end
+	for _, key in ipairs({ "player", "opp" }) do
+		hud[key] = {
+			box = mk("Square"),
+			hpBg = mk("Square"),
+			hpFill = mk("Square"),
+			bodyBg = mk("Square"),
+			bodyFill = mk("Square"),
+			stBg = mk("Square"),
+			stFill = mk("Square"),
+			name = mk("Text"),
+			status = mk("Text"),
+		}
+	end
+	hud.card = {
+		bg = mk("Square"),
+		hpBg = mk("Square"),
+		hpFill = mk("Square"),
+		stBg = mk("Square"),
+		stFill = mk("Square"),
+		name = mk("Text"),
+		info = mk("Text"),
+	}
+end
+
+local function clearHud()
+	for _, d in ipairs(drawings) do
+		pcall(function()
+			d.Visible = false
+			d:Remove()
+		end)
+	end
+	drawings = {}
+	hud = {}
+end
+
+local function hideFighter(h)
+	if not h then return end
+	for _, key in ipairs({ "box", "hpBg", "hpFill", "bodyBg", "bodyFill", "stBg", "stFill", "name", "status" }) do
+		local d = h[key]
+		if d then d.Visible = false end
+	end
+end
+
+local function drawFighter(m, f, h, label, color)
+	if not h then return end
+	if not f or not f.rig then hideFighter(h) return end
+	local cam = workspace.CurrentCamera
+	local ok, head = pcall(function() return f.rig:point("head") end)
+	if not ok or not head then hideFighter(h) return end
+	local feet = f.pos
+	local hPos, onScreen = cam:WorldToViewportPoint(head + Vector3.new(0, 0.28 * (f.s or 1), 0))
+	local fPos = cam:WorldToViewportPoint(feet)
+	if not onScreen or hPos.Z <= 0 or fPos.Z <= 0 then
+		hideFighter(h)
+		return
+	end
+	local vp = cam.ViewportSize
+	if hPos.X < -50 or hPos.X > vp.X + 50 or hPos.Y < -50 or hPos.Y > vp.Y + 50 then
+		hideFighter(h)
+		return
+	end
+	local height = math.clamp(math.abs(fPos.Y - hPos.Y), 30, 480)
+	local width = math.clamp(height * 0.34, 26, 190)
+
+	local x = hPos.X - width / 2
+	local top = hPos.Y - 34
+	local barW = width
+	local barH = 4
+
+	-- thin silhouette box
+	if h.box then
+		h.box.Visible = true
+		h.box.Color = color
+		h.box.Transparency = 0.75
+		h.box.Thickness = 1
+		h.box.Filled = false
+		h.box.Size = Vector2.new(width, height)
+		h.box.Position = Vector2.new(x, hPos.Y)
+	end
+
+	if not CFG.hudBars then
+		if h.hpBg then h.hpBg.Visible = false end
+		if h.hpFill then h.hpFill.Visible = false end
+		if h.bodyBg then h.bodyBg.Visible = false end
+		if h.bodyFill then h.bodyFill.Visible = false end
+		if h.stBg then h.stBg.Visible = false end
+		if h.stFill then h.stFill.Visible = false end
+	end
+
+	-- head + body health, stacked
+	local hpHead = math.clamp((f.hp and f.hp.head or 100) / 100, 0, 1)
+	local hpBody = math.clamp((f.hp and f.hp.body or 100) / 100, 0, 1)
+	local bars = {
+		{ h.hpBg, h.hpFill, top, hpHead, Color3.fromRGB(255, 84, 84) },
+		{ h.bodyBg, h.bodyFill, top + barH + 2, hpBody, Color3.fromRGB(255, 176, 74) },
+	}
+	for _, b in ipairs(bars) do
+		local bg, fill, y, frac, col = b[1], b[2], b[3], b[4], b[5]
+		if bg and fill and CFG.hudBars then
+			bg.Visible = true
+			bg.Color = Color3.fromRGB(12, 12, 16)
+			bg.Transparency = 0.35
+			bg.Filled = true
+			bg.Size = Vector2.new(barW, barH)
+			bg.Position = Vector2.new(x, y)
+			bg.Thickness = 1
+			fill.Visible = true
+			fill.Color = col:Lerp(Color3.fromRGB(60, 220, 120), frac)
+			fill.Transparency = 0.1
+			fill.Filled = true
+			fill.Size = Vector2.new(math.max(1, barW * frac), barH)
+			fill.Position = Vector2.new(x, y)
+			fill.Thickness = 1
+		end
+	end
+
+	-- stamina
+	local stFrac = math.clamp((f.stamina or 100) / math.max(1, f.maxStamina or 100), 0, 1)
+	if h.stBg and h.stFill and CFG.hudBars then
+		local sy = top + (barH + 2) * 2
+		h.stBg.Visible = true
+		h.stBg.Color = Color3.fromRGB(12, 12, 16)
+		h.stBg.Transparency = 0.35
+		h.stBg.Filled = true
+		h.stBg.Size = Vector2.new(barW, 3)
+		h.stBg.Position = Vector2.new(x, sy)
+		h.stBg.Thickness = 1
+		h.stFill.Visible = true
+		h.stFill.Color = Color3.fromRGB(64, 200, 255)
+		h.stFill.Transparency = 0.12
+		h.stFill.Filled = true
+		h.stFill.Size = Vector2.new(math.max(1, barW * stFrac), 3)
+		h.stFill.Position = Vector2.new(x, sy)
+		h.stFill.Thickness = 1
+	end
+
+	if h.name then
+		if CFG.hudNames then
+			local dist = ""
+			if match and match.player and match.opp then
+				dist = string.format("  %dm", math.floor(flat(f.pos - match.player.pos).Magnitude))
+			end
+			h.name.Visible = true
+			h.name.Center = true
+			h.name.Size = 13
+			h.name.Outline = true
+			h.name.Color = color
+			h.name.Position = Vector2.new(hPos.X, top - 17)
+			h.name.Text = label .. dist
+			h.name.Transparency = 1
+		else
+			h.name.Visible = false
+		end
+	end
+
+	if h.status then
+		local bits = {}
+		if (f.rockedT or 0) > 0 then table.insert(bits, "ROCKED") end
+		if (f.stun or 0) > 55 then table.insert(bits, "STUN") end
+		if f.down then table.insert(bits, "DOWN") end
+		if (f.bodyHurtT or 0) > 0 then table.insert(bits, "BODY") end
+		if CFG.hudAlerts and #bits == 0 and f ~= (match and match.player) then
+			local threat = incomingStrike(match)
+			if threat then table.insert(bits, "STRIKE") end
+		end
+		if #bits > 0 then
+			h.status.Visible = true
+			h.status.Center = true
+			h.status.Size = 11
+			h.status.Outline = true
+			h.status.Color = Color3.fromRGB(255, 90, 90)
+			h.status.Position = Vector2.new(hPos.X, top + (barH + 2) * 2 + 6)
+			h.status.Text = table.concat(bits, " ")
+			h.status.Transparency = 1
+		else
+			h.status.Visible = false
+		end
+	end
+end
+
+local lastHud = 0
+local function fighterLabel(m, f, isPlayer)
+	local prof = isPlayer and m.profile or m.oppProfile
+	if type(prof) == "table" then
+		local first = tostring(prof.first or "")
+		local last = tostring(prof.last or "")
+		local name = (first .. " " .. last):gsub("^%s+", ""):gsub("%s+$", "")
+		if #name > 0 then return name end
+	end
+	if f and f.name and f.name ~= "Fighter" then return f.name end
+	return isPlayer and "YOU" or "OPPONENT"
+end
+
+local function hideCard()
+	local c = hud.card
+	if not c then return end
+	for _, d in pairs(c) do
+		if d then d.Visible = false end
+	end
+end
+
+-- the local fighter's head is usually off-screen (first person / over the
+-- shoulder), so their own readout gets a fixed card in the lower-left corner.
+local function drawCard(m)
+	local c = hud.card
+	if not c or not c.bg or not m.player then return end
+	local w, h = 236, 62
+	local x, y = 20, 96
+	local p = m.player
+	local hp = math.clamp((p.hp and p.hp.head or 100) / 100, 0, 1)
+	local st = math.clamp((p.stamina or 100) / math.max(1, p.maxStamina or 100), 0, 1)
+
+	c.bg.Visible = true
+	c.bg.Color = Color3.fromRGB(10, 12, 16)
+	c.bg.Transparency = 0.45
+	c.bg.Filled = true
+	c.bg.Thickness = 1
+	c.bg.Size = Vector2.new(w, h)
+	c.bg.Position = Vector2.new(x, y)
+
+	if c.name then
+		c.name.Visible = true
+		c.name.Center = false
+		c.name.Size = 13
+		c.name.Outline = true
+		c.name.Color = Color3.fromRGB(90, 220, 255)
+		c.name.Position = Vector2.new(x + 10, y + 6)
+		c.name.Text = fighterLabel(m, p, true)
+		c.name.Transparency = 1
+	end
+
+	if c.info then
+		c.info.Visible = true
+		c.info.Center = false
+		c.info.Size = 12
+		c.info.Outline = true
+		c.info.Color = Color3.fromRGB(230, 232, 240)
+		c.info.Position = Vector2.new(x + 10, y + 24)
+		c.info.Text = string.format(
+			"R%s  %s   HP %d%%   ST %d%%",
+			tostring(m.round or 1), fmtTime(m.clock or 0), math.floor(hp * 100), math.floor(st * 100)
+		)
+		c.info.Transparency = 1
+	end
+
+	local function bar(bg, fill, by, bh, frac, col)
+		if not (bg and fill) then return end
+		if not CFG.hudBars then
+			bg.Visible = false
+			fill.Visible = false
+			return
+		end
+		bg.Visible = true
+		bg.Color = Color3.fromRGB(30, 34, 42)
+		bg.Transparency = 0.25
+		bg.Filled = true
+		bg.Thickness = 1
+		bg.Size = Vector2.new(w - 20, bh)
+		bg.Position = Vector2.new(x + 10, by)
+		fill.Visible = true
+		fill.Color = col
+		fill.Transparency = 0.1
+		fill.Filled = true
+		fill.Thickness = 1
+		fill.Size = Vector2.new(math.max(1, (w - 20) * frac), bh)
+		fill.Position = Vector2.new(x + 10, by)
+	end
+	bar(c.hpBg, c.hpFill, y + 42, 5, hp, Color3.fromRGB(255, 84, 84):Lerp(Color3.fromRGB(60, 220, 120), hp))
+	bar(c.stBg, c.stFill, y + 51, 4, st, Color3.fromRGB(64, 200, 255))
+end
+
+local function hudTick()
+	if not CFG.hud or not match or not match.player or not match.opp then
+		if hud.player then
+			hideFighter(hud.player)
+			hideFighter(hud.opp)
+		end
+		hideCard()
+		return
+	end
+	if match.finish or match.state ~= "fight" then
+		hideFighter(hud.player)
+		hideFighter(hud.opp)
+		hideCard()
+		return
+	end
+	if now() - lastHud < 1 / 45 then return end
+	lastHud = now()
+	if #drawings == 0 then buildHud() end
+	if #drawings == 0 then return end
+	drawFighter(match, match.player, hud.player, fighterLabel(match, match.player, true), Color3.fromRGB(90, 220, 255))
+	drawFighter(match, match.opp, hud.opp, fighterLabel(match, match.opp, false), Color3.fromRGB(255, 96, 96))
+	drawCard(match)
+end
+
+--// career ---------------------------------------------------------------------
+
+local careerText
+
+local function refreshCareer()
+	if not (GetCareer and careerText) then return end
+	local ok, c = pcall(function() return GetCareer:InvokeServer() end)
+	if not ok or type(c) ~= "table" then
+		pcall(function() careerText:Set("career unavailable") end)
+		return
+	end
+	local lines = {}
+	local function add(k, v) table.insert(lines, string.format("%-10s %s", k, tostring(v))) end
+	add("division", c.div or "?")
+	add("record", string.format("%d-%d-%d", c.wins or 0, c.losses or 0, c.draws or 0))
+	add("streak", c.streak or 0)
+	add("next", c.nextOpp or "-")
+	add("last", c.lastOpp or "-")
+	add("fight", string.format("#%s of %s", tostring(c.fightNo or "?"), tostring(c.recs or "?")))
+	add("belts", type(c.belts) == "table" and #c.belts or 0)
+	add("defenses", c.defenses or 0)
+	add("ko wins", c.koWins or 0)
+	add("moves", c.moves or 0)
+	pcall(function() careerText:Set(table.concat(lines, "\n")) end)
+end
+
+--// UI --------------------------------------------------------------------------
+
+local Rayfield
+pcall(function()
+	Rayfield = loadstring(game:HttpGet("https://sirius.menu/gen2"))()
+end)
+
+local function notifyToWindow(text)
+	print("[MMA] " .. tostring(text))
+	if ui.window and ui.window.Notify then
+		pcall(function()
+			ui.window:Notify({ title = "MMA", content = tostring(text), duration = 4 })
+		end)
+	end
+end
+notify = notifyToWindow
+
+local function buildUI()
+	if not Rayfield then return end
+	local w = Rayfield:CreateWindow({
+		Name = "RAGDOLL MMA // MAX",
+		LoadingTitle = "REALISTIC RAGDOLL MMA",
+		LoadingSubtitle = "auto fight  -  ground game  -  live HUD",
+		KeySystem = false,
+	})
+	ui.window = w
+	pcall(function()
+		w:ChangeTheme({
+			WindowColor = ColorSequence.new({
+				ColorSequenceKeypoint.new(0, Color3.fromRGB(14, 8, 10)),
+				ColorSequenceKeypoint.new(1, Color3.fromRGB(34, 14, 18)),
+			}),
+			ShadowColor = Color3.fromRGB(5, 2, 4),
+			CornerRoundness = UDim.new(0, 16),
+			ElementCornerRadius = UDim.new(0, 10),
+			PillCornerRadius = UDim.new(1, 0),
+			ElementGradient = ColorSequence.new({
+				ColorSequenceKeypoint.new(0, Color3.fromRGB(30, 14, 18)),
+				ColorSequenceKeypoint.new(1, Color3.fromRGB(46, 20, 26)),
+			}),
+			ElementStrokeGradient = ColorSequence.new({
+				ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 64, 88)),
+				ColorSequenceKeypoint.new(1, Color3.fromRGB(255, 186, 84)),
+			}),
+			ElementStroke = Color3.fromRGB(84, 34, 44),
+			ElementStrokeHover = Color3.fromRGB(255, 78, 96),
+			AccentColor = Color3.fromRGB(255, 74, 92),
+			AccentStroke = Color3.fromRGB(255, 200, 120),
+			AccentGlow = 0.55,
+			SliderProgress = ColorSequence.new({
+				ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 186, 84)),
+				ColorSequenceKeypoint.new(1, Color3.fromRGB(255, 64, 88)),
+			}),
+			SliderBackground = Color3.fromRGB(34, 16, 20),
+			SliderBackgroundHover = Color3.fromRGB(48, 22, 28),
+			SliderHandle = Color3.fromRGB(255, 255, 255),
+			SliderStroke = Color3.fromRGB(255, 200, 120),
+			ToggleTrack = Color3.fromRGB(24, 10, 14),
+			ToggleTrackTransparency = 0.65,
+			ToggleKnobOff = Color3.fromRGB(150, 130, 134),
+			ContentColor = Color3.fromRGB(246, 238, 240),
+			TitlingColor = Color3.fromRGB(255, 255, 255),
+			ElementTextHoverColor = Color3.fromRGB(255, 112, 128),
+			StatBackground = Color3.fromRGB(28, 12, 16),
+			TabBackground = ColorSequence.new(Color3.fromRGB(48, 20, 26), Color3.fromRGB(24, 10, 14)),
+			TabStroke = ColorSequence.new(Color3.fromRGB(255, 64, 88), Color3.fromRGB(255, 186, 84)),
+			TabColor = Color3.fromRGB(255, 244, 246),
+			FieldGlow = Color3.fromRGB(255, 74, 92),
+			DropdownHighlight = Color3.fromRGB(255, 74, 92),
+		})
+	end)
+
+	local fightTab = w:CreateTab({ name = "FIGHT" })
+	local groundTab = w:CreateTab({ name = "GROUND" })
+	local hudTab = w:CreateTab({ name = "HUD" })
+	local careerTab = w:CreateTab({ name = "CAREER" })
+	local sysTab = w:CreateTab({ name = "SYS" })
+
+	-- FIGHT
+	ui.card = fightTab:CreateText({ name = "state  |  idle", text = "no match captured" })
+	fightTab:CreateToggle({
+		name = "auto fight",
+		description = "picks a strike from range and stamina, holds the right distance, and fires it with Match:playerStrike. everything is the game's own strike path.",
+		flag = "mma_autoFight",
+		value = CFG.autoFight,
+		callback = function(v) CFG.autoFight = v end,
+	})
+	fightTab:CreateToggle({
+		name = "auto aim",
+		description = "drives match.camYaw/camPitch onto the selected zone. the game feeds those into the camera and into player.yaw, so the strike ray really lands where you aim.",
+		flag = "mma_autoAim",
+		value = CFG.autoAim,
+		callback = function(v) CFG.autoAim = v end,
+	})
+	fightTab:CreateDropdown({
+		name = "aim zone",
+		description = "head does the most damage, body drains stamina, legs break the base. all three are real hit zones on the rig.",
+		flag = "mma_aimZone",
+		options = { "head", "body", "legs" },
+		value = CFG.aimZone,
+		callback = function(v) CFG.aimZone = tostring(v) end,
+	})
+	fightTab:CreateDropdown({
+		name = "strike style",
+		description = "smart reacts to range, gas and rocked state; power spends stamina on hooks and crosses; kicks fights at range; combo is a steady boxing rhythm.",
+		flag = "mma_strikeStyle",
+		options = { "smart", "combo", "power", "kicks", "jab" },
+		value = CFG.strikeStyle,
+		callback = function(v) CFG.strikeStyle = tostring(v) end,
+	})
+	fightTab:CreateSlider({
+		name = "aggression",
+		description = "how far in the auto fighter steps. low keeps a kicking range, high crowds the opponent.",
+		flag = "mma_aggro",
+		range = { 0, 100 },
+		increment = 5,
+		value = CFG.aggro,
+		suffix = "%",
+		callback = function(v) CFG.aggro = v end,
+	})
+	fightTab:CreateSlider({
+		name = "stamina floor",
+		description = "never start a strike below this stamina. keeps you from being gassed when the round turns.",
+		flag = "mma_staminaFloor",
+		range = { 5, 60 },
+		increment = 1,
+		value = CFG.staminaFloor,
+		suffix = "%",
+		callback = function(v) CFG.staminaFloor = v end,
+	})
+	fightTab:CreateToggle({
+		name = "auto block",
+		description = "reads the opponent's live strike phases and holds Touch.block (the game's own guard state) through the windup and extend of anything in range.",
+		flag = "mma_autoBlock",
+		value = CFG.autoBlock,
+		callback = function(v) CFG.autoBlock = v end,
+	})
+	fightTab:CreateToggle({
+		name = "auto counter",
+		description = "stops throwing while a strike is incoming, so the guard is never dropped mid-exchange.",
+		flag = "mma_autoCounter",
+		value = CFG.autoCounter,
+		callback = function(v) CFG.autoCounter = v end,
+	})
+	fightTab:CreateToggle({
+		name = "auto takedown",
+		description = "shoots when the opponent is rocked, hurt or gassed and you are inside shooting range. the game resolves it into its own drive contest.",
+		flag = "mma_autoTakedown",
+		value = CFG.autoTakedown,
+		callback = function(v) CFG.autoTakedown = v end,
+	})
+	fightTab:CreateSlider({
+		name = "takedown stamina",
+		description = "minimum stamina before an automatic shot.",
+		flag = "mma_takedownStamina",
+		range = { 10, 80 },
+		increment = 5,
+		value = CFG.takedownStamina,
+		suffix = "%",
+		callback = function(v) CFG.takedownStamina = v end,
+	})
+	fightTab:CreateToggle({
+		name = "auto skip",
+		description = "calls Cinema.requestSkip through every skippable walkout and round break, until the result appears.",
+		flag = "mma_autoSkip",
+		value = CFG.autoSkip,
+		callback = function(v) CFG.autoSkip = v end,
+	})
+
+	-- GROUND
+	ui.groundCard = groundTab:CreateText({ name = "ground  |  idle", text = "no match captured" })
+	groundTab:CreateToggle({
+		name = "auto ground",
+		description = "plays the game's own ground menu: passes up the position ladder on top, sweeps or stands on the bottom, and mashes the position.",
+		flag = "mma_autoGround",
+		value = CFG.autoGround,
+		callback = function(v) CFG.autoGround = v end,
+	})
+	groundTab:CreateToggle({
+		name = "auto submissions",
+		description = "takes a submission entry from the menu when stamina allows, and mashes to finish one you already have.",
+		flag = "mma_autoSub",
+		value = CFG.autoSub,
+		callback = function(v) CFG.autoSub = v end,
+	})
+	groundTab:CreateToggle({
+		name = "auto sprawl",
+		description = "spams Match:sprawlPress during a shot or a drive. it is the same press the defender and the attacker both use.",
+		flag = "mma_autoSprawl",
+		value = CFG.autoSprawl,
+		callback = function(v) CFG.autoSprawl = v end,
+	})
+	groundTab:CreateSlider({
+		name = "press rate",
+		description = "presses per second for mashing and sprawling. the game rate-limits these on its own, so going past ~14 rarely helps and burns stamina.",
+		flag = "mma_pressRate",
+		range = { 4, 20 },
+		increment = 1,
+		value = CFG.pressRate,
+		suffix = "/s",
+		callback = function(v) CFG.pressRate = v end,
+	})
+
+	-- HUD
+	hudTab:CreateToggle({
+		name = "overlay hud",
+		description = "draws health and stamina over both fighters using the live Fighter state.",
+		flag = "mma_hud",
+		value = CFG.hud,
+		callback = function(v) CFG.hud = v end,
+	})
+	hudTab:CreateToggle({
+		name = "health bars",
+		description = "head and body health plus stamina for each fighter.",
+		flag = "mma_hudBars",
+		value = CFG.hudBars,
+		callback = function(v) CFG.hudBars = v end,
+	})
+	hudTab:CreateToggle({
+		name = "names + distance",
+		description = "fighter labels and range in metres.",
+		flag = "mma_hudNames",
+		value = CFG.hudNames,
+		callback = function(v) CFG.hudNames = v end,
+	})
+	hudTab:CreateToggle({
+		name = "strike alerts",
+		description = "flags a fighter in windup, and shows rocked, stun, down and body states.",
+		flag = "mma_hudAlerts",
+		value = CFG.hudAlerts,
+		callback = function(v) CFG.hudAlerts = v end,
+	})
+	hudTab:CreateSection({ name = "SESSION" })
+	ui.sFights = hudTab:CreateStat({ name = "fights", value = stats.fights })
+	ui.sWins = hudTab:CreateStat({ name = "wins", value = stats.wins })
+	ui.sLosses = hudTab:CreateStat({ name = "losses", value = stats.losses })
+	ui.sLanded = hudTab:CreateStat({ name = "landed", value = stats.landed })
+	ui.sThrown = hudTab:CreateStat({ name = "strikes", value = stats.strikes })
+	ui.sDamage = hudTab:CreateStat({ name = "damage", value = stats.damage })
+	ui.sTd = hudTab:CreateStat({ name = "takedowns", value = stats.takedowns })
+	ui.sSubs = hudTab:CreateStat({ name = "subs", value = stats.subs })
+	ui.sAcc = hudTab:CreateStat({ name = "accuracy", value = 0, suffix = "%" })
+	-- session log
+	ui.logText = hudTab:CreateText({ name = "log", text = "-" })
+
+	-- CAREER
+	careerText = careerTab:CreateText({ name = "career", text = "press refresh" })
+	careerTab:CreateButton({
+		name = "refresh career",
+		description = "one GetCareer invoke, read-only.",
+		callback = function()
+			refreshCareer()
+		end,
+	})
+	careerTab:CreateSection({ name = "INFO" })
+	careerTab:CreateText({
+		name = "how it works",
+		text = "this panel never writes career data. results, saves and rank changes stay with the game's own onEnd handler.",
+	})
+
+	-- SYS
+	sysTab:CreateButton({
+		name = "panic (P)",
+		description = "kill every automation flag, clear movement and guard, leave the match running.",
+		callback = function()
+			if ui.panic then ui.panic() end
+		end,
+	})
+	sysTab:CreateButton({
+		name = "unload panel",
+		description = "tear down drawings, hooks, connections and the window. settings are kept.",
+		callback = function()
+			if ui.shutdown then ui.shutdown() end
+		end,
+	})
+	sysTab:CreateSection({ name = "STATE" })
+	ui.diag = sysTab:CreateText({ name = "diag", text = "match: none" })
+end
+
+--// loop ------------------------------------------------------------------------
+
+local function panic()
+	if dead then return end
+	CFG.autoFight = false
+	CFG.autoAim = false
+	CFG.autoBlock = false
+	CFG.autoCounter = false
+	CFG.autoTakedown = false
+	CFG.autoGround = false
+	CFG.autoSub = false
+	CFG.autoSprawl = false
+	if match then
+		pcall(function()
+			match.debugMove = nil
+		end)
+	end
+	pcall(function() Touch.block = false end)
+	for _, flag in ipairs({ "mma_autoFight", "mma_autoAim", "mma_autoBlock", "mma_autoCounter", "mma_autoTakedown", "mma_autoGround", "mma_autoSub", "mma_autoSprawl" }) do
+		if ui.window then pcall(function() ui.window:Set(flag, false) end) end
+	end
+	status = "panic  |  automation off"
+	pushLog("panic")
+end
+ui.panic = panic
+
+local shutdown
+shutdown = function()
+	if dead then return end
+	dead = true
+	if match then
+		pcall(function() match.debugMove = nil end)
+	end
+	pcall(function() Touch.block = false end)
+	if Match.new == hookNew then
+		Match.new = oldNew
+	end
+	clearHud()
+	if ui.keyConn then pcall(function() ui.keyConn:Disconnect() end) end
+	if ui.loopConn then pcall(function() ui.loopConn:Disconnect() end) end
+	if ui.window then pcall(function() ui.window:Unload() end) end
+	_G.RagdollMmaPanel = { cfg = CFG }
+	_G.RagdollMmaStats = stats
+	print("[MMA] unloaded")
+end
+ui.shutdown = shutdown
+
+local function syncUI()
+	if ui.card then
+		pcall(function()
+			ui.card:SetTitle("state  |  " .. (match and ("round " .. tostring(match.round or 1)) or "idle"))
+			ui.card:Set(status)
+		end)
+	end
+	if ui.groundCard then
+		pcall(function()
+			local g = match and match.gnd
+			local txt = "no match captured"
+			if match then
+				if match.drive then
+					txt = "drive  |  " .. (match.drive.att == match.player and "attacking" or "defending")
+				elseif g then
+					txt = string.format("ground  |  %s  |  %s", tostring(g.pos), g.top == match.player and "top" or "bottom")
+				else
+					txt = "standing"
+				end
+			end
+			ui.groundCard:SetTitle("ground  |  " .. (g and tostring(g.pos) or (match and "standing" or "idle")))
+			ui.groundCard:Set(txt)
+		end)
+	end
+	if ui.sFights then pcall(function() ui.sFights:Set(stats.fights) end) end
+	if ui.sWins then pcall(function() ui.sWins:Set(stats.wins) end) end
+	if ui.sLosses then pcall(function() ui.sLosses:Set(stats.losses) end) end
+	if ui.sLanded then pcall(function() ui.sLanded:Set(stats.landed) end) end
+	if ui.sThrown then pcall(function() ui.sThrown:Set(stats.strikes) end) end
+	if ui.sDamage then pcall(function() ui.sDamage:Set(stats.damage) end) end
+	if ui.sTd then pcall(function() ui.sTd:Set(stats.takedowns) end) end
+	if ui.sSubs then pcall(function() ui.sSubs:Set(stats.subs) end) end
+	if ui.sAcc then
+		pcall(function()
+			local acc = stats.strikes > 0 and math.floor(stats.landed / stats.strikes * 100) or 0
+			ui.sAcc:Set(acc)
+		end)
+	end
+	if ui.logText then
+		pcall(function() ui.logText:Set(#log > 0 and table.concat(log, "\n") or "-") end)
+	end
+	if ui.diag then
+		pcall(function()
+			ui.diag:Set(string.format(
+				"match: %s\nround: %s   clock: %s\ncontrols: %s   gnd: %s   drive: %s",
+				match and "captured" or "none",
+				match and tostring(match.round) or "-",
+				match and fmtTime(match.clock or 0) or "-",
+				match and tostring(match.controls) or "-",
+				match and tostring(match.gnd ~= nil) or "-",
+				match and tostring(match.drive ~= nil) or "-"
+			))
+		end)
+	end
+end
+
+local lastSync = 0
+local lastHudWarn = 0
+
+local function tick()
+	if dead then return end
+	if not match or match.closed then
+		match = nil
+		if now() >= nextScan then
+			nextScan = now() + 1
+			local found = scanForMatch()
+			if found then
+				adopt(found)
+			else
+				status = "idle  |  no match"
+			end
+		end
+	end
+
+	local m = match
+	if m and not m.closed then
+		-- clear our movement hook once the match stops needing it
+		if nextMoveClear > 0 and now() > nextMoveClear then
+			pcall(function() m.debugMove = nil end)
+			nextMoveClear = 0
+		end
+		if m.state == "fight" and not m.finish and m.controls then
+			status = string.format("round %s  |  %s  |  %s hp", tostring(m.round or 1), fmtTime(m.clock or 0), math.floor((m.player and m.player.hp.head) or 0))
+		elseif m.finish then
+			status = "fight over  |  " .. tostring(m.finish.method or m.finish.kind)
+		else
+			status = "match  |  " .. tostring(m.state) .. (m.controls and "" or "  |  waiting")
+		end
+		pcall(watch, m)
+		if CFG.autoFight then pcall(fightTick, m) end
+		pcall(groundTick, m)
+		pcall(driveTick, m)
+		if not CFG.autoFight and not CFG.autoGround and not CFG.autoSprawl then
+			pcall(function()
+				if m.debugMove then m.debugMove = nil end
+			end)
+		end
+		if not CFG.autoBlock then
+			pcall(function() Touch.block = false end)
+		end
+	end
+	pcall(skipTick)
+	local okHud, hudErr = pcall(hudTick)
+	if not okHud and now() - lastHudWarn > 5 then
+		lastHudWarn = now()
+		warn("[MMA] hud error: " .. tostring(hudErr))
+	end
+	local t = now()
+	if t - lastSync > 0.3 then
+		lastSync = t
+		pcall(syncUI)
+	end
+end
+
+buildUI()
+if ui.window then
+	local conn
+	conn = UserInputService.InputBegan:Connect(function(input, gp)
+		if gp then return end
+		if input.KeyCode == Enum.KeyCode.P then
+			panic()
+		end
+	end)
+	ui.keyConn = conn
+end
+ui.loopConn = RunService.Heartbeat:Connect(function()
+	local ok, err = pcall(tick)
+	if not ok then
+		warn("[MMA] tick error: " .. tostring(err))
+	end
+end)
+resetWatch()
+refreshCareer()
+pushLog("panel loaded")
+
+_G.RagdollMmaPanel = {
+	cfg = CFG,
+	window = ui.window,
+	stop = shutdown,
+	panic = panic,
+	stats = stats,
+	hud = hud,
+	drawings = drawings,
+	getMatch = function() return match end,
+	scan = scanForMatch,
+	aim = aimAt,
+	strike = function(move)
+		if match then return strikeAt(match, move or "jab", CFG.aimZone) end
+		return false
+	end,
+}
+
+end
+
+--// embedded suite: carsoccer  (from carsoccer-panel.luau) =========================
+Hub.SUITE.carsoccer = function()
+-- CarSoccer | PILOT - client-sim autopilot, ball path ESP, speed/boost readout
+-- place 101880234193261 | Rayfield Gen2 | replace-not-stack via _G.CarSoccer
+
+local prev = _G.CarSoccer
+local CFG = (prev and prev.cfg) or {
+	pilot = false,
+	mode = "striker", -- striker | defender | chase
+	smartBoost = true,
+	autoJump = true,
+	offset = 158,
+	steerGain = 3,
+	look = 0.45,
+	path = true,
+	goals = true,
+	pathLen = 1.5,
+}
+if prev and prev.stop then
+	pcall(prev.stop)
+end
+_G.CarSoccer = { cfg = CFG }
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local RS = game:GetService("ReplicatedStorage")
+local LP = Players.LocalPlayer
+
+local Sim = RS:WaitForChild("Shared"):WaitForChild("Sim")
+local Const = require(Sim:WaitForChild("Const"))
+local ArenaGeom = require(Sim:WaitForChild("ArenaGeom"))
+local Protocol = require(RS.Shared:WaitForChild("Net"):WaitForChild("Protocol"))
+local MatchSession
+do
+	local holder = LP:WaitForChild("PlayerScripts"):FindFirstChild("Client")
+	if holder then
+		local m = holder:FindFirstChild("MatchSession")
+		if m then
+			local ok, res = pcall(require, m)
+			if ok then MatchSession = res end
+		end
+	end
+end
+
+local GRAV = Const.GRAVITY_Z or -650
+local BALL_REST = Const.BALL_REST_Z or 93.15
+local GOAL_Y = (ArenaGeom.EXTENT_Y or 5120) - 24
+local MOUTH_Z = (ArenaGeom.MOUTH_HEIGHT or 640) / 2
+local SUPERSONIC = Const.SUPERSONIC_START_SPEED or 2200
+
+--// state -----------------------------------------------------------------------
+local session, mySide, window
+local hbConn, renderConn, keyConn
+local jumpUntil, lastErrAt, lastStatAt = 0, 0, 0
+local dead = false
+
+local speedStat, boostStat
+
+--// helpers --------------------------------------------------------------------
+local function ballOf(match)
+	local b = match.ball
+	if b == nil and type(match.world) == "table" then
+		b = match.world.ball
+	end
+	if b == nil then
+		for k, v in pairs(match) do
+			if k == "ball" and type(v) == "table" then
+				b = v
+				break
+			end
+		end
+	end
+	if type(b) == "table" then
+		local body = b.body
+		if body and body.pos and body.vel then
+			return body
+		end
+		if b.pos and b.vel then
+			return b
+		end
+	end
+	return nil
+end
+
+-- ball position t seconds ahead: gravity, floor bounce, no drag (visual grade)
+local function ballAt(body, t)
+	local px, py, pz = body.pos.x, body.pos.y, body.pos.z
+	local vx, vy, vz = body.vel.x, body.vel.y, body.vel.z
+	local acc = 0
+	while acc < t do
+		local dt = math.min(0.05, t - acc)
+		vz = vz + GRAV * dt
+		px = px + vx * dt
+		py = py + vy * dt
+		pz = pz + vz * dt
+		if pz < BALL_REST and vz < 0 then
+			pz = BALL_REST
+			vz = -vz * 0.6
+			vx = vx * 0.9
+			vy = vy * 0.9
+		end
+		acc = acc + dt
+	end
+	return px, py, pz
+end
+
+local function oops(err)
+	local now = os.clock()
+	if now - lastErrAt > 5 then
+		lastErrAt = now
+		warn("[CarPilot] " .. tostring(err))
+	end
+end
+
+--// pilot ----------------------------------------------------------------------
+-- math adapted from the game's own Sim.AimPilot controller
+local function pilot(car, match, ctrl)
+	if car.isDemoed then
+		return
+	end
+	local body = car.body
+	local pos = body.pos
+
+	-- flat forward + speeds
+	local fx, fy = body.fwd.x, body.fwd.y
+	local fl = math.sqrt(fx * fx + fy * fy)
+	if fl < 1e-5 then
+		fx, fy = 0, 1
+	else
+		fx, fy = fx / fl, fy / fl
+	end
+	local fwdSpeed = body.vel.x * fx + body.vel.y * fy
+	local speed = math.sqrt(body.vel.x ^ 2 + body.vel.y ^ 2 + body.vel.z ^ 2)
+
+	local ball = ballOf(match)
+	if not ball then
+		return
+	end
+
+	-- remember which half we defend (kickoff spawns sit on own half)
+	local my = mySide
+	if match.phase ~= "play" and math.abs(pos.y) > 1000 then
+		my = pos.y > 0 and 1 or -1
+		mySide = my
+	elseif not my then
+		my = pos.y >= 0 and 1 or -1
+		mySide = my
+	end
+
+	-- predicted ball at intercept time
+	local dBall = math.sqrt((pos.x - ball.pos.x) ^ 2 + (pos.y - ball.pos.y) ^ 2)
+	local tLook = math.clamp(dBall / math.max(math.abs(fwdSpeed), 700), 0.1, CFG.look)
+	local bx, by, bz = ballAt(ball, tLook)
+
+	-- contact point + drive direction per mode
+	local dirx, diry, contactX, contactY, swing = 0, -my, 0, 0, false
+	if CFG.mode == "striker" then
+		local gx = math.clamp(bx * 0.25, -350, 350)
+		local dxx, dyy = gx - bx, -my * GOAL_Y - by
+		local dl = math.sqrt(dxx * dxx + dyy * dyy)
+		if dl < 1 then
+			dxx, dyy, dl = 0, -my, 1
+		end
+		dirx, diry = dxx / dl, dyy / dl
+		contactX = bx - dirx * CFG.offset
+		contactY = by - diry * CFG.offset
+		swing = true
+	elseif CFG.mode == "defender" then
+		local dxx, dyy = bx, by - my * GOAL_Y
+		local dl = math.sqrt(dxx * dxx + dyy * dyy)
+		if dl < 1 then
+			dxx, dyy, dl = 0, -my, 1
+		end
+		dirx, diry = dxx / dl, dyy / dl
+		local park = math.min(700, dl * 0.5)
+		contactX = dirx * park
+		contactY = my * GOAL_Y + diry * park
+	else -- chase: straight at the ball from whichever side we are on
+		local dxx, dyy = pos.x - bx, pos.y - by
+		local dl = math.sqrt(dxx * dxx + dyy * dyy)
+		if dl < 1 then
+			dxx, dyy, dl = 0, -my, 1
+		end
+		dirx, diry = dxx / dl, dyy / dl
+		contactX = bx
+		contactY = by
+	end
+
+	local relX, relY = pos.x - contactX, pos.y - contactY
+	local along = relX * dirx + relY * diry
+
+	-- aim point with the game bot's lead, swing wide around the ball if wrong side
+	local lead = math.clamp(math.max(fwdSpeed, 0) * 0.45 + 300, 350, 1100)
+	local aimX = contactX + dirx * math.min(along + lead, 220)
+	local aimY = contactY + diry * math.min(along + lead, 220)
+	if swing and along > 60 and dBall < 800 then
+		local perpx, perpy = -diry, dirx
+		local side = (relX * perpx + relY * perpy >= 0) and 1 or -1
+		aimX = bx + perpx * side * 420 - dirx * 200
+		aimY = by + perpy * side * 420 - diry * 200
+	end
+
+	-- signed angle from forward to aim (AimPilot convention)
+	local toX, toY = aimX - pos.x, aimY - pos.y
+	local ang = math.atan2(toX * -fy + toY * fx, toX * fx + toY * fy)
+
+	ctrl.steer = math.clamp(ang * CFG.steerGain, -1, 1)
+	ctrl.throttle = 1
+	ctrl.pitch, ctrl.yaw, ctrl.roll = 0, 0, 0
+	ctrl.boost = CFG.smartBoost
+		and math.abs(ang) < 0.6
+		and speed < SUPERSONIC - 50
+		and (car.boost or 0) > 4
+		and dBall > 250
+	ctrl.handbrake = math.abs(ang) > 1.9 and speed > 500 and car.isOnGround
+
+	-- wrong side and jammed against the ball: back out and swing
+	if swing and along > 60 and dBall < 420 and fwdSpeed > 700 then
+		ctrl.throttle = -1
+		ctrl.boost = false
+		ctrl.handbrake = car.isOnGround == true
+	end
+
+	-- auto jump for a hanging ball over the hood
+	local now = os.clock()
+	if CFG.autoJump and car.isOnGround and bz - pos.z > 130 and dBall < 400 and (ball.vel.z or 0) < 60 then
+		jumpUntil = now + 0.18
+	end
+	ctrl.jump = now < jumpUntil
+end
+
+--// hooks -----------------------------------------------------------------------
+-- the tick loop does: input -> controlsOf(own) -> Protocol.quantize(controls) -> prediction step.
+-- we ride quantize and overwrite our controls right before the game reads them -
+-- the same surface the game's own AimPilot bot drives.
+
+local origQuantize, quantizeHook
+local origNew, newHook, origDestroy, destroyHook
+
+local function adoptSession(s)
+	session = s
+	mySide = nil
+	print("[CarPilot] match session captured - pilot armed")
+end
+
+quantizeHook = function(c, ...)
+	if session ~= nil and CFG.pilot and not dead then
+		local ok, err = pcall(function()
+			local match = session.match
+			local own = session.own
+			if match ~= nil and own ~= nil and match.phase == "play" then
+				local entry = match.cars[own]
+				if entry ~= nil and entry.car ~= nil and rawequal(c, entry.car.controls) then
+					pilot(entry.car, match, c)
+				end
+			end
+		end)
+		if not ok then
+			oops(err)
+		end
+	end
+	return origQuantize(c, ...)
+end
+origQuantize = Protocol.quantize
+Protocol.quantize = quantizeHook
+
+if MatchSession then
+	newHook = function(...)
+		local s = origNew(...)
+		if type(s) == "table" and s.match ~= nil and s.own ~= nil then
+			adoptSession(s)
+		end
+		return s
+	end
+	origNew = MatchSession.new
+	MatchSession.new = newHook
+
+	destroyHook = function(self, ...)
+		if self == session then
+			session = nil
+		end
+		return origDestroy(self, ...)
+	end
+	origDestroy = MatchSession.destroy
+	MatchSession.destroy = destroyHook
+end
+
+-- registry fallback for sessions created before we loaded
+local function scanForSession()
+	if session ~= nil or MatchSession == nil then
+		return
+	end
+	local reg = getreg()
+	for _, v in ipairs(reg) do
+		if type(v) == "table" then
+			local mt = getmetatable(v)
+			if mt == MatchSession or (type(mt) == "table" and rawget(mt, "__index") == MatchSession) then
+				if type(v.match) == "table" and v.own ~= nil then
+					adoptSession(v)
+					return
+				end
+			end
+		end
+	end
+end
+
+--// ESP ------------------------------------------------------------------------
+local segs = {}
+local drawingOK = pcall(function()
+	local t = Drawing.new("Line")
+	pcall(function() t:Remove() end)
+	return true
+end)
+local function seg(i)
+	local s = segs[i]
+	if not s then
+		s = Drawing.new("Line")
+		s.Thickness = 1.6
+		segs[i] = s
+	end
+	return s
+end
+local function hideAll()
+	for _, s in ipairs(segs) do
+		s.Visible = false
+	end
+end
+
+local function drawESP()
+	if not (CFG.path or CFG.goals) or dead or not drawingOK then
+		hideAll()
+		return
+	end
+	local s = session
+	local match = s and s.match
+	if not match or not s.own then
+		hideAll()
+		return
+	end
+	local ball = ballOf(match)
+	local cam = workspace.CurrentCamera
+	if not ball or not cam then
+		hideAll()
+		return
+	end
+	local used = 0
+
+	if CFG.path then
+		local n = 18
+		local pvx, pvy = nil, nil
+		local p0 = cam:WorldToViewportPoint(Vector3.new(ball.pos.x, ball.pos.y, ball.pos.z))
+		if p0.Z > 0 then
+			pvx, pvy = p0.X, p0.Y
+		end
+		for i = 1, n do
+			local x, y, z = ballAt(ball, CFG.pathLen * i / n)
+			local v = cam:WorldToViewportPoint(Vector3.new(x, y, z))
+			if v.Z > 0 and pvx then
+				used += 1
+				local ln = seg(used)
+				ln.From = Vector2.new(pvx, pvy)
+				ln.To = Vector2.new(v.X, v.Y)
+				local k = i / n
+				ln.Color = Color3.new(1, 1 - k * 0.8, 0.15)
+				ln.Visible = true
+			end
+			if v.Z > 0 then
+				pvx, pvy = v.X, v.Y
+			else
+				pvx = nil
+			end
+		end
+	end
+
+	if CFG.goals then
+		local my = mySide or 1
+		local marks = {
+			{ 0, -my * GOAL_Y, MOUTH_Z, Color3.fromRGB(255, 70, 70) }, -- enemy mouth
+			{ 0, my * GOAL_Y, MOUTH_Z, Color3.fromRGB(90, 255, 120) }, -- own mouth
+		}
+		for _, g in ipairs(marks) do
+			local v = cam:WorldToViewportPoint(Vector3.new(g[1], g[2], g[3]))
+			if v.Z > 0 then
+				for _, d in ipairs({ { -16, -16, 16, 16 }, { -16, 16, 16, -16 } }) do
+					used += 1
+					local ln = seg(used)
+					ln.From = Vector2.new(v.X + d[1], v.Y + d[2])
+					ln.To = Vector2.new(v.X + d[3], v.Y + d[4])
+					ln.Color = g[4]
+					ln.Visible = true
+				end
+			end
+		end
+	end
+
+	for i = used + 1, #segs do
+		segs[i].Visible = false
+	end
+end
+
+local function updateStats()
+	local now = os.clock()
+	if now - lastStatAt < 0.2 then
+		return
+	end
+	lastStatAt = now
+	local spd, bst = 0, 0
+	local s = session
+	if s and s.match and s.own then
+		local entry = s.match.cars[s.own]
+		local car = entry and entry.car
+		if car and car.body then
+			local v = car.body.vel
+			spd = math.floor(math.sqrt(v.x ^ 2 + v.y ^ 2 + v.z ^ 2) + 0.5)
+			bst = math.floor((car.boost or 0) + 0.5)
+		end
+	end
+	if speedStat then
+		pcall(function() speedStat:Set(spd) end)
+	end
+	if boostStat then
+		pcall(function() boostStat:Set(bst) end)
+	end
+end
+
+--// lifecycle ------------------------------------------------------------------
+local function panic()
+	CFG.pilot = false
+	CFG.path = false
+	CFG.goals = false
+	if window then
+		for _, f in ipairs({ "pilot", "path", "goals" }) do
+			pcall(function() window:Set(f, false) end)
+		end
+	end
+	print("[CarPilot] panic: pilot + visuals off")
+end
+
+local function shutdown()
+	if dead then
+		return
+	end
+	dead = true
+	if hbConn then hbConn:Disconnect() hbConn = nil end
+	if renderConn then renderConn:Disconnect() renderConn = nil end
+	if keyConn then keyConn:Disconnect() keyConn = nil end
+	for _, s in ipairs(segs) do
+		pcall(function() s:Remove() end)
+	end
+	if Protocol.quantize == quantizeHook then
+		Protocol.quantize = origQuantize
+	end
+	if MatchSession then
+		if MatchSession.new == newHook then
+			MatchSession.new = origNew
+		end
+		if MatchSession.destroy == destroyHook then
+			MatchSession.destroy = origDestroy
+		end
+	end
+	session = nil
+	if window then
+		pcall(function() window:Unload() end)
+	end
+	_G.CarSoccer = nil
+	print("[CarPilot] unloaded")
+end
+
+keyConn = UserInputService.InputBegan:Connect(function(i, gp)
+	if gp then return end
+	if i.KeyCode == Enum.KeyCode.P then
+		panic()
+	end
+end)
+
+local scanClock = 0
+hbConn = RunService.Heartbeat:Connect(function(dt)
+	if dead then return end
+	if session ~= nil and (session.match == nil or session.own == nil) then
+		session = nil
+	end
+	scanClock += dt
+	if scanClock > 1.5 and session == nil then
+		scanClock = 0
+		pcall(scanForSession)
+	end
+end)
+
+renderConn = RunService.RenderStepped:Connect(function()
+	if dead then return end
+	drawESP()
+	updateStats()
+end)
+
+--// UI -------------------------------------------------------------------------
+local Rayfield
+pcall(function() Rayfield = loadstring(game:HttpGet("https://sirius.menu/gen2"))() end)
+
+local function buildUI()
+	if not Rayfield then return end
+	local w = Rayfield:CreateWindow({
+		Name = "CARSOCCER | PILOT",
+		LoadingTitle = "CAR PILOT",
+		LoadingSubtitle = "client-sim autopilot",
+		KeySystem = false,
+	})
+	window = w
+	local drive = w:CreateTab({ name = "DRIVE" })
+	local view = w:CreateTab({ name = "VIEW" })
+	local sys = w:CreateTab({ name = "SYS" })
+
+	drive:CreateToggle({ name = "autopilot", description = "drives the car through the live controls channel - the same one the game bot uses", flag = "pilot", value = CFG.pilot, callback = function(v) CFG.pilot = v end })
+	drive:CreateDropdown({ name = "style", options = { "striker", "defender", "chase" }, value = CFG.mode, flag = "mode", callback = function(v) CFG.mode = v end })
+	drive:CreateToggle({ name = "smart boost", description = "boost only when lined up and below supersonic", flag = "sboost", value = CFG.smartBoost, callback = function(v) CFG.smartBoost = v end })
+	drive:CreateToggle({ name = "auto jump", description = "pop the ball when it hangs over the hood", flag = "ajump", value = CFG.autoJump, callback = function(v) CFG.autoJump = v end })
+	drive:CreateSlider({ name = "contact offset", description = "studs behind the ball the pilot aims at", range = { 80, 320 }, increment = 10, value = CFG.offset, suffix = " st", callback = function(v) CFG.offset = v end })
+	drive:CreateSlider({ name = "steer gain", description = "steering aggression toward the aim point", range = { 1.5, 5 }, increment = .1, value = CFG.steerGain, callback = function(v) CFG.steerGain = v end })
+	drive:CreateSlider({ name = "ball look-ahead", description = "seconds of ball travel the pilot plans against", range = { .15, 1 }, increment = .05, value = CFG.look, suffix = " s", callback = function(v) CFG.look = v end })
+
+	speedStat = drive:CreateStat({ name = "speed", value = 0, suffix = " u/s" })
+	boostStat = drive:CreateStat({ name = "boost", value = 0, suffix = "" })
+
+	view:CreateToggle({ name = "ball path", description = "predicted ball line - yellow now, red later", flag = "path", value = CFG.path, callback = function(v) CFG.path = v end })
+	view:CreateToggle({ name = "goal markers", description = "crosshair on both mouths - red is the one you score in", flag = "goals", value = CFG.goals, callback = function(v) CFG.goals = v end })
+	view:CreateSlider({ name = "path length", range = { .5, 3 }, increment = .25, value = CFG.pathLen, suffix = " s", callback = function(v) CFG.pathLen = v end })
+
+	sys:CreateButton({ name = "panic (P)", description = "autopilot + visuals off, body untouched", callback = panic })
+	sys:CreateButton({ name = "unload panel", description = "tear everything down", callback = shutdown })
+end
+
+buildUI()
+
+_G.CarSoccer = { cfg = CFG, stop = shutdown, panic = panic }
+
+local status = (MatchSession and "hooks armed - waiting for a match" or "MatchSession not found - pilot disabled")
+	.. (drawingOK and "" or " | Drawing unavailable - ESP off")
+print("[CarPilot] panel loaded - autopilot, ball path ESP, speed readout | " .. status)
+
 end
 
 --// dispatch -------------------------------------------------------------------
