@@ -12750,7 +12750,10 @@ local function saveCfg()
 	pcall(writefile, CFG_FILE, blob)
 end
 
-if not prev then
+-- a panel replacing an older build still has to pick up the saved file: the old
+-- cfg has no autoQueue key, so treat that as a fresh load instead of letting the
+-- in-memory table overwrite the file with defaults.
+if not prev or (type(prev.cfg) == "table" and prev.cfg.autoQueue == nil) then
 	pcall(loadCfg)
 end
 
