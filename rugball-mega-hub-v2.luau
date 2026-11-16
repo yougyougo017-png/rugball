@@ -70,7 +70,7 @@ Hub.SUITE_NAMES = {
 	nba        = "nba panel         |  court suite",
 	swish      = "swish             |  auto perfect shot",
 	duels      = "duels panel       |  court panel",
-	qb_aimbot  = "qb aimbot         |  throw a football",
+	qb_aimbot  = "qb aimbot         |  ballistic solver",
 	taf_bypass = "taf bypass        |  moveguard / animguard / speed",
 	physbox    = "physbox corner    |  autopilot / full power / inf stamina",
 	tps        = "tps street         |  auto shot / tackle / GK / esp",
@@ -7923,512 +7923,1652 @@ end
 Hub.SUITE.qb_aimbot = function()
 --[[
 	QB AIMBOT -- Throw A Football (place 125942529011157)
-	Client-side only. It mirrors the old ragdoll football aimbot's job, but
-	it uses this game's real API surface instead of the old remote:
+	Rayfield Gen2 | replace-not-stack via _G.SlimQbAim
 
-	  * GameRigs.Home.Receivers is the live receiver list (root, catch point, Vel)
-	  * ThrowController.SetAimTargets accepts a callable returning
-	    { Position, Velocity } entries - exactly the shape the game's own
-	    scanTargets / leadPoint path already understands
-	  * BallController:Launch's 4th argument after self is Perfect, so the
-	    perfect flag can be forced at the single choke point every release
-	    flows through
-	  * the camera is never written; the aim candidate is fed to the game's
-	    own target registry instead
+	how a throw actually works in this game
+	  every release funnels through BallController:Launch(position, velocity,
+	  gravity, perfect, wobble, drift). the ball is simulated on the client and
+	  the result is streamed to the server through Net.Cast, so the velocity
+	  handed to Launch is the whole throw.
 
-	Keys:
-		RightShift  master toggle
-		F           cycle the locked receiver manually
-		G           toggle auto-target
-		H           toggle ESP
-		E           nudge/force the perfect release when your launch fires
-]]
+	  ThrowConfig owns the ballistics:
+	    launchDirection(from, to)  lofted unit vector
+	    idealSpeed(from, to)       exact speed to land on `to`
+	    maxSpeed(power)            the player's own ceiling
+
+	  so this suite never touches the camera and never fires a remote. it solves
+	  the trajectory onto the chosen receiver's catch point and rewrites the
+	  Launch arguments the game itself passes in. perfect is forced true and
+	  wobble/drift are zeroed, which is exactly what a perfect release does.
+
+	what "better" means here
+	  * target = the receiver with the most separation from the nearest defender,
+	    not the one closest to the crosshair. separation is measured to the catch
+	    point and to the throw line, so a defender sitting under the route still
+	    counts as coverage.
+	  * the lead uses the game's own three-pass leadPoint loop, so a running
+	    receiver is met where he will be, not where he is.
+	  * BallController.Launch is wrapped, not replaced: the controller's state
+	    machine, Thrown signal, reload and animation all still run.
+	  * out-of-range throws are left alone instead of being fired at a clamped
+	    speed, so the ball never dies short of the target.
+	  * power assist is the game's own PowerAssist field; the rank override is
+	    opt-in and off by default.
+	  * auto throw drives the game's real throw input (a mouse click) instead of
+	    calling Launch behind the controller's back.
+
+	keys
+	  RightShift  master toggle        F  cycle target
+	  G           auto target          H  visuals
+	  T           auto throw           E  release now
+	  P           panic
+
+	_G.SlimQbAim exports cfg, stats, pick, list, probe, throw, cycle, panic, stop.
+--]]
+
+if game.PlaceId ~= 125942529011157 then
+	warn("[QBAIM] this suite is built for Throw A Football (125942529011157); running on " .. tostring(game.PlaceId))
+end
+
+local prev = _G.SlimQbAim
+if prev and prev.stop then
+	pcall(prev.stop)
+end
+
+--// config --------------------------------------------------------------------
+
+local DEFAULTS = {
+	enabled = true,
+	autoTarget = true,
+	perfect = true,
+	idealSpeed = true,
+	powerAssist = true,
+	powerBoost = false,
+	snap = true,
+	assistAngle = 45,
+	esp = true,
+	ring = true,
+	labels = true,
+	arc = true,
+	defLines = false,
+	hud = true,
+	autoThrow = false,
+	autoDelay = 0.55,
+	respectUi = true,
+	minGap = 5,
+	maxDistance = 260,
+	speedCap = 110,
+	lead = true,
+}
+
+local CFG = {}
+for key, value in pairs(DEFAULTS) do
+	CFG[key] = value
+end
+
+local CFG_FILE = "slimhub-qbaim.cfg"
+
+local function loadCfg()
+	if not (isfile and readfile and isfile(CFG_FILE)) then return end
+	local ok, data = pcall(readfile, CFG_FILE)
+	if not ok or type(data) ~= "string" then return end
+	for line in string.gmatch(data, "[^\r\n]+") do
+		local k, v = string.match(line, "^([%w_]+)=(.*)$")
+		if k and CFG[k] ~= nil then
+			if v == "true" then
+				CFG[k] = true
+			elseif v == "false" then
+				CFG[k] = false
+			elseif tonumber(v) then
+				CFG[k] = tonumber(v)
+			end
+		end
+	end
+end
+
+local function saveCfg()
+	if not writefile then return end
+	local keys = {}
+	for k in pairs(CFG) do
+		keys[#keys + 1] = k
+	end
+	table.sort(keys)
+	local out = {}
+	for _, k in ipairs(keys) do
+		out[#out + 1] = k .. "=" .. tostring(CFG[k])
+	end
+	pcall(writefile, CFG_FILE, table.concat(out, "\n"))
+end
+
+loadCfg()
+
+--// services ------------------------------------------------------------------
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace = game:GetService("Workspace")
+local LP = Players.LocalPlayer
 
-local LocalPlayer = Players.LocalPlayer
+local TAG = "SlimQbAim"
+local HUD_NAME = "SlimQbAimHud"
+local FX_NAME = "SlimQbAimFx"
 
-local CONFIG = {
-	enabled = true,
-	aimLock = true,
-	esp = true,
-	forcePerfect = true,
-	fov = 60,
-	aimCone = 45,
-	maxDistance = 220,
-	leadWeight = 1.0,
-	openBonus = 10,
-	hoverPick = true,
-	hoverRelease = 1.2,
-}
+local OPEN_COLOR = Color3.fromRGB(120, 230, 140)
+local CUT_COLOR = Color3.fromRGB(255, 96, 96)
+local FAR_COLOR = Color3.fromRGB(255, 160, 60)
+local LOCK_COLOR = Color3.fromRGB(255, 221, 35)
 
-local Keys = {
-	toggle = Enum.KeyCode.RightShift,
-	cycle = Enum.KeyCode.F,
-	autoTarget = Enum.KeyCode.G,
-	esp = Enum.KeyCode.H,
-	perfect = Enum.KeyCode.E,
-}
+local dead = false
+local ui = { flags = {} }
+local hooks = {}
+local stats = { throws = 0, aimed = 0, auto = 0, lastSpeed = 0, missed = 0 }
+local pick = nil
+local targetList = {}
+local cycle = 0
+local lastBuild = 0
+local lastHud = 0
+local lastStatus = 0
+local nextClick = 0
+local autoAt = 0
+local statusLine = "starting"
 
---// controller modules --------------------------------------------------------
-local function loadController(name)
-	local ok, mod = pcall(function()
-		return require(LocalPlayer.PlayerScripts.Controllers[name])
-	end)
+--// modules -------------------------------------------------------------------
+
+local function softRequire(inst)
+	if not inst then return nil end
+	local ok, mod = pcall(require, inst)
 	if ok then return mod end
 	return nil
 end
 
-local ThrowController = loadController("ThrowController")
-local GameRigs = loadController("GameRigs")
-local BallController = nil
-pcall(function()
-	BallController = require(ReplicatedStorage.TAF_Shared.Client.BallController)
-end)
+local PlayerScripts = LP:FindFirstChild("PlayerScripts")
+	or LP:WaitForChild("PlayerScripts", 20)
+local Controllers = PlayerScripts and (PlayerScripts:FindFirstChild("Controllers")
+	or PlayerScripts:WaitForChild("Controllers", 20))
 
-local ThrowConfig = nil
-pcall(function()
-	ThrowConfig = require(ReplicatedStorage.TAF_Shared.Shared.ThrowConfig)
-end)
+local TC = softRequire(Controllers and Controllers:FindFirstChild("ThrowController"))
+local GR = softRequire(Controllers and Controllers:FindFirstChild("GameRigs"))
+local DC = softRequire(Controllers and Controllers:FindFirstChild("DataController"))
+local CamCtl = softRequire(Controllers and Controllers:FindFirstChild("CameraController"))
+local BC = softRequire(Controllers and Controllers:FindFirstChild("BallController"))
 
-local GameConfig = nil
-pcall(function()
-	GameConfig = require(ReplicatedStorage.TAF_Shared.Shared.GameConfig)
-end)
+local TAF = ReplicatedStorage:FindFirstChild("TAF_Shared")
+local Shared = TAF and TAF:FindFirstChild("Shared")
+local TCfg = softRequire(Shared and Shared:FindFirstChild("ThrowConfig"))
+local GCfg = softRequire(Shared and Shared:FindFirstChild("GameConfig"))
 
---// preclean (live-reload keeps the previous run only if it shut down) ---------
-pcall(function() RunService:UnbindFromRenderStep("QBAimThrow") end)
-for _, d in ipairs({Workspace:FindFirstChild("QBAimEsp")}) do
-	if d then d:Destroy() end
-end
-local oldGui = LocalPlayer:FindFirstChild("PlayerGui") and LocalPlayer.PlayerGui:FindFirstChild("QBAimHud")
-if oldGui then oldGui:Destroy() end
-local oldAssist = _G.SlimQBAimState
-if oldAssist and oldAssist.stop then pcall(oldAssist.stop) end
-
--- pre-clean removes it. rebuilt fresh every load so old stray ESP never lingers
-local espFolder = Instance.new("Folder")
-espFolder.Name = "QBAimEsp"
-espFolder.Parent = Workspace
-
-local manualCycle = 0
-local stats = { throws = 0, mode = "auto" }
-local currentEntry = nil
-
--- assist widening: the game's own snap cone is ThrowConfig.AssistAngle (12 deg).
--- while locked we widen it so the assist drags the aim onto our candidate from
--- a much bigger cone. stock values are saved and restored on disable.
-local ASSIST_ORIG = nil
-local function widenAssist()
-	if not ThrowConfig then return end
-	ASSIST_ORIG = ASSIST_ORIG or { ThrowConfig.AssistAngle, ThrowConfig.AssistPower }
-	ThrowConfig.AssistAngle = CONFIG.aimCone
-	ThrowConfig.AssistPower = 1
-end
-local function restoreAssist()
-	if not ThrowConfig or not ASSIST_ORIG then return end
-	ThrowConfig.AssistAngle = ASSIST_ORIG[1]
-	ThrowConfig.AssistPower = ASSIST_ORIG[2]
-	ASSIST_ORIG = nil
+if not BC and TAF then
+	local Client = TAF:FindFirstChild("Client")
+	BC = softRequire(Client and Client:FindFirstChild("BallController"))
 end
 
---// hooks ---------------------------------------------------------------------
--- force Perfect at BallController:Launch (arg 4 after self). This is the
--- exact spot ragdoll football script used for its perfect flag, minus any
--- remote assumptions from that game.
-local installBallHook, uninstallBallHook, markAimTargets
-do
-	local origLaunch = nil
-	local hooked = false
-
-	installBallHook = function()
-		if hooked or not BallController or type(BallController.Launch) ~= "function" then return end
-		origLaunch = BallController.Launch
-		BallController.Launch = function(self, a2, a3, a4, a5, a6, a7)
-			if CONFIG.forcePerfect and a5 ~= true then
-				a5 = true
-			end
-			stats.throws = stats.throws + 1
-			return origLaunch(self, a2, a3, a4, a5, a6, a7)
+-- the hub can run before every controller module has finished requiring, so
+-- give the important ones a bounded retry instead of silently doing nothing.
+if not (TC and BC and TCfg) then
+	local deadline = os.clock() + 12
+	repeat
+		task.wait(0.25)
+		if not Controllers and PlayerScripts then
+			Controllers = PlayerScripts:FindFirstChild("Controllers")
 		end
-		hooked = true
-	end
+		if Controllers then
+			TC = TC or softRequire(Controllers:FindFirstChild("ThrowController"))
+			GR = GR or softRequire(Controllers:FindFirstChild("GameRigs"))
+			DC = DC or softRequire(Controllers:FindFirstChild("DataController"))
+			CamCtl = CamCtl or softRequire(Controllers:FindFirstChild("CameraController"))
+			BC = BC or softRequire(Controllers:FindFirstChild("BallController"))
+		end
+		TAF = TAF or ReplicatedStorage:FindFirstChild("TAF_Shared")
+		Shared = Shared or (TAF and TAF:FindFirstChild("Shared"))
+		TCfg = TCfg or softRequire(Shared and Shared:FindFirstChild("ThrowConfig"))
+	until (TC and BC and TCfg) or os.clock() > deadline
+end
 
-	uninstallBallHook = function()
-		if not hooked or not origLaunch then return end
-		BallController.Launch = origLaunch
-		hooked = false
-	end
+if not (TC and BC and TCfg) then
+	warn("[QBAIM] game modules are not ready yet (throw/ball controller or throw config missing); run the suite again once the match has loaded")
+	return
+end
 
-	-- the game's own target registry expects a callable returning
-	-- { Position, Velocity } entries. LockPoint then applies the normal lead.
-	markAimTargets = function(fn)
-		if ThrowController and type(ThrowController.SetAimTargets) == "function" then
-			pcall(ThrowController.SetAimTargets, ThrowController, fn)
+local HANDS = tonumber(GCfg and GCfg.HandsHeight) or 1.3
+local GRAVITY = tonumber(TCfg.Gravity) or 40
+
+--// rig model -----------------------------------------------------------------
+
+local trackers = setmetatable({}, { __mode = "k" })
+
+local function baseOf(r)
+	local root = r.Root
+	local rp = root and root.Parent and root.Position or nil
+	local p = r.Pos
+	if typeof(p) == "Vector3" then
+		if not rp then
+			return p
+		end
+		-- the rig's own root wins when Pos has gone stale (lobby leftovers sit
+		-- thousands of studs away from the live character).
+		local dx = p.X - rp.X
+		local dz = p.Z - rp.Z
+		if dx * dx + dz * dz <= 144 then
+			return p
 		end
 	end
-end
-
-installBallHook()
-local function resolver()
-	if not CONFIG.aimLock then return nil end
-	local e = currentEntry
-	if not e or not e.point then return nil end
-	return { { Position = e.point, Velocity = e.vel or Vector3.zero } }
-end
-if CONFIG.enabled and CONFIG.aimLock then
-	markAimTargets(resolver)
-	widenAssist()
-end
-
---// target model helpers ------------------------------------------------------
-local function receivers()
-	if not GameRigs or not GameRigs.Home or not GameRigs.Home.Receivers then return {} end
-	return GameRigs.Home.Receivers
-end
-
-local function receiverPoint(entry)
-	if not entry then return nil end
-	local root = entry.Root
-	local base = entry.Pos or (root and root.Position) or nil
-	if not base then return nil end
-	local scale = tonumber(entry.Scale) or 1
-	local lift = tonumber(entry.Lift) or 0
-	local hh = GameConfig and tonumber(GameConfig.HandsHeight) or 2.4
-	return Vector3.new(base.X, base.Y + (3 + hh) * scale + lift, base.Z)
-end
-
-local trackers = {}
-local function trackVelocity(rig, pos, now)
-	local t = trackers[rig]
-	if not t then
-		trackers[rig] = { pos = pos, t = now, vel = Vector3.zero }
-		return Vector3.zero
+	if rp then
+		return rp - Vector3.new(0, 3, 0)
 	end
-	local dt = now - t.t
-	if dt >= 0.016 then
-		local raw = (pos - t.pos) / dt
-		if raw.Magnitude > 200 then raw = Vector3.zero end
-		t.vel = t.vel:Lerp(raw, 0.3)
-		t.pos = pos
-		t.t = now
-	end
-	return t.vel
-end
-
-local function throwOrigin()
-	if ThrowController and type(ThrowController.GetHandPart) == "function" then
-		local ok, hand = pcall(ThrowController.GetHandPart, ThrowController)
-		if ok and hand and hand:IsA("BasePart") then return hand.Position end
-	end
-	local ch = LocalPlayer.Character
-	local root = ch and ch:FindFirstChild("HumanoidRootPart")
-	if root then return root.Position + Vector3.new(0, 3.4, 0) end
 	return nil
 end
 
-local function defenderGap(execPos, allRigs)
-	local best = math.huge
-	for i, other in ipairs(allRigs) do
-		if other and other ~= execPos then
-			local pos = other.Pos or other.Root and other.Root.Position
-			if pos then
-				local d = (pos - execPos).Magnitude
-				if d < best then best = d end
+local function catchOf(r, base)
+	local spot = r.PassSpot
+	if typeof(spot) == "Vector3" then
+		if (spot - base).Magnitude <= 18 then
+			return spot
+		end
+	end
+	local scale = tonumber(r.Scale) or 1
+	return Vector3.new(base.X, base.Y + (3 + HANDS) * scale, base.Z)
+end
+
+local function velOf(r, base, now)
+	local v = r.Vel
+	if typeof(v) == "Vector3" and v.Magnitude > 0.5 then
+		return v
+	end
+	local t = trackers[r]
+	if not t then
+		trackers[r] = { p = base, t = now, v = Vector3.zero }
+		return Vector3.zero
+	end
+	local dt = now - t.t
+	if dt >= 0.05 then
+		local raw = (base - t.p) / dt
+		if raw.Magnitude > 120 then
+			raw = Vector3.zero
+		end
+		t.v = t.v:Lerp(raw, 0.35)
+		t.p = base
+		t.t = now
+	end
+	return t.v
+end
+
+-- exactly the loop ThrowController uses for its own lead, so the aim point is
+-- the game's aim point rather than a different approximation.
+local function leadPoint(from, point, vel)
+	if not vel or vel.Magnitude < 0.5 then
+		return point
+	end
+	local p = point
+	for _ = 1, 3 do
+		local dir = TCfg.launchDirection(from, p)
+		local speed = TCfg.idealSpeed(from, p, dir)
+		if not speed then
+			break
+		end
+		local horiz = speed * math.sqrt(dir.X * dir.X + dir.Z * dir.Z)
+		if horiz < 0.01 then
+			break
+		end
+		p = point + vel * ((Vector3.new(p.X - from.X, 0, p.Z - from.Z)).Magnitude / horiz)
+	end
+	return p
+end
+
+local function currentPower()
+	if CFG.powerBoost then
+		return 99
+	end
+	local up = DC and DC.Profile and DC.Profile.Upgrades
+	return tonumber(up and up.Power) or 0
+end
+
+local function defenderPositions()
+	local out = {}
+	local all = GR and GR.All
+	if type(all) ~= "table" then
+		return out
+	end
+	for _, r in ipairs(all) do
+		if type(r) == "table" and r.Side ~= "Home" then
+			local job = tostring(r.Job or "")
+			local p = baseOf(r)
+			if p and job ~= "Down" and job ~= "Dive" then
+				out[#out + 1] = p
 			end
 		end
 	end
-	return best
+	return out
 end
 
-local function entryFor(receiver, origin, now)
-	local point = receiverPoint(receiver)
-	local root = receiver.Root
-	local base = receiver.Pos or (root and root.Position) or point
-	if not point or not base then return nil end
-	-- receivers carry their own live movement velocity, so prefer it; our
-	-- sampled tracker is only the fallback for rigs that report 0
-	local vel = (typeof(receiver.Vel) == "Vector3" and receiver.Vel.Magnitude > 0.05 and receiver.Vel)
-		or trackVelocity(receiver, base, now)
-	local cam = Workspace.CurrentCamera
-	if not cam then return nil end
-	local toTarget = point - cam.CFrame.Position
-	if toTarget.Magnitude < 0.01 then return nil end
-	local angle = math.deg(math.acos(math.clamp(cam.CFrame.LookVector:Dot(toTarget.Unit), -1, 1)))
-	local dist = (point - origin).Magnitude
-	local gap = defenderGap(base, receivers())
-	return {
-		receiver = receiver,
-		point = point,
-		vel = vel,
-		angle = angle,
-		dist = dist,
-		gap = gap,
-		score = angle * 1.25 + dist * 0.08 - math.min(gap, 12) * CONFIG.openBonus * 0.1,
-	}
-end
-
-local function candidates(origin, now)
-	local list = {}
-	for _, r in ipairs(receivers()) do
-		if type(r) == "table" and r.Job ~= "Down" then
-			local e = entryFor(r, origin, now)
-			if e and e.angle <= CONFIG.fov and e.dist <= CONFIG.maxDistance and e.dist > 6 then
-				table.insert(list, e)
+-- distance from the nearest defender to either the catch point or the throw
+-- line. a defender directly under the route but 3 studs off the line still
+-- counts, which a plain catch-point distance does not see.
+local function separation(from, point, defs)
+	local best = 99
+	local near = nil
+	local sx = point.X - from.X
+	local sz = point.Z - from.Z
+	local len2 = sx * sx + sz * sz
+	for i = 1, #defs do
+		local dp = defs[i]
+		local cx = dp.X - point.X
+		local cz = dp.Z - point.Z
+		local catchD = math.sqrt(cx * cx + cz * cz)
+		local lineD = catchD
+		if len2 > 0.01 then
+			local ax = dp.X - from.X
+			local az = dp.Z - from.Z
+			local t = (ax * sx + az * sz) / len2
+			if t < 0 then
+				t = 0
+			elseif t > 1 then
+				t = 1
 			end
+			local nx = from.X + sx * t
+			local nz = from.Z + sz * t
+			local dx = dp.X - nx
+			local dz = dp.Z - nz
+			lineD = math.sqrt(dx * dx + dz * dz) + 1.5
+		end
+		local s = math.min(catchD, lineD)
+		if s < best then
+			best = s
+			near = dp
 		end
 	end
-	table.sort(list, function(a, b) return a.score < b.score end)
-	return list
+	return best, near
 end
 
---// ESP ----------------------------------------------------------------------
-local esp = { rig = nil, hl = nil, box = nil, tag = nil, label = nil, beam = nil }
-local function clearEsp()
-	for _, v in ipairs(espFolder:GetChildren()) do v:Destroy() end
-	esp.rig, esp.hl, esp.box, esp.tag, esp.label, esp.beam = nil, nil, nil, nil, nil, nil
-end
-local function buildEsp(model, root)
-	clearEsp()
-	if not model or not root then return end
-	local hl = Instance.new("Highlight")
-	hl.Adornee = model
-	hl.FillColor = Color3.fromRGB(255, 60, 60)
-	hl.FillTransparency = 0.78
-	hl.OutlineColor = Color3.fromRGB(255, 235, 90)
-	hl.OutlineTransparency = 0
-	hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-	hl.Parent = espFolder
-	esp.hl = hl
-	local box = Instance.new("BoxHandleAdornment")
-	box.Adornee = root
-	box.Size = Vector3.new(4.4, 4.4, 4.4)
-	box.AlwaysOnTop = true
-	box.ZIndex = 5
-	box.Transparency = 0.6
-	box.Color3 = Color3.fromRGB(255, 60, 60)
-	box.Parent = espFolder
-	esp.box = box
-	local beam = Instance.new("Part")
-	beam.Anchored = true
-	beam.CanCollide = false
-	beam.CanQuery = false
-	beam.CanTouch = false
-	beam.CastShadow = false
-	beam.Material = Enum.Material.Neon
-	beam.Color = Color3.fromRGB(255, 220, 60)
-	beam.Transparency = 0.35
-	beam.Size = Vector3.new(0.12, 0.12, 1)
-	beam.Parent = espFolder
-	esp.beam = beam
-	local tag = Instance.new("BillboardGui")
-	tag.Size = UDim2.fromOffset(180, 34)
-	tag.StudsOffset = Vector3.new(0, 5.4, 0)
-	tag.AlwaysOnTop = true
-	tag.Adornee = root
-	tag.Parent = espFolder
-	esp.tag = tag
-	local label = Instance.new("TextLabel")
-	label.Size = UDim2.fromScale(1, 1)
-	label.BackgroundTransparency = 1
-	label.Font = Enum.Font.GothamBold
-	label.TextSize = 14
-	label.TextColor3 = Color3.fromRGB(255, 235, 90)
-	label.TextStrokeTransparency = 0.4
-	label.Parent = tag
-	esp.label = label
-	esp.rig = model
-end
-local function drawEsp(entry)
-	-- receiver entries are plain tables carrying a .Model and a .Root part,
-	-- never Instances themselves
-	local model = entry and entry.Model
-	local root = entry and entry.Root
-	if not model or not root then
-		if esp.rig then clearEsp() end
-		return
+local function throwOrigin()
+	local ok, hand = pcall(TC.GetHandPart, TC)
+	if ok and typeof(hand) == "Instance" and hand:IsA("BasePart") then
+		return hand.Position
 	end
-	if esp.rig ~= entry then buildEsp(model, root) end
-	if esp.label then
-		esp.label.Text = string.format("R%d  %.0f°  %.0f st  gap %.0f", entry.Slot or 0, entry.angle, entry.dist, entry.gap)
+	local ch = LP.Character
+	local root = ch and ch:FindFirstChild("HumanoidRootPart")
+	if root then
+		return root.Position + Vector3.new(0, 1.2, 0)
 	end
+	return nil
 end
-local function updateBeam(entry)
-	local beam = esp.beam
-	if not beam then return end
+
+local function build(now)
 	local origin = throwOrigin()
-	if not origin or not entry or not entry.point then
-		beam.Transparency = 1
+	if not origin then
+		targetList = {}
+		pick = nil
 		return
 	end
-	local delta = entry.point - origin
-	local len = delta.Magnitude
-	if len < 0.5 then beam.Transparency = 1 return end
-	beam.Size = Vector3.new(0.12, 0.12, len)
-	beam.CFrame = CFrame.lookAt(origin + delta * 0.5, entry.point)
-	beam.Transparency = 0.45
+	local defs = defenderPositions()
+	local power = currentPower()
+	local maxs = TCfg.maxSpeed(power)
+	local list = {}
+	local recs = GR and GR.Home and GR.Home.Receivers
+
+	if type(recs) == "table" then
+		for i = 1, #recs do
+			local r = recs[i]
+			if type(r) == "table" then
+				local job = tostring(r.Job or "")
+				local base = job ~= "Down" and job ~= "Dive" and baseOf(r) or nil
+				local spot = base and catchOf(r, base)
+				if base and spot then
+					local vel = velOf(r, base, now)
+					local aim = spot
+					if CFG.lead then
+						aim = leadPoint(origin, spot, vel)
+					end
+					local dir = TCfg.launchDirection(origin, aim)
+					local speed = TCfg.idealSpeed(origin, aim, dir)
+					if speed then
+						local flat = (Vector3.new(aim.X - origin.X, 0, aim.Z - origin.Z)).Magnitude
+						local sep, near = separation(origin, aim, defs)
+						local reachable = speed <= CFG.speedCap and flat <= CFG.maxDistance
+						local open = sep >= CFG.minGap
+						local slider = TCfg.sliderFor(power, math.min(speed, maxs))
+						local score = sep * 1.5
+							- flat * 0.03
+							+ (job == "Catch" and 3 or 0)
+							+ (open and 10 or 0)
+							+ (reachable and 5 or -5)
+						list[#list + 1] = {
+							rig = r,
+							index = i,
+							base = base,
+							raw = spot,
+							point = aim,
+							vel = vel,
+							dir = dir,
+							speed = speed,
+							maxs = maxs,
+							dist = flat,
+							sep = sep,
+							nearest = near,
+							job = job,
+							open = open,
+							reachable = reachable,
+							slot = tonumber(r.Slot) or i,
+							name = tostring(r.Name or ("R" .. i)),
+							slider = slider and math.clamp(slider, 0, 1) or 0,
+							score = score,
+						}
+					end
+				end
+			end
+		end
+	end
+
+	table.sort(list, function(a, b)
+		return a.score > b.score
+	end)
+	targetList = list
+
+	if #list == 0 then
+		pick = nil
+	elseif cycle > 0 then
+		pick = list[((cycle - 1) % #list) + 1]
+	elseif CFG.autoTarget then
+		pick = list[1]
+	else
+		pick = nil
+	end
 end
 
---// minimal HUD + throw button ------------------------------------------------
-local gui = Instance.new("ScreenGui")
-gui.Name = "QBAimHud"
-gui.ResetOnSpawn = false
-gui.IgnoreGuiInset = true
-gui.Parent = LocalPlayer:WaitForChild("PlayerGui")
-local panel = Instance.new("Frame")
-panel.Size = UDim2.fromOffset(248, 108)
-panel.Position = UDim2.new(0, 14, 1, -122)
-panel.BackgroundColor3 = Color3.fromRGB(14, 16, 22)
-panel.BackgroundTransparency = 0.18
-panel.BorderSizePixel = 0
-panel.Parent = gui
-local corner = Instance.new("UICorner") corner.CornerRadius = UDim.new(0, 8) corner.Parent = panel
-local stroke = Instance.new("UIStroke") stroke.Color = Color3.fromRGB(255, 221, 35) stroke.Transparency = 0.55 stroke.Thickness = 1.4 stroke.Parent = panel
-local title = Instance.new("TextLabel")
-title.Size = UDim2.new(1, -16, 0, 22) title.Position = UDim2.fromOffset(8, 6) title.BackgroundTransparency = 1
-title.Font = Enum.Font.GothamBold title.TextSize = 14 title.TextXAlignment = Enum.TextXAlignment.Left
-title.TextColor3 = Color3.fromRGB(255, 221, 35) title.Text = "QB AIMBOT" title.Parent = panel
-local body = Instance.new("TextLabel")
-body.Size = UDim2.new(1, -16, 0, 72) body.Position = UDim2.fromOffset(8, 30) body.BackgroundTransparency = 1
-body.Font = Enum.Font.Code body.TextSize = 12 body.TextXAlignment = Enum.TextXAlignment.Left body.TextYAlignment = Enum.TextYAlignment.Top
-body.TextColor3 = Color3.fromRGB(232, 234, 240) body.Text = "" body.Parent = panel
-local throwBtn = Instance.new("TextButton")
-throwBtn.Size = UDim2.fromOffset(104, 46) throwBtn.Position = UDim2.new(0, 270, 1, -122)
-throwBtn.BackgroundColor3 = Color3.fromRGB(20, 23, 30) throwBtn.BackgroundTransparency = 0.1 throwBtn.BorderSizePixel = 0
-throwBtn.AutoButtonColor = true throwBtn.Font = Enum.Font.GothamBold throwBtn.TextSize = 15
-throwBtn.TextColor3 = Color3.fromRGB(255, 221, 35) throwBtn.Text = "LOCK" throwBtn.Parent = gui
-local btnCorner = Instance.new("UICorner") btnCorner.CornerRadius = UDim.new(0, 8) btnCorner.Parent = throwBtn
-local btnStroke = Instance.new("UIStroke") btnStroke.Color = Color3.fromRGB(255, 221, 35) btnStroke.Transparency = 0.45 btnStroke.Thickness = 1.4 btnStroke.Parent = throwBtn
+--// visuals -------------------------------------------------------------------
 
-local lastHud = 0
-local function refreshHud(entry)
-	local now = os.clock()
-	if now - lastHud < 0.1 then return end
+local fxFolder = Instance.new("Folder")
+fxFolder.Name = FX_NAME
+fxFolder.Parent = Workspace
+
+local esp = {}
+
+local function ensureEsp(rig, root)
+	local item = esp[rig]
+	if item and item.billboard and item.billboard.Parent then
+		return item
+	end
+	local bb = Instance.new("BillboardGui")
+	bb.Name = "qbaim"
+	bb.Size = UDim2.fromOffset(200, 96)
+	bb.AlwaysOnTop = true
+	bb.LightInfluence = 0
+	bb.MaxDistance = 500
+	bb.Adornee = root
+	bb.Parent = fxFolder
+
+	local ring = Instance.new("Frame")
+	ring.BackgroundTransparency = 1
+	ring.Size = UDim2.fromOffset(64, 64)
+	ring.Position = UDim2.fromScale(0.5, 0.5)
+	ring.AnchorPoint = Vector2.new(0.5, 0.5)
+	ring.Parent = bb
+
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(1, 0)
+	corner.Parent = ring
+
+	local stroke = Instance.new("UIStroke")
+	stroke.Thickness = 2
+	stroke.Transparency = 0.1
+	stroke.Parent = ring
+
+	local label = Instance.new("TextLabel")
+	label.BackgroundTransparency = 1
+	label.Size = UDim2.fromOffset(200, 22)
+	label.Position = UDim2.new(0.5, 0, 0.5, 40)
+	label.AnchorPoint = Vector2.new(0.5, 0)
+	label.Font = Enum.Font.GothamBold
+	label.TextSize = 13
+	label.TextStrokeTransparency = 0.35
+	label.Text = ""
+	label.Parent = bb
+
+	item = { billboard = bb, ring = ring, stroke = stroke, label = label }
+	esp[rig] = item
+	return item
+end
+
+local arcPool = {}
+local arcReady = false
+local marker = nil
+local defLine = nil
+local markerReady = false
+
+local function ensureArc()
+	if arcReady then
+		return
+	end
+	for i = 1, 26 do
+		if not arcPool[i] then
+			local p = Instance.new("Part")
+			p.Name = "qbaim_arc"
+			p.Shape = Enum.PartType.Ball
+			p.Size = Vector3.new(0.22, 0.22, 0.22)
+			p.Material = Enum.Material.Neon
+			p.Color = LOCK_COLOR
+			p.Anchored = true
+			p.CanCollide = false
+			p.CanQuery = false
+			p.CanTouch = false
+			p.CastShadow = false
+			p.Transparency = 1
+			p.Parent = fxFolder
+			arcPool[i] = p
+		end
+	end
+	arcReady = true
+end
+
+local function ensureMarkers()
+	if markerReady then
+		return
+	end
+	if not marker then
+		local p = Instance.new("Part")
+		p.Name = "qbaim_mark"
+		p.Shape = Enum.PartType.Ball
+		p.Size = Vector3.new(2.6, 2.6, 2.6)
+		p.Material = Enum.Material.Neon
+		p.Color = LOCK_COLOR
+		p.Transparency = 1
+		p.Anchored = true
+		p.CanCollide = false
+		p.CanQuery = false
+		p.CanTouch = false
+		p.CastShadow = false
+		p.Parent = fxFolder
+		marker = p
+	end
+	if not defLine then
+		local p = Instance.new("Part")
+		p.Name = "qbaim_def"
+		p.Size = Vector3.new(0.12, 0.12, 1)
+		p.Material = Enum.Material.Neon
+		p.Color = CUT_COLOR
+		p.Transparency = 1
+		p.Anchored = true
+		p.CanCollide = false
+		p.CanQuery = false
+		p.CanTouch = false
+		p.CastShadow = false
+		p.Parent = fxFolder
+		defLine = p
+	end
+	markerReady = true
+end
+
+local function clearVisuals()
+	for _, item in pairs(esp) do
+		if item.billboard and item.billboard.Parent then
+			item.billboard.Enabled = false
+		end
+	end
+	for _, p in ipairs(arcPool) do
+		p.Transparency = 1
+	end
+	if marker then
+		marker.Transparency = 1
+	end
+	if defLine then
+		defLine.Transparency = 1
+	end
+end
+
+local function drawVisuals()
+	if not CFG.enabled or not CFG.esp then
+		for _, item in pairs(esp) do
+			if item.billboard and item.billboard.Parent then
+				item.billboard.Enabled = false
+			end
+		end
+		return
+	end
+	local seen = {}
+	for _, e in ipairs(targetList) do
+		local root = e.rig.Root
+		if root and root.Parent then
+			local item = ensureEsp(e.rig, root)
+			item.billboard.Adornee = root
+			item.billboard.StudsOffsetWorldSpace = e.raw - root.Position
+			item.billboard.Enabled = CFG.esp
+
+			local locked = pick == e
+			local col = OPEN_COLOR
+			if not e.open then
+				col = CUT_COLOR
+			elseif not e.reachable then
+				col = FAR_COLOR
+			elseif locked then
+				col = LOCK_COLOR
+			end
+
+			item.stroke.Color = col
+			item.stroke.Thickness = locked and 3 or 2
+			item.ring.Visible = CFG.ring
+			item.label.Visible = CFG.labels
+			item.label.TextColor3 = col
+			item.label.Text = string.format(
+				"%s  %.0f st  %s  sep %.0f  pwr %d%%",
+				e.name, e.dist, e.open and "open" or "cut", e.sep, math.floor(e.slider * 100)
+			)
+			seen[e.rig] = true
+		end
+	end
+	for rig, item in pairs(esp) do
+		if not seen[rig] and item.billboard and item.billboard.Parent then
+			item.billboard.Enabled = false
+		end
+	end
+end
+
+local function drawArc()
+	ensureArc()
+	ensureMarkers()
+	if not pick or not CFG.enabled or not CFG.arc then
+		for _, p in ipairs(arcPool) do
+			p.Transparency = 1
+		end
+		marker.Transparency = 1
+		return
+	end
+	local origin = throwOrigin()
+	if not origin then
+		return
+	end
+	local dir = TCfg.launchDirection(origin, pick.point)
+	local speed = TCfg.idealSpeed(origin, pick.point, dir)
+	if not speed then
+		return
+	end
+	speed = math.min(speed, CFG.speedCap)
+	local v = dir * speed
+	local pos = origin
+	local dt = 0.06
+	local shown = 0
+	for i = 1, #arcPool do
+		local p = arcPool[i]
+		p.Position = pos
+		p.Transparency = 0.1 + i * 0.025
+		local shrink = 1 - math.min(0.5, i * 0.015)
+		p.Size = Vector3.new(0.22, 0.22, 0.22) * shrink
+		shown = i
+		pos = pos + v * dt
+		v = v - Vector3.new(0, GRAVITY * dt, 0)
+		if pos.Y < pick.point.Y - 2 then
+			break
+		end
+	end
+	for i = shown + 1, #arcPool do
+		arcPool[i].Transparency = 1
+	end
+	marker.Position = pick.point
+	marker.Transparency = 0.72
+end
+
+local function drawDefLine()
+	ensureMarkers()
+	if not CFG.defLines or not pick or not pick.nearest or not CFG.enabled then
+		defLine.Transparency = 1
+		return
+	end
+	local a = pick.point
+	local b = pick.nearest
+	local d = b - a
+	if d.Magnitude < 0.5 then
+		defLine.Transparency = 1
+		return
+	end
+	defLine.Size = Vector3.new(0.12, 0.12, d.Magnitude)
+	defLine.CFrame = CFrame.lookAt(a + d * 0.5, b)
+	defLine.Transparency = 0.35
+end
+
+--// hud -----------------------------------------------------------------------
+
+local hudGui = nil
+local hudBody = nil
+local hudBadge = nil
+
+local function buildHud()
+	local pg = LP:FindFirstChild("PlayerGui") or LP:WaitForChild("PlayerGui", 10)
+	if not pg then
+		return
+	end
+	local gui = Instance.new("ScreenGui")
+	gui.Name = HUD_NAME
+	gui.ResetOnSpawn = false
+	gui.IgnoreGuiInset = true
+	gui.DisplayOrder = 50
+	gui.Parent = pg
+
+	local frame = Instance.new("Frame")
+	frame.Size = UDim2.fromOffset(286, 112)
+	frame.Position = UDim2.new(0.5, -143, 0, 14)
+	frame.BackgroundColor3 = Color3.fromRGB(14, 16, 22)
+	frame.BackgroundTransparency = 0.18
+	frame.BorderSizePixel = 0
+	frame.Parent = gui
+
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 8)
+	corner.Parent = frame
+
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = LOCK_COLOR
+	stroke.Transparency = 0.55
+	stroke.Thickness = 1.4
+	stroke.Parent = frame
+
+	local title = Instance.new("TextLabel")
+	title.Size = UDim2.new(1, -16, 0, 20)
+	title.Position = UDim2.fromOffset(8, 5)
+	title.BackgroundTransparency = 1
+	title.Font = Enum.Font.GothamBold
+	title.TextSize = 13
+	title.TextXAlignment = Enum.TextXAlignment.Left
+	title.TextColor3 = LOCK_COLOR
+	title.Text = "QB AIMBOT"
+	title.Parent = frame
+
+	hudBadge = Instance.new("TextLabel")
+	hudBadge.Size = UDim2.fromOffset(64, 20)
+	hudBadge.Position = UDim2.new(1, -72, 0, 5)
+	hudBadge.BackgroundTransparency = 1
+	hudBadge.Font = Enum.Font.GothamBold
+	hudBadge.TextSize = 12
+	hudBadge.TextXAlignment = Enum.TextXAlignment.Right
+	hudBadge.TextColor3 = OPEN_COLOR
+	hudBadge.Text = "LIVE"
+	hudBadge.Parent = frame
+
+	hudBody = Instance.new("TextLabel")
+	hudBody.Size = UDim2.new(1, -16, 0, 80)
+	hudBody.Position = UDim2.fromOffset(8, 26)
+	hudBody.BackgroundTransparency = 1
+	hudBody.Font = Enum.Font.Code
+	hudBody.TextSize = 12
+	hudBody.TextXAlignment = Enum.TextXAlignment.Left
+	hudBody.TextYAlignment = Enum.TextYAlignment.Top
+	hudBody.TextColor3 = Color3.fromRGB(232, 234, 240)
+	hudBody.Text = ""
+	hudBody.Parent = frame
+
+	hudGui = gui
+end
+
+local function updateHud(now)
+	if not hudGui then
+		return
+	end
+	hudGui.Enabled = CFG.hud
+	if not CFG.hud then
+		return
+	end
+	if now - lastHud < 0.08 then
+		return
+	end
 	lastHud = now
-	body.Text = string.format(
-		"aim     %s\npick    %s\nesp     %s\ntarget  %s\nthrows  %d",
-		CONFIG.aimLock and "on" or "off",
-		manualCycle > 0 and ("R" .. manualCycle) or "auto",
-		CONFIG.esp and "on" or "off",
-		entry and string.format("R%d (%.0f st)", entry.Slot or 0, entry.dist) or "-",
-		stats.throws
+
+	local e = pick
+	local lines = {}
+	lines[#lines + 1] = string.format(
+		"aim %s   auto %s   %s",
+		CFG.enabled and "ON" or "OFF",
+		CFG.autoTarget and "ON" or "OFF",
+		e and ("LOCK " .. e.name) or "no target"
 	)
-	throwBtn.TextColor3 = entry and Color3.fromRGB(255, 221, 35) or Color3.fromRGB(120, 124, 134)
-	btnStroke.Color = entry and Color3.fromRGB(255, 221, 35) or Color3.fromRGB(90, 94, 104)
+	if e then
+		lines[#lines + 1] = string.format(
+			"%.0f st   sep %.1f   %s",
+			e.dist, e.sep, e.open and "OPEN" or "COVERED"
+		)
+		lines[#lines + 1] = string.format(
+			"pwr %d%%   need %.1f   cap %.0f",
+			math.floor(e.slider * 100), e.speed, CFG.speedCap
+		)
+	else
+		lines[#lines + 1] = "no receiver in range"
+		lines[#lines + 1] = "waiting for a route"
+	end
+	lines[#lines + 1] = string.format(
+		"throws %d   aimed %d   auto %d",
+		stats.throws, stats.aimed, stats.auto
+	)
+
+	if hudBody then
+		hudBody.Text = table.concat(lines, "\n")
+	end
+	if hudBadge then
+		hudBadge.Text = CFG.enabled and "LIVE" or "OFF"
+		hudBadge.TextColor3 = CFG.enabled and OPEN_COLOR or CUT_COLOR
+	end
+end
+
+--// hooks ---------------------------------------------------------------------
+
+local function installLaunch()
+	if hooks.launch or type(BC.Launch) ~= "function" then
+		return
+	end
+	local orig = BC.Launch
+	local wrapper = function(self, pos, vel, grav, perfect, wobble, drift)
+		stats.throws = stats.throws + 1
+		local e = pick
+		if CFG.enabled and e and typeof(pos) == "Vector3" then
+			if CFG.idealSpeed then
+				local dir = TCfg.launchDirection(pos, e.point)
+				local speed = TCfg.idealSpeed(pos, e.point, dir)
+				if speed and speed <= CFG.speedCap then
+					vel = dir * speed
+					stats.aimed = stats.aimed + 1
+					stats.lastSpeed = speed
+				else
+					stats.missed = stats.missed + 1
+				end
+			end
+			if CFG.perfect then
+				perfect = true
+				wobble = 0
+				drift = Vector3.new(0, 0, 0)
+			end
+		end
+		return orig(self, pos, vel, grav, perfect, wobble, drift)
+	end
+	local ok = pcall(function()
+		BC.Launch = wrapper
+	end)
+	if ok and BC.Launch == wrapper then
+		hooks.launch = true
+		hooks.launchOrig = orig
+	else
+		warn("[QBAIM] could not hook BallController.Launch")
+	end
+end
+
+local function installSnap()
+	if hooks.snap or type(TC.SetAimTargets) ~= "function" then
+		return
+	end
+	local function resolver()
+		local e = pick
+		if not e then
+			return nil
+		end
+		return { { Position = e.raw, Velocity = e.vel or Vector3.zero } }
+	end
+	pcall(TC.SetAimTargets, TC, resolver)
+	hooks.snap = true
+end
+
+local function removeSnap()
+	if not hooks.snap then
+		return
+	end
+	pcall(TC.SetAimTargets, TC, nil)
+	hooks.snap = false
+end
+
+local assistOrig = nil
+
+local function widenAssist()
+	assistOrig = assistOrig or { TCfg.AssistAngle, TCfg.AssistPower }
+	TCfg.AssistAngle = CFG.assistAngle
+	TCfg.AssistPower = 1
+end
+
+local function restoreAssist()
+	if assistOrig then
+		TCfg.AssistAngle = assistOrig[1]
+		TCfg.AssistPower = assistOrig[2]
+		assistOrig = nil
+	end
+end
+
+local function applyPower()
+	if CFG.enabled and CFG.powerAssist then
+		if not hooks.powerSaved then
+			hooks.powerOrig = TC.PowerAssist
+			hooks.powerSaved = true
+		end
+		TC.PowerAssist = 1
+	elseif hooks.powerSaved then
+		TC.PowerAssist = hooks.powerOrig
+		hooks.powerSaved = false
+	end
+
+	if CFG.enabled and CFG.powerBoost then
+		if not hooks.rankSaved then
+			hooks.rankOrig = TC.RankOverride
+			hooks.rankSaved = true
+		end
+		TC.RankOverride = { Accuracy = 12, Power = 99 }
+	elseif hooks.rankSaved then
+		TC.RankOverride = hooks.rankOrig
+		hooks.rankSaved = false
+	end
+end
+
+local function restoreAll()
+	if hooks.launch and hooks.launchOrig then
+		BC.Launch = hooks.launchOrig
+		hooks.launch = false
+		hooks.launchOrig = nil
+	end
+	removeSnap()
+	restoreAssist()
+	if hooks.powerSaved then
+		TC.PowerAssist = hooks.powerOrig
+		hooks.powerSaved = false
+	end
+	if hooks.rankSaved then
+		TC.RankOverride = hooks.rankOrig
+		hooks.rankSaved = false
+	end
 end
 
 local function setEnabled(v)
-	CONFIG.enabled = v
+	CFG.enabled = v
 	if v then
-		if CONFIG.aimLock then
-			markAimTargets(resolver)
-			widenAssist()
-		end
-	else
-		clearEsp()
-		markAimTargets(nil)
-		restoreAssist()
-	end
-end
-
-local function forceRelease()
-	if not BallController or type(BallController.Launch) ~= "function" then return end
-	local origin = throwOrigin()
-	local e = currentEntry
-	if not origin or not e or not e.point then stats.mode = "no target" return end
-	local dir = (e.point - origin)
-	if dir.Magnitude < 0.01 then return end
-	local speed = if ThrowConfig and type(ThrowConfig.idealSpeed) == "function" then ThrowConfig.idealSpeed(origin, e.point, dir.Unit) else nil
-	if not speed then speed = 62 end
-	local ok, err = pcall(BallController.Launch, BallController, origin, dir.Unit * speed, nil, true, nil, nil)
-	if not ok then stats.mode = "launch err " .. tostring(err):sub(1, 40) end
-end
-
-throwBtn.Activated:Connect(forceRelease)
-
-_G.QBAim = {
-	pick = function(rigOrName)
-		local all = receivers()
-		if type(rigOrName) == "number" then
-			manualCycle = rigOrName
-			return true
-		end
-		for i, r in ipairs(all) do
-			if r == rigOrName or (type(rigOrName) == "string" and tostring(r.Slot) == rigOrName) then
-				manualCycle = i
-				return true
-			end
-		end
-		return false
-	end,
-	clear = function() manualCycle = 0 end,
-	throw = forceRelease,
-}
-
-UserInputService.InputBegan:Connect(function(input, gpe)
-	if gpe then return end
-	if input.KeyCode == Keys.toggle then
-		setEnabled(not CONFIG.enabled)
-	elseif input.KeyCode == Keys.esp then
-		CONFIG.esp = not CONFIG.esp
-		if not CONFIG.esp then clearEsp() end
-	elseif input.KeyCode == Keys.autoTarget then
-		CONFIG.aimLock = not CONFIG.aimLock
-		if CONFIG.aimLock then
-			currentEntry = nil
-			markAimTargets(resolver)
+		installLaunch()
+		if CFG.snap then
+			installSnap()
 			widenAssist()
 		else
-			markAimTargets(nil)
+			removeSnap()
 			restoreAssist()
 		end
-	elseif input.KeyCode == Keys.cycle then
-		manualCycle = manualCycle + 1
-	elseif input.KeyCode == Keys.perfect then
-		forceRelease()
+		applyPower()
+	else
+		restoreAll()
+		clearVisuals()
 	end
-end)
-
---// main loop -----------------------------------------------------------------
-RunService:BindToRenderStep("QBAimThrow", Enum.RenderPriority.Camera.Value + 1, function()
-	local cam = Workspace.CurrentCamera
-	if not cam then return end
-	if not CONFIG.enabled then clearEsp() return end
-	local origin = throwOrigin()
-	if not origin then clearEsp() return end
-	local now = os.clock()
-	local list = candidates(origin, now)
-	local entry = list[1]
-	if manualCycle > 0 and list[manualCycle] then entry = list[manualCycle] end
-	currentEntry = entry
-	if CONFIG.esp and entry then
-		drawEsp(entry)
-		updateBeam(entry)
-	elseif esp.rig then
-		clearEsp()
-	end
-	refreshHud(entry)
-end)
-
-local function shutdown()
-	markAimTargets(nil)
-	uninstallBallHook()
-	restoreAssist()
-	_G.QBAim = nil
-	_G.SlimQBAimState = nil
-	if gui then gui:Destroy() end
-	clearEsp()
-	espFolder:Destroy()
-	pcall(function() RunService:UnbindFromRenderStep("QBAimThrow") end)
+	statusLine = v and "aim on" or "aim off"
 end
 
-_G.SlimQBAimState = { stop = shutdown, cfg = CONFIG, stats = stats }
+--// auto throw ----------------------------------------------------------------
 
-print("[QBAim] loaded - RightShift toggle | F cycle receiver | G aim lock | H esp | E force release")
+local function mouseClick()
+	local ok, fn = pcall(function()
+		return mouse1click
+	end)
+	if ok and type(fn) == "function" then
+		pcall(fn)
+		return true
+	end
+	return false
+end
+
+local function gameActive()
+	local ok, fn = pcall(function()
+		return isrbxactive
+	end)
+	if ok and type(fn) == "function" then
+		local ok2, v = pcall(fn)
+		return ok2 and v == true
+	end
+	return true
+end
+
+local function uiOpen()
+	if not CamCtl then
+		return false
+	end
+	local ok, v = pcall(CamCtl.IsUiOpen, CamCtl)
+	return ok and v == true
+end
+
+local function releaseNow()
+	if dead then
+		return false
+	end
+	if not gameActive() then
+		return false
+	end
+	local now = os.clock()
+	if now < nextClick then
+		return false
+	end
+	local okPower, powering = pcall(TC.IsPowering, TC)
+	if okPower and powering then
+		nextClick = now + 0.4
+		if mouseClick() then
+			stats.auto = stats.auto + 1
+			return true
+		end
+		return false
+	end
+	local okHold, holding = pcall(TC.IsHolding, TC)
+	if okHold and holding then
+		nextClick = now + 0.4
+		return mouseClick()
+	end
+	return false
+end
+
+local function autoThrowStep(now)
+	if not CFG.autoThrow or dead then
+		autoAt = 0
+		return
+	end
+	local e = pick
+	if not e or not e.open or not e.reachable then
+		autoAt = 0
+		return
+	end
+	local okHold, holding = pcall(TC.IsHolding, TC)
+	if not okHold or not holding then
+		autoAt = 0
+		return
+	end
+	if CFG.respectUi and uiOpen() then
+		autoAt = 0
+		return
+	end
+	if not gameActive() then
+		autoAt = 0
+		return
+	end
+	if now < nextClick then
+		return
+	end
+	local okPower, powering = pcall(TC.IsPowering, TC)
+	if okPower and powering then
+		if autoAt == 0 then
+			autoAt = now
+		end
+		if now - autoAt >= CFG.autoDelay then
+			autoAt = 0
+			nextClick = now + 0.5
+			if mouseClick() then
+				stats.auto = stats.auto + 1
+			end
+		end
+	else
+		autoAt = 0
+		nextClick = now + 0.3
+		mouseClick()
+	end
+end
+
+--// ui ------------------------------------------------------------------------
+
+local function reg(flag, key)
+	ui.flags[#ui.flags + 1] = { flag, key }
+end
+
+local function syncUi()
+	if not ui.window then
+		return
+	end
+	for _, f in ipairs(ui.flags) do
+		pcall(function()
+			ui.window:Set(f[1], CFG[f[2]])
+		end)
+	end
+end
+
+local function buildUI()
+	local Rayfield
+	pcall(function()
+		Rayfield = loadstring(game:HttpGet("https://sirius.menu/gen2"))()
+	end)
+	if not Rayfield then
+		warn("[QBAIM] Rayfield failed to load; running with the built-in HUD only")
+		return
+	end
+
+	local w = Rayfield:CreateWindow({
+		Name = "TAF // QB AIMBOT",
+		LoadingTitle = "THROW A FOOTBALL",
+		LoadingSubtitle = "qb aimbot  -  perfect ballistics",
+		KeySystem = false,
+	})
+	ui.window = w
+
+	pcall(function()
+		w:ChangeTheme({
+			WindowColor = ColorSequence.new({
+				ColorSequenceKeypoint.new(0, Color3.fromRGB(10, 12, 18)),
+				ColorSequenceKeypoint.new(1, Color3.fromRGB(18, 22, 30)),
+			}),
+			ShadowColor = Color3.fromRGB(4, 6, 10),
+			CornerRoundness = UDim.new(0, 16),
+			ElementCornerRadius = UDim.new(0, 10),
+			PillCornerRadius = UDim.new(1, 0),
+			AccentColor = LOCK_COLOR,
+		})
+	end)
+
+	-- AIM
+	local aimTab = w:CreateTab({ Name = "AIM" })
+	aimTab:CreateSection({ Name = "SOLVER" })
+	reg("qb_enabled", "enabled")
+	aimTab:CreateToggle({
+		Name = "master",
+		Description = "wraps BallController.Launch and solves every release onto the picked receiver.",
+		Flag = "qb_enabled",
+		Value = CFG.enabled,
+		Callback = function(v)
+			setEnabled(v)
+			saveCfg()
+		end,
+	})
+	reg("qb_auto", "autoTarget")
+	aimTab:CreateToggle({
+		Name = "auto target",
+		Description = "picks the receiver with the most separation instead of the one nearest the crosshair.",
+		Flag = "qb_auto",
+		Value = CFG.autoTarget,
+		Callback = function(v)
+			CFG.autoTarget = v
+			if v then
+				cycle = 0
+			end
+			saveCfg()
+		end,
+	})
+	reg("qb_perfect", "perfect")
+	aimTab:CreateToggle({
+		Name = "perfect release",
+		Description = "forces the perfect flag and zeroes wobble and drift, the same state a perfect timing produces.",
+		Flag = "qb_perfect",
+		Value = CFG.perfect,
+		Callback = function(v)
+			CFG.perfect = v
+			saveCfg()
+		end,
+	})
+	reg("qb_ideal", "idealSpeed")
+	aimTab:CreateToggle({
+		Name = "exact speed",
+		Description = "replaces the launch velocity with ThrowConfig.idealSpeed, so the ball lands on the catch point.",
+		Flag = "qb_ideal",
+		Value = CFG.idealSpeed,
+		Callback = function(v)
+			CFG.idealSpeed = v
+			saveCfg()
+		end,
+	})
+	reg("qb_snap", "snap")
+	aimTab:CreateToggle({
+		Name = "aim snap",
+		Description = "also feeds the pick into ThrowController.SetAimTargets and widens the game's own assist cone.",
+		Flag = "qb_snap",
+		Value = CFG.snap,
+		Callback = function(v)
+			CFG.snap = v
+			if CFG.enabled then
+				if v then
+					installSnap()
+					widenAssist()
+				else
+					removeSnap()
+					restoreAssist()
+				end
+			end
+			saveCfg()
+		end,
+	})
+	reg("qb_lead", "lead")
+	aimTab:CreateToggle({
+		Name = "predict movement",
+		Description = "leads running receivers with the game's own three-pass solve.",
+		Flag = "qb_lead",
+		Value = CFG.lead,
+		Callback = function(v)
+			CFG.lead = v
+			saveCfg()
+		end,
+	})
+
+	aimTab:CreateSection({ Name = "POWER" })
+	reg("qb_powerassist", "powerAssist")
+	aimTab:CreateToggle({
+		Name = "power assist",
+		Description = "sets ThrowController.PowerAssist to 1, the controller's own ideal-speed assist.",
+		Flag = "qb_powerassist",
+		Value = CFG.powerAssist,
+		Callback = function(v)
+			CFG.powerAssist = v
+			applyPower()
+			saveCfg()
+		end,
+	})
+	reg("qb_powerboost", "powerBoost")
+	aimTab:CreateToggle({
+		Name = "rank override",
+		Description = "reports accuracy 12 and power 99 to the throw controller. off by default; stronger than a real rank.",
+		Flag = "qb_powerboost",
+		Value = CFG.powerBoost,
+		Callback = function(v)
+			CFG.powerBoost = v
+			applyPower()
+			saveCfg()
+		end,
+	})
+	reg("qb_cap", "speedCap")
+	aimTab:CreateSlider({
+		Name = "speed cap",
+		Description = "hard ceiling on solved throw speed. 110 is the game's own maximum.",
+		Range = { 62, 130 },
+		Increment = 1,
+		Value = CFG.speedCap,
+		Suffix = " studs/s",
+		Flag = "qb_cap",
+		Callback = function(v)
+			CFG.speedCap = v
+			saveCfg()
+		end,
+	})
+
+	aimTab:CreateSection({ Name = "FILTER" })
+	reg("qb_range", "maxDistance")
+	aimTab:CreateSlider({
+		Name = "max distance",
+		Range = { 40, 300 },
+		Increment = 5,
+		Value = CFG.maxDistance,
+		Suffix = " st",
+		Flag = "qb_range",
+		Callback = function(v)
+			CFG.maxDistance = v
+			saveCfg()
+		end,
+	})
+	reg("qb_gap", "minGap")
+	aimTab:CreateSlider({
+		Name = "open threshold",
+		Description = "separation, in studs, that counts as open. below this a receiver is marked cut.",
+		Range = { 0, 20 },
+		Increment = 0.5,
+		Value = CFG.minGap,
+		Suffix = " st",
+		Flag = "qb_gap",
+		Callback = function(v)
+			CFG.minGap = v
+			saveCfg()
+		end,
+	})
+	reg("qb_angle", "assistAngle")
+	aimTab:CreateSlider({
+		Name = "assist cone",
+		Description = "how wide the game's own snap cone is while aim snap is on.",
+		Range = { 12, 90 },
+		Increment = 1,
+		Value = CFG.assistAngle,
+		Suffix = " deg",
+		Flag = "qb_angle",
+		Callback = function(v)
+			CFG.assistAngle = v
+			if assistOrig then
+				TCfg.AssistAngle = v
+			end
+			saveCfg()
+		end,
+	})
+
+	-- TARGETS
+	local visTab = w:CreateTab({ Name = "TARGETS" })
+	visTab:CreateSection({ Name = "OVERLAY" })
+	reg("qb_esp", "esp")
+	visTab:CreateToggle({
+		Name = "receiver markers",
+		Flag = "qb_esp",
+		Value = CFG.esp,
+		Callback = function(v)
+			CFG.esp = v
+			if not v then
+				clearVisuals()
+			end
+			saveCfg()
+		end,
+	})
+	reg("qb_ring", "ring")
+	visTab:CreateToggle({
+		Name = "catch ring",
+		Flag = "qb_ring",
+		Value = CFG.ring,
+		Callback = function(v)
+			CFG.ring = v
+			saveCfg()
+		end,
+	})
+	reg("qb_labels", "labels")
+	visTab:CreateToggle({
+		Name = "labels",
+		Flag = "qb_labels",
+		Value = CFG.labels,
+		Callback = function(v)
+			CFG.labels = v
+			saveCfg()
+		end,
+	})
+	reg("qb_arc", "arc")
+	visTab:CreateToggle({
+		Name = "flight arc",
+		Description = "draws the solved trajectory and a landing marker.",
+		Flag = "qb_arc",
+		Value = CFG.arc,
+		Callback = function(v)
+			CFG.arc = v
+			if not v then
+				for _, p in ipairs(arcPool) do
+					p.Transparency = 1
+				end
+			end
+			saveCfg()
+		end,
+	})
+	reg("qb_defline", "defLines")
+	visTab:CreateToggle({
+		Name = "nearest defender",
+		Description = "line from the catch point to the closest defender.",
+		Flag = "qb_defline",
+		Value = CFG.defLines,
+		Callback = function(v)
+			CFG.defLines = v
+			saveCfg()
+		end,
+	})
+	reg("qb_hud", "hud")
+	visTab:CreateToggle({
+		Name = "hud",
+		Flag = "qb_hud",
+		Value = CFG.hud,
+		Callback = function(v)
+			CFG.hud = v
+			saveCfg()
+		end,
+	})
+
+	-- AUTO
+	local autoTab = w:CreateTab({ Name = "AUTO" })
+	autoTab:CreateSection({ Name = "THROW" })
+	reg("qb_autothrow", "autoThrow")
+	autoTab:CreateToggle({
+		Name = "auto throw",
+		Description = "clicks your own throw button to charge and release when a receiver is open. needs the Roblox window focused.",
+		Flag = "qb_autothrow",
+		Value = CFG.autoThrow,
+		Callback = function(v)
+			CFG.autoThrow = v
+			autoAt = 0
+			saveCfg()
+		end,
+	})
+	reg("qb_delay", "autoDelay")
+	autoTab:CreateSlider({
+		Name = "hold time",
+		Description = "how long the throw charges before the release click. the solver makes the result independent of the charge.",
+		Range = { 0.15, 1.2 },
+		Increment = 0.05,
+		Value = CFG.autoDelay,
+		Suffix = " s",
+		Flag = "qb_delay",
+		Callback = function(v)
+			CFG.autoDelay = v
+			saveCfg()
+		end,
+	})
+	reg("qb_respectui", "respectUi")
+	autoTab:CreateToggle({
+		Name = "respect open menus",
+		Description = "stops auto throw while the game reports a UI panel open.",
+		Flag = "qb_respectui",
+		Value = CFG.respectUi,
+		Callback = function(v)
+			CFG.respectUi = v
+			saveCfg()
+		end,
+	})
+	autoTab:CreateButton({
+		Name = "throw now",
+		Description = "one click: starts the charge if idle, releases it if already charging.",
+		Callback = function()
+			releaseNow()
+		end,
+	})
+	autoTab:CreateButton({
+		Name = "cycle target",
+		Callback = function()
+			if #targetList > 0 then
+				cycle = (cycle % #targetList) + 1
+			end
+		end,
+	})
+	autoTab:CreateButton({
+		Name = "back to auto pick",
+		Callback = function()
+			cycle = 0
+		end,
+	})
+
+	-- INFO
+	local infoTab = w:CreateTab({ Name = "INFO" })
+	ui.status = infoTab:CreateText({ Name = "state", Text = "starting" })
+	infoTab:CreateButton({
+		Name = "print probe",
+		Callback = function()
+			local api = _G.SlimQbAim
+			if api and api.probe then
+				print("[QBAIM]\n" .. api.probe())
+			end
+		end,
+	})
+	infoTab:CreateButton({
+		Name = "reset stats",
+		Callback = function()
+			stats.throws = 0
+			stats.aimed = 0
+			stats.auto = 0
+			stats.missed = 0
+		end,
+	})
+	infoTab:CreateButton({
+		Name = "panic  (P)",
+		Description = "removes every hook, restores the controller fields and clears the overlay.",
+		Callback = function()
+			if _G.SlimQbAim and _G.SlimQbAim.panic then
+				_G.SlimQbAim.panic()
+			end
+		end,
+	})
+	infoTab:CreateButton({
+		Name = "unload",
+		Callback = function()
+			if _G.SlimQbAim and _G.SlimQbAim.stop then
+				_G.SlimQbAim.stop()
+			end
+		end,
+	})
+
+	return true
+end
+
+--// status --------------------------------------------------------------------
+
+local function probe()
+	local e = pick
+	local rows = {
+		"place=" .. tostring(game.PlaceId),
+		"throwController=" .. tostring(TC ~= nil),
+		"ballController=" .. tostring(BC ~= nil),
+		"throwConfig=" .. tostring(TCfg ~= nil),
+		"launchHook=" .. tostring(hooks.launch == true),
+		"snap=" .. tostring(hooks.snap == true),
+		"powerAssist=" .. tostring(hooks.powerSaved == true),
+		"rankOverride=" .. tostring(hooks.rankSaved == true),
+		"receivers=" .. tostring(#targetList),
+		"pick=" .. (e and (e.name .. " " .. string.format("%.1f st", e.dist)) or "nil"),
+		"throws=" .. tostring(stats.throws),
+		"aimed=" .. tostring(stats.aimed),
+		"auto=" .. tostring(stats.auto),
+		"skipped=" .. tostring(stats.missed),
+	}
+	return table.concat(rows, "\n")
+end
+
+--// boot ----------------------------------------------------------------------
+
+buildHud()
+ensureMarkers()
+
+local bootCfg = {}
+for k, v in pairs(CFG) do
+	bootCfg[k] = v
+end
+
+setEnabled(CFG.enabled)
+buildUI()
+
+-- Rayfield replays its own saved flags while creating elements, which fires the
+-- callbacks and can silently override the values we just loaded. put the boot
+-- snapshot back, then push it into the UI so the controls match.
+for k, v in pairs(bootCfg) do
+	CFG[k] = v
+end
+syncUi()
+setEnabled(CFG.enabled)
+
+local function panic()
+	CFG.enabled = false
+	CFG.autoThrow = false
+	CFG.esp = false
+	CFG.arc = false
+	CFG.defLines = false
+	CFG.snap = false
+	restoreAll()
+	clearVisuals()
+	syncUi()
+	saveCfg()
+	print("[QBAIM] panic - hooks removed, controller fields restored, overlay cleared")
+end
+
+local function shutdown()
+	if dead then
+		return
+	end
+	dead = true
+	restoreAll()
+	clearVisuals()
+	if ui.window then
+		pcall(function()
+			ui.window:Unload()
+		end)
+	end
+	if hudGui then
+		hudGui:Destroy()
+	end
+	if fxFolder then
+		fxFolder:Destroy()
+	end
+	pcall(function()
+		RunService:UnbindFromRenderStep(TAG)
+	end)
+	saveCfg()
+	_G.SlimQbAim = nil
+	print("[QBAIM] unloaded")
+end
+
+_G.SlimQbAim = {
+	cfg = CFG,
+	stats = stats,
+	pick = function()
+		return pick
+	end,
+	list = function()
+		return targetList
+	end,
+	probe = probe,
+	throw = releaseNow,
+	cycle = function(n)
+		cycle = tonumber(n) or 0
+	end,
+	panic = panic,
+	stop = shutdown,
+	apply = function()
+		setEnabled(CFG.enabled)
+	end,
+}
+
+--// input ---------------------------------------------------------------------
+
+UserInputService.InputBegan:Connect(function(input, gpe)
+	if dead or gpe then
+		return
+	end
+	local kc = input.KeyCode
+	if kc == Enum.KeyCode.RightShift then
+		setEnabled(not CFG.enabled)
+		syncUi()
+	elseif kc == Enum.KeyCode.G then
+		CFG.autoTarget = not CFG.autoTarget
+		if CFG.autoTarget then
+			cycle = 0
+		end
+		syncUi()
+		saveCfg()
+	elseif kc == Enum.KeyCode.F then
+		if #targetList > 0 then
+			cycle = (cycle % #targetList) + 1
+		end
+	elseif kc == Enum.KeyCode.H then
+		CFG.esp = not CFG.esp
+		CFG.arc = CFG.esp
+		if not CFG.esp then
+			clearVisuals()
+		end
+		syncUi()
+		saveCfg()
+	elseif kc == Enum.KeyCode.T then
+		CFG.autoThrow = not CFG.autoThrow
+		autoAt = 0
+		syncUi()
+		saveCfg()
+	elseif kc == Enum.KeyCode.E then
+		releaseNow()
+	elseif kc == Enum.KeyCode.P then
+		panic()
+	end
+end)
+
+--// loop ----------------------------------------------------------------------
+
+RunService:BindToRenderStep(TAG, Enum.RenderPriority.Camera.Value + 2, function()
+	if dead then
+		return
+	end
+	local now = os.clock()
+	if now - lastBuild >= 0.05 then
+		lastBuild = now
+		build(now)
+	end
+	if CFG.enabled then
+		drawVisuals()
+		drawArc()
+		drawDefLine()
+		autoThrowStep(now)
+	else
+		clearVisuals()
+	end
+	updateHud(now)
+
+	if ui.status and now - lastStatus >= 0.4 then
+		lastStatus = now
+		pcall(function()
+			ui.status:Set(string.format(
+				"%s\nreceivers %d\n%s",
+				statusLine,
+				#targetList,
+				pick and (pick.name .. "  " .. string.format("%.0f st", pick.dist)) or "no target"
+			))
+		end)
+	end
+end)
+
+print("[QBAIM] loaded - RightShift on/off | F cycle | G auto | H visuals | T auto throw | E throw | P panic")
 end
 
 --// embedded suite: taf_bypass  (from taf_bypass.luau) =========================
