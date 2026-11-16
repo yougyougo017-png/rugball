@@ -52,7 +52,7 @@ Hub.ORDER = {
 	{ place = 82886081053523, label = "TRACK & FIELD",     suites = { "track" } },
 	{ place = 14315258385,    label = "RSS STREET SOCCER", suites = { "rss" } },
 	{ place = 124780003623150, label = "REALISTIC RAGDOLL MMA", suites = { "mma" } },
-	{ place = 101880234193261, label = "CAR SOCCER", suites = { "carsoccer" } },
+	{ place = 101880234193261, label = "CAR SOCCER",       suites = { "carsoccer" } },
 }
 
 Hub.GAMES = {}
@@ -102,7 +102,7 @@ function Hub.runAll(list)
 	end
 end
 
---// embedded suite: football  (from football-panel.luau) =========================
+--// embedded suite: football  (from football.luau) =========================
 Hub.SUITE.football = function()
 --[[
 	RUGBALL PANEL -- Rugball / football (place 81469298413354)
@@ -4586,7 +4586,7 @@ else
 end
 end
 
---// embedded suite: anime  (from anime-panel.luau) =========================
+--// embedded suite: anime  (from anime.luau) =========================
 Hub.SUITE.anime = function()
 --[[
 	ANIME PANEL -- Build An Anime Character (place 124617195142196)
@@ -5325,7 +5325,7 @@ else
 end
 end
 
---// embedded suite: nba  (from nba-panel.luau) =========================
+--// embedded suite: nba  (from nba.luau) =========================
 Hub.SUITE.nba = function()
 --[[
 	NBA: HEROES SUITE -- court panel for the official NBA 3v3 experience
@@ -6534,7 +6534,7 @@ else
 end
 end
 
---// embedded suite: swish  (from swish-panel.luau) =========================
+--// embedded suite: swish  (from swish.luau) =========================
 Hub.SUITE.swish = function()
 --[[
 	SWISH -- auto perfect        basketball (place 126424052816775)
@@ -7244,7 +7244,7 @@ if not uiReady then
 end
 end
 
---// embedded suite: duels  (from basketball-duels-script.luau) =========================
+--// embedded suite: duels  (from duels.luau) =========================
 Hub.SUITE.duels = function()
 --[[
 	BASKETBALL DUELS -- one-file script for the game you're in right now
@@ -7916,7 +7916,7 @@ else
 end
 end
 
---// embedded suite: qb_aimbot  (from qb-aimbot.luau) =========================
+--// embedded suite: qb_aimbot  (from qb_aimbot.luau) =========================
 Hub.SUITE.qb_aimbot = function()
 --[[
 	QB AIMBOT -- Throw A Football (place 125942529011157)
@@ -8428,7 +8428,7 @@ _G.SlimQBAimState = { stop = shutdown, cfg = CONFIG, stats = stats }
 print("[QBAim] loaded - RightShift toggle | F cycle receiver | G aim lock | H esp | E force release")
 end
 
---// embedded suite: taf_bypass  (from taf-anticheat-bypass.luau) =========================
+--// embedded suite: taf_bypass  (from taf_bypass.luau) =========================
 Hub.SUITE.taf_bypass = function()
 --[[
 	TAF anti-cheat bypass -- Throw A Football / Drive Duels family
@@ -8599,7 +8599,7 @@ if not uiOk then warn("[SlimTaf] rayfield failed to load - running headless") en
 _G.SlimTafBypass = { cfg = CFG, stats = stats, install = install, uninstall = uninstall, stop = shutdown }
 end
 
---// embedded suite: physbox  (from physbox-panel.luau) =========================
+--// embedded suite: physbox  (from physbox.luau) =========================
 Hub.SUITE.physbox = function()
 -- PhysBox (HitBout) | CORNER - combo king autopilot, full power, inf stamina, ESP
 -- place 96120449121277 | Rayfield Gen2 | replace-not-stack via _G.PhysBoxCorner
@@ -9459,7 +9459,7 @@ print("[Corner] panel loaded - combo-king auto play, full power, dodges, anti-cr
 	.. (drawingOK and "" or " | Drawing unavailable - ESP off"))
 end
 
---// embedded suite: tps  (from tps-panel.luau) =========================
+--// embedded suite: tps  (from tps.luau) =========================
 Hub.SUITE.tps = function()
 -- TPS: Street Soccer | STREET - auto shot, auto tackle, auto GK save, auto pass, powers, ball ESP
 -- places 335760407 + 75703135112691 | Rayfield Gen2 | replace-not-stack via _G.TpsStreetPanel
@@ -10066,7 +10066,7 @@ print("[Street] panel loaded - auto shot, tackles, GK saves, passes, powers, bal
 	.. (remotePaths() and "ok" or "missing (lobby place?)"))
 end
 
---// embedded suite: track  (from track-panel.luau) =====================
+--// embedded suite: track  (from track.luau) =========================
 Hub.SUITE.track = function()
 -- Track & Field Legends | auto race + auto field timing
 -- place 82886081053523 | Rayfield Gen2 | replace-not-stack via _G.TrackFieldPanel
@@ -10852,8 +10852,7 @@ _G.TrackFieldPanel = {
 print(string.format("[TRACK] panel loaded - auto race/field, dip %.3f, start %.3f | %s", CFG.dipOffset, CFG.startOffset, CFG.joinMode))
 end
 
-
---// embedded suite: rss  (from rss-panel.luau) =========================
+--// embedded suite: rss  (from rss.luau) =========================
 Hub.SUITE.rss = function()
 -- Realistic Street Soccer | STREET - auto shot (the game's own curve + kick anims),
 -- auto pass, auto tackle, auto header, auto GK dive, auto grab, auto crossover,
@@ -12651,10 +12650,13 @@ print("[RSS] panel loaded - auto play, curve shots, pass, tackle, header, GK div
 	.. (amPlaying() and (amKeeper() and " | keeper" or " | field") or " | spectating (join Home/Away)"))
 end
 
---// embedded suite: mma  (from mma-panel.luau) =========================
+--// embedded suite: mma  (from mma.luau) =========================
 Hub.SUITE.mma = function()
 -- Realistic Ragdoll MMA | max-mode fight panel
 -- place 124780003623150 | Rayfield Gen2 | replace-not-stack via _G.RagdollMmaPanel
+--
+-- AUTO | full match is one switch: every fight and ground auto is treated as
+-- on. off, the individual toggles go back to being the only thing that runs.
 --
 -- this game is a client-authoritative boxing sim: damage, contact and knockdowns are
 -- all resolved on the client from its own Match/Fighter state. so there is nothing to
@@ -12674,6 +12676,9 @@ Hub.SUITE.mma = function()
 local prev = _G.RagdollMmaPanel
 local CFG = (prev and prev.cfg) or {}
 for k, v in pairs({
+	autoMaster = false,
+	retreatStamina = 24,
+	finishPush = true,
 	autoFight = false,
 	autoAim = true,
 	aimZone = "head",
@@ -12701,6 +12706,14 @@ if prev and prev.stop then
 	pcall(prev.stop)
 end
 _G.RagdollMmaPanel = { cfg = CFG }
+
+-- master switch: with autoMaster on, every auto below behaves as if its own
+-- toggle were on, so one switch plays a whole match. the individual toggles
+-- keep their own state and take over again the moment the master goes off.
+local function autoOn(key)
+	if CFG.autoMaster then return true end
+	return CFG[key] == true
+end
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -13015,7 +13028,7 @@ local function scoreOption(entry, isTop, gnd)
 	local action = entry[1]
 	local target = entry[2]
 	if action == "sub" then
-		if not CFG.autoSub then return -1 end
+		if not autoOn("autoSub") then return -1 end
 		return 60 + (SUB_PREF[target] or 1) * 5
 	end
 	if action == "pass" then
@@ -13073,14 +13086,27 @@ local function fightTick(m)
 	if p.down or o.down or p.rig.ragdolled or o.rig.ragdolled then return end
 	if m.gnd or m.drive then return end
 
-	if CFG.autoAim then
+	if autoOn("autoAim") then
 		aimAt(m, CFG.aimZone)
 	end
 
 	local delta = flat(o.pos - p.pos)
 	local dist = delta.Magnitude
 	local reach = (p.d and p.d.reach or 1.1) + 0.75 * (p.s or 1)
+
+	-- read the fight: are they hurt enough to press, or are we too tired to trade
+	local headHp = (o.hp and o.hp.head) or 100
+	local hurt = (o.rockedT or 0) > 0 or headHp < 26 or o.stamina < 20
+	local gassed = p.stamina < math.max(6, CFG.retreatStamina)
+	local pressing = CFG.finishPush and hurt and not gassed
+
 	local want = reach * (0.60 + 0.55 * (CFG.aggro / 100))
+	if pressing then
+		want = reach * 0.52          -- walk onto the finish instead of trading at range
+	end
+	if gassed then
+		want = reach * 1.55          -- back out and breathe, let them walk onto a counter
+	end
 
 	local fwd, side = 0, 0
 	if dist > want + 0.05 then
@@ -13090,17 +13116,17 @@ local function fightTick(m)
 	end
 	-- small orbit so the AI cannot just line us up, and so we stay off the fence
 	local t = now()
-	side = math.sin(t * 1.3) * 0.25
+	side = math.sin(t * 1.3) * (gassed and 0.55 or 0.25)
 	setMove(Vector3.new(side, 0, fwd))
 
 	local threat = false
-	if CFG.autoBlock then
+	if autoOn("autoBlock") then
 		threat = incomingStrike(m)
 	end
-	setBlock(threat ~= false)
+	setBlock(threat ~= false and not pressing)
 
-	local allowStrike = (not CFG.autoBlock) or (not threat) or (not CFG.autoCounter)
-	if allowStrike and dist <= reach * 1.0 and now() - lastTry > 0.09 then
+	local allowStrike = pressing or (not autoOn("autoBlock")) or (not threat) or (not autoOn("autoCounter"))
+	if allowStrike and not gassed and dist <= reach * 1.0 and now() - lastTry > 0.09 then
 		local move = pickStrike(m, dist, reach)
 		if canThrow(p, move) then
 			lastTry = now()
@@ -13108,7 +13134,7 @@ local function fightTick(m)
 		end
 	end
 
-	if CFG.autoTakedown and now() - lastTakedown > 0.55 and p.stamina >= CFG.takedownStamina then
+	if autoOn("autoTakedown") and now() - lastTakedown > 0.55 and p.stamina >= CFG.takedownStamina then
 		local ok, can = pcall(function() return m:canShoot(p) end)
 		local shootRange = 3.4 * ((p.s or 1) + (o.s or 1)) / 2
 		local pressured = (o.rockedT or 0) > 0 or o.stamina < 35 or (o.hp.head < 35) or math.random() < 0.02
@@ -13161,7 +13187,7 @@ local function groundTick(m)
 		return
 	end
 
-	if not CFG.autoGround then return end
+	if not autoOn("autoGround") then return end
 
 	-- top: ground and pound, and climb / submit when the moment is right
 	if top then
@@ -13192,7 +13218,7 @@ local function groundTick(m)
 			if index then
 				if action == "rev" and p.stamina > 34 then
 					fire = true
-				elseif action == "sub" and CFG.autoSub and p.stamina > 34 and math.random() < 0.45 then
+				elseif action == "sub" and autoOn("autoSub") and p.stamina > 34 and math.random() < 0.45 then
 					fire = true
 				elseif action == "up" and math.random() < 0.6 then
 					fire = true
@@ -13215,7 +13241,7 @@ local function driveTick(m)
 	if not drv or m.finish then return end
 	local p = m.player
 	if drv.att ~= p and drv.def ~= p then return end
-	if not CFG.autoSprawl then return end
+	if not autoOn("autoSprawl") then return end
 	local gap = 1 / math.max(1, CFG.pressRate)
 	if now() - lastSprawl >= gap then
 		lastSprawl = now()
@@ -13224,7 +13250,7 @@ local function driveTick(m)
 end
 
 local function skipTick()
-	if not CFG.autoSkip then return end
+	if not autoOn("autoSkip") then return end
 	if match and match.finish then return end
 	if now() - lastSkip < 0.35 then return end
 	if Cinema and Cinema.skippable then
@@ -13758,6 +13784,30 @@ local function buildUI()
 	-- FIGHT
 	ui.card = fightTab:CreateText({ name = "state  |  idle", text = "no match captured" })
 	fightTab:CreateToggle({
+		name = "AUTO  |  full match",
+		description = "one switch for the whole fight: aim, block, counters, strikes, takedowns, ground, submissions, sprawl and skip all behave as on. individual toggles keep their own state and take over again the moment this goes off.",
+		flag = "mma_autoMaster",
+		value = CFG.autoMaster,
+		callback = function(v) CFG.autoMaster = v end,
+	})
+	fightTab:CreateSlider({
+		name = "retreat stamina",
+		description = "below this stamina the fighter stops trading, backs out to kicking range and waits to recover instead of standing in the pocket.",
+		flag = "mma_retreatStamina",
+		range = { 8, 50 },
+		increment = 1,
+		value = CFG.retreatStamina,
+		suffix = "%",
+		callback = function(v) CFG.retreatStamina = v end,
+	})
+	fightTab:CreateToggle({
+		name = "finish push",
+		description = "when the opponent is rocked, head-hurt or gassed, close onto short range and throw through the guard instead of trading at distance.",
+		flag = "mma_finishPush",
+		value = CFG.finishPush,
+		callback = function(v) CFG.finishPush = v end,
+	})
+	fightTab:CreateToggle({
 		name = "auto fight",
 		description = "picks a strike from range and stamina, holds the right distance, and fires it with Match:playerStrike. everything is the game's own strike path.",
 		flag = "mma_autoFight",
@@ -14092,7 +14142,7 @@ local function tick()
 			status = "match  |  " .. tostring(m.state) .. (m.controls and "" or "  |  waiting")
 		end
 		pcall(watch, m)
-		if CFG.autoFight then pcall(fightTick, m) end
+		if autoOn("autoFight") then pcall(fightTick, m) end
 		pcall(groundTick, m)
 		pcall(driveTick, m)
 		if not CFG.autoFight and not CFG.autoGround and not CFG.autoSprawl then
@@ -14154,10 +14204,9 @@ _G.RagdollMmaPanel = {
 		return false
 	end,
 }
-
 end
 
---// embedded suite: carsoccer  (from carsoccer-panel.luau) =========================
+--// embedded suite: carsoccer  (from carsoccer.luau) =========================
 Hub.SUITE.carsoccer = function()
 -- CarSoccer | PILOT - client-sim autopilot, ball path ESP, speed/boost readout
 -- place 101880234193261 | Rayfield Gen2 | replace-not-stack via _G.CarSoccer
@@ -14695,7 +14744,6 @@ _G.CarSoccer = { cfg = CFG, stop = shutdown, panic = panic }
 local status = (MatchSession and "hooks armed - waiting for a match" or "MatchSession not found - pilot disabled")
 	.. (drawingOK and "" or " | Drawing unavailable - ESP off")
 print("[CarPilot] panel loaded - autopilot, ball path ESP, speed readout | " .. status)
-
 end
 
 --// dispatch -------------------------------------------------------------------
