@@ -12691,6 +12691,11 @@ for k, v in pairs({
 	autoSprawl = true,
 	pressRate = 12,
 	autoSkip = true,
+	autoQueue = false,
+	autoContinue = true,
+	queueDelay = 6,
+	autoBest = false,
+	autoExec = false,
 	aggro = 60,
 	staminaFloor = 20,
 	strikeStyle = "smart",
@@ -12702,6 +12707,53 @@ for k, v in pairs({
 }) do
 	if CFG[k] == nil then CFG[k] = v end
 end
+-- settings survive a teleport: the loader re-runs the panel on the next join, so
+-- the switches people actually keep are written next to the script and read
+-- back on load. every executor names its folder differently, so it is
+-- best-effort and never fatal.
+local CFG_FILE = "slimhub-mma.cfg"
+
+local function loadCfg()
+	if not (isfile and readfile and isfile(CFG_FILE)) then return end
+	local ok, data = pcall(readfile, CFG_FILE)
+	if not ok or type(data) ~= "string" then return end
+	for line in string.gmatch(data, "[^\r\n]+") do
+		local k, v = string.match(line, "^([%w_]+)=(.*)$")
+		if k and CFG[k] ~= nil then
+			if v == "true" then
+				CFG[k] = true
+			elseif v == "false" then
+				CFG[k] = false
+			elseif tonumber(v) then
+				CFG[k] = tonumber(v)
+			else
+				CFG[k] = v
+			end
+		end
+	end
+end
+
+local savedCfg = ""
+local function saveCfg()
+	if not writefile then return end
+	local parts = {}
+	for k, v in pairs(CFG) do
+		local t = type(v)
+		if t == "boolean" or t == "number" or t == "string" then
+			table.insert(parts, k .. "=" .. tostring(v))
+		end
+	end
+	table.sort(parts)
+	local blob = table.concat(parts, "\n")
+	if blob == savedCfg then return end
+	savedCfg = blob
+	pcall(writefile, CFG_FILE, blob)
+end
+
+if not prev then
+	pcall(loadCfg)
+end
+
 if prev and prev.stop then
 	pcall(prev.stop)
 end
@@ -12798,6 +12850,263 @@ local notify = function(text)
 	print("[MMA] " .. tostring(text))
 end
 
+--// ranked automation -----------------------------------------------------------
+-- the ranked screen is the game's own UI. its buttons only carry Activated
+-- listeners, and firesignal is a silent no-op in this executor, so the listener
+-- itself is called: that is exactly the function a real click runs, which keeps
+-- the queue, the ticket and the RR result inside the game's own flow.
+
+local function onScreen(d)
+	local p = d
+	while p and p ~= game do
+		if p:IsA("ScreenGui") and not p.Enabled then return false end
+		if p:IsA("GuiObject") and not p.Visible then return false end
+		p = p.Parent
+	end
+	return true
+end
+
+local function buttons()
+	local pg = LP:FindFirstChild("PlayerGui")
+	local root = pg and (pg:FindFirstChild("ROFC_UI") or pg)
+	local out = {}
+	if not root then return out end
+	for _, d in ipairs(root:GetDescendants()) do
+		if d:IsA("GuiButton") and onScreen(d) then
+			table.insert(out, d)
+		end
+	end
+	return out
+end
+
+local function labelOf(b)
+	if b:IsA("TextButton") and b.Text ~= "" then return b.Text end
+	for _, c in ipairs(b:GetDescendants()) do
+		if c:IsA("TextLabel") and c.Text ~= "" then return c.Text end
+	end
+	return ""
+end
+
+local function press(b)
+	for _, sig in ipairs({ b.Activated, b.MouseButton1Click }) do
+		local ok, conns = pcall(getconnections, sig)
+		if ok and type(conns) == "table" then
+			for _, c in ipairs(conns) do
+				if c.Function then
+					local okc, err = pcall(c.Function)
+					return okc, err
+				end
+			end
+		end
+	end
+	return false, "no click handler"
+end
+
+local function findButton(names, texts)
+	local list = buttons()
+	for _, b in ipairs(list) do
+		for _, n in ipairs(names) do
+			if b.Name == n then return b end
+		end
+	end
+	for _, b in ipairs(list) do
+		local t = string.upper(labelOf(b))
+		for _, s in ipairs(texts) do
+			if t:find(s, 1, true) then return b end
+		end
+	end
+	return nil
+end
+
+local QUEUE_NAMES = { "Btn_PLAYAGAIN", "Btn_PlayAgain", "Btn_FINDMATCH", "Btn_FindMatch", "Btn_Queue", "Btn_QUEUE" }
+local QUEUE_TEXT = { "PLAY AGAIN", "FIND MATCH", "FIND A MATCH" }
+local RANKED_PLAY_NAMES = { "Btn_PLAY", "Btn_Play" }
+local RANKED_PLAY_TEXT = { "PLAY" }
+local CANCEL_NAMES = { "Btn_CANCEL", "Btn_CancelQueue", "Btn_Cancel" }
+local CONTINUE_NAMES = { "Btn_CONTINUE", "Btn_Continue" }
+local CONTINUE_TEXT = { "CONTINUE" }
+local RANKED_NAMES = { "Btn_RANKED", "Btn_Ranked", "Btn_RANKEDMODE" }
+local RANKED_TEXT = { "RANKED" }
+
+local queue = { last = "idle  |  auto queue off", nextTry = 0, nextNav = 0, pressedAt = 0, tries = 0 }
+
+local function queueTick()
+	if dead or not CFG.autoQueue then
+		queue.last = "idle  |  auto queue off"
+		return
+	end
+	local t = now()
+	if t < queue.nextTry then return end
+	queue.nextTry = t + 0.5
+
+	-- a live match needs nothing from us
+	if match and not match.closed and match.state ~= "ended" and not match.finish then
+		queue.pressedAt = 0
+		queue.last = "in match  |  round " .. tostring(match.round or 1)
+		return
+	end
+
+	-- result screens: one press moves on to the ranked screen
+	if CFG.autoContinue then
+		local cont = findButton(CONTINUE_NAMES, CONTINUE_TEXT)
+		if cont then
+			local ok = press(cont)
+			queue.pressedAt = 0
+			queue.last = ok and "result screen  |  continue" or "result screen  |  continue failed"
+			queue.nextTry = t + 1.2
+			return
+		end
+	end
+
+	-- cancel a queue that never found a match, then try again
+	if queue.pressedAt > 0 and t - queue.pressedAt > 14 then
+		local cancel = findButton(CANCEL_NAMES, { "CANCEL" })
+		if cancel then
+			pcall(press, cancel)
+			queue.last = "queue timed out  |  cancelled"
+		else
+			queue.last = "queue timed out  |  retrying"
+		end
+		queue.pressedAt = 0
+		queue.nextTry = t + 1
+		return
+	end
+
+	local play = findButton(QUEUE_NAMES, QUEUE_TEXT)
+	if not play then
+		-- the ranked screen's own PLAY is the queue button; the lobby's PLAY
+		-- starts a casual bout, so it only counts once the ranked tabs are up
+		local rankedUp = findButton({ "Btn_BACKTOLOBBY", "Btn_TabOVERVIEW" }, { "BACK TO LOBBY", "OVERVIEW" })
+		if rankedUp then
+			play = findButton(RANKED_PLAY_NAMES, RANKED_PLAY_TEXT)
+		end
+	end
+	if play then
+		local ok, err = press(play)
+		queue.tries = queue.tries + 1
+		queue.pressedAt = ok and t or 0
+		queue.last = ok and ("queued  |  try " .. queue.tries) or ("queue press failed  |  " .. tostring(err))
+		pushLog("queue press " .. (ok and "sent" or "failed"))
+		queue.nextTry = t + (tonumber(CFG.queueDelay) or 6)
+		return
+	end
+
+	-- not on the ranked screen: open it from the lobby
+	if t >= queue.nextNav then
+		local nav = findButton(RANKED_NAMES, RANKED_TEXT)
+		if nav then
+			queue.nextNav = t + 3
+			local ok = press(nav)
+			queue.last = ok and "opening ranked" or "ranked button failed"
+			return
+		end
+	end
+	queue.last = "idle  |  no ranked screen"
+end
+
+--// best config -----------------------------------------------------------------
+-- one preset that plays the whole match: pressure without gassing, head hunting,
+-- ground and submissions on. it bends a little around the opponent's style so a
+-- wrestler is fought at range and a kicker is crowded instead.
+
+local BEST = {
+	autoMaster = true,
+	aimZone = "head",
+	strikeStyle = "smart",
+	aggro = 72,
+	staminaFloor = 16,
+	retreatStamina = 30,
+	finishPush = true,
+	pressRate = 14,
+	takedownStamina = 45,
+	autoSkip = true,
+	autoFight = true,
+	autoAim = true,
+	autoBlock = true,
+	autoCounter = true,
+	autoTakedown = true,
+	autoGround = true,
+	autoSub = true,
+	autoSprawl = true,
+}
+
+local GRAPPLERS = { wrestler = true, grappler = true, blackbelt = true, aikido = true, kravmaga = true, silat = true, bokh = true, shaolin = true, suikendo = true }
+local KICKERS = { muaythai = true, kickboxer = true, tkdmaster = true, capoeira = true, savate = true, dragon = true }
+local SLUGGERS = { power = true, slugger = true, brawler = true, onepunch = true }
+
+local function tuneTo(m)
+	local style = m and tostring(m.oppStyle or "") or ""
+	if GRAPPLERS[style] then
+		CFG.aggro = 55
+		CFG.retreatStamina = 34
+		CFG.takedownStamina = 60
+	elseif KICKERS[style] then
+		CFG.aggro = 82
+	elseif SLUGGERS[style] then
+		CFG.aggro = 58
+		CFG.staminaFloor = 24
+	end
+	local o = m and m.opp
+	local maxSt = o and tonumber(o.maxStamina)
+	if maxSt and maxSt < 70 then
+		CFG.aggro = math.max(CFG.aggro, 80)
+		CFG.staminaFloor = math.min(CFG.staminaFloor, 12)
+	end
+	return style
+end
+
+local function pushFlags()
+	if not ui.window then return end
+	pcall(function()
+		ui.window:Set("mma_autoMaster", CFG.autoMaster)
+		ui.window:Set("mma_aimZone", CFG.aimZone)
+		ui.window:Set("mma_strikeStyle", CFG.strikeStyle)
+		ui.window:Set("mma_aggro", CFG.aggro)
+		ui.window:Set("mma_staminaFloor", CFG.staminaFloor)
+		ui.window:Set("mma_retreatStamina", CFG.retreatStamina)
+		ui.window:Set("mma_finishPush", CFG.finishPush)
+		ui.window:Set("mma_pressRate", CFG.pressRate)
+		ui.window:Set("mma_takedownStamina", CFG.takedownStamina)
+		ui.window:Set("mma_autoSkip", CFG.autoSkip)
+		ui.window:Set("mma_autoFight", CFG.autoFight)
+		ui.window:Set("mma_autoAim", CFG.autoAim)
+		ui.window:Set("mma_autoBlock", CFG.autoBlock)
+		ui.window:Set("mma_autoCounter", CFG.autoCounter)
+		ui.window:Set("mma_autoTakedown", CFG.autoTakedown)
+		ui.window:Set("mma_autoGround", CFG.autoGround)
+		ui.window:Set("mma_autoSub", CFG.autoSub)
+		ui.window:Set("mma_autoSprawl", CFG.autoSprawl)
+	end)
+end
+
+local function applyBestCfg(reason)
+	for k, v in pairs(BEST) do CFG[k] = v end
+	local style = tuneTo(match)
+	pushFlags()
+	local text = "best cfg  |  " .. (reason or "manual") .. (style ~= "" and ("  |  vs " .. style) or "")
+	pushLog(text)
+	if ui.bestText then
+		pcall(function() ui.bestText:Set(text) end)
+	end
+end
+
+--// auto exec -------------------------------------------------------------------
+-- queue_on_teleport runs source after the next server join. pointing it at the
+-- loader means every teleport, including the game's own matchmaking hops, comes
+-- back with the hub already loaded and the saved cfg already restored.
+
+local LOADER = 'loadstring(game:HttpGet("https://raw.githubusercontent.com/yougyougo017-png/rugball/main/slimhub-loader.luau"))()'
+
+local function armAutoExec()
+	if not CFG.autoExec then return end
+	local enqueue = queue_on_teleport or queueonteleport
+	if not enqueue then return end
+	local ok = pcall(enqueue, LOADER)
+	if ok then
+		pushLog("auto exec armed  |  next join")
+	end
+end
+
 --// match capture ---------------------------------------------------------------
 
 local function isMatch(v)
@@ -12853,6 +13162,9 @@ local function adopt(m)
 	status = "match captured"
 	pushLog("match captured (round " .. tostring(m.round) .. ", " .. tostring(m.rounds) .. " rounds)")
 	notify("match captured")
+	if CFG.autoBest then
+		pcall(applyBestCfg, "match start")
+	end
 end
 
 local oldNew = Match.new
@@ -13777,6 +14089,7 @@ local function buildUI()
 
 	local fightTab = w:CreateTab({ name = "FIGHT" })
 	local groundTab = w:CreateTab({ name = "GROUND" })
+	local rankedTab = w:CreateTab({ name = "RANKED" })
 	local hudTab = w:CreateTab({ name = "HUD" })
 	local careerTab = w:CreateTab({ name = "CAREER" })
 	local sysTab = w:CreateTab({ name = "SYS" })
@@ -13895,6 +14208,66 @@ local function buildUI()
 		value = CFG.autoSkip,
 		callback = function(v) CFG.autoSkip = v end,
 	})
+
+	-- RANKED
+	ui.queueCard = rankedTab:CreateText({ name = "queue  |  idle", text = "auto queue off" })
+	rankedTab:CreateToggle({
+		name = "auto queue",
+		description = "presses the game's own PLAY AGAIN / FIND MATCH button whenever there is no fight, so a ranked bout starts by itself. the press runs the game's real click listener, ticket and RR result included.",
+		flag = "mma_autoQueue",
+		value = CFG.autoQueue,
+		callback = function(v)
+			CFG.autoQueue = v
+			queue.nextTry = 0
+			queue.tries = 0
+			queue.pressedAt = 0
+		end,
+	})
+	rankedTab:CreateToggle({
+		name = "auto continue",
+		description = "presses CONTINUE on the result and rank-up screens so the queue loop can start the next fight.",
+		flag = "mma_autoContinue",
+		value = CFG.autoContinue,
+		callback = function(v) CFG.autoContinue = v end,
+	})
+	rankedTab:CreateSlider({
+		name = "queue delay",
+		description = "seconds to wait after a queue press before trying again. the game takes a few seconds to hand back an opponent, so very low values just double-press.",
+		flag = "mma_queueDelay",
+		range = { 2, 20 },
+		increment = 1,
+		value = CFG.queueDelay,
+		suffix = "s",
+		callback = function(v) CFG.queueDelay = v end,
+	})
+	rankedTab:CreateSection({ name = "AUTO EXEC" })
+	rankedTab:CreateToggle({
+		name = "auto execute on join",
+		description = "queues the SLIMHUB loader to run after the next server join, so every new lobby comes back with the hub and this panel already loaded. needs an executor with queue_on_teleport (Real has it). the switch and your cfg are written to slimhub-mma.cfg, so it re-arms itself on every join.",
+		flag = "mma_autoExec",
+		value = CFG.autoExec,
+		callback = function(v)
+			CFG.autoExec = v
+			armAutoExec()
+		end,
+	})
+	rankedTab:CreateSection({ name = "BEST CFG" })
+	rankedTab:CreateToggle({
+		name = "auto best cfg",
+		description = "the moment a match is captured (including one already running when the panel loads) the winning preset is written into every fight setting and the master switch is turned on. this is the auto-execute part: it re-arms the whole panel for you on every ranked join.",
+		flag = "mma_autoBest",
+		value = CFG.autoBest,
+		callback = function(v)
+			CFG.autoBest = v
+			if v then applyBestCfg("toggled on") end
+		end,
+	})
+	rankedTab:CreateButton({
+		name = "apply best cfg now",
+		description = "writes the preset once, without leaving it armed for later matches.",
+		callback = function() applyBestCfg("manual") end,
+	})
+	ui.bestText = rankedTab:CreateText({ name = "preset", text = "head  |  smart  |  aggro 72  |  master on" })
 
 	-- GROUND
 	ui.groundCard = groundTab:CreateText({ name = "ground  |  idle", text = "no match captured" })
@@ -14018,13 +14391,16 @@ local function panic()
 	CFG.autoGround = false
 	CFG.autoSub = false
 	CFG.autoSprawl = false
+	CFG.autoQueue = false
+	CFG.autoBest = false
+	CFG.autoContinue = false
 	if match then
 		pcall(function()
 			match.debugMove = nil
 		end)
 	end
 	pcall(function() Touch.block = false end)
-	for _, flag in ipairs({ "mma_autoFight", "mma_autoAim", "mma_autoBlock", "mma_autoCounter", "mma_autoTakedown", "mma_autoGround", "mma_autoSub", "mma_autoSprawl" }) do
+	for _, flag in ipairs({ "mma_autoFight", "mma_autoAim", "mma_autoBlock", "mma_autoCounter", "mma_autoTakedown", "mma_autoGround", "mma_autoSub", "mma_autoSprawl", "mma_autoQueue", "mma_autoBest", "mma_autoContinue" }) do
 		if ui.window then pcall(function() ui.window:Set(flag, false) end) end
 	end
 	status = "panic  |  automation off"
@@ -14077,6 +14453,15 @@ local function syncUI()
 			ui.groundCard:Set(txt)
 		end)
 	end
+	if ui.queueCard then
+		pcall(function()
+			local txt = queue.last
+			if queue.tries > 0 then
+				txt = txt .. "  |  tries " .. queue.tries
+			end
+			ui.queueCard:Set(txt)
+		end)
+	end
 	if ui.sFights then pcall(function() ui.sFights:Set(stats.fights) end) end
 	if ui.sWins then pcall(function() ui.sWins:Set(stats.wins) end) end
 	if ui.sLosses then pcall(function() ui.sLosses:Set(stats.losses) end) end
@@ -14111,6 +14496,7 @@ end
 
 local lastSync = 0
 local lastHudWarn = 0
+local lastSave = 0
 
 local function tick()
 	if dead then return end
@@ -14155,6 +14541,7 @@ local function tick()
 		end
 	end
 	pcall(skipTick)
+	pcall(queueTick)
 	local okHud, hudErr = pcall(hudTick)
 	if not okHud and now() - lastHudWarn > 5 then
 		lastHudWarn = now()
@@ -14164,6 +14551,10 @@ local function tick()
 	if t - lastSync > 0.3 then
 		lastSync = t
 		pcall(syncUI)
+	end
+	if t - lastSave > 4 then
+		lastSave = t
+		pcall(saveCfg)
 	end
 end
 
@@ -14187,6 +14578,8 @@ end)
 resetWatch()
 refreshCareer()
 pushLog("panel loaded")
+pcall(armAutoExec)
+pcall(saveCfg)
 
 _G.RagdollMmaPanel = {
 	cfg = CFG,
@@ -14199,6 +14592,8 @@ _G.RagdollMmaPanel = {
 	getMatch = function() return match end,
 	scan = scanForMatch,
 	aim = aimAt,
+	applyBest = applyBestCfg,
+	queue = queue,
 	strike = function(move)
 		if match then return strikeAt(match, move or "jab", CFG.aimZone) end
 		return false
