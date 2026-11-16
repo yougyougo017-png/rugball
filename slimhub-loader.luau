@@ -33,6 +33,17 @@ local function fetch(url, tries)
 	return nil, lastErr
 end
 
+-- auto-exec runs the instant the join starts, when half the game has not
+-- replicated yet. wait for the load, then a beat, so the suites see a real
+-- ReplicatedStorage instead of bailing on the first FindFirstChild.
+if not game:IsLoaded() then
+	local okLoad = pcall(function() game.Loaded:Wait() end)
+	if not okLoad then
+		while not game:IsLoaded() do task.wait(0.2) end
+	end
+	task.wait(1.5)
+end
+
 banner("fetching hub")
 local src, err = fetch(HUB, 3)
 
