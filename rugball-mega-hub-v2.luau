@@ -13155,13 +13155,19 @@ end
 -- back with the hub already loaded and the saved cfg already restored.
 
 local LOADER = 'loadstring(game:HttpGet("https://raw.githubusercontent.com/yougyougo017-png/rugball/main/slimhub-loader.luau"))()'
+-- marker the loader reads to drop duplicate auto-exec runs (two panels can load
+-- in one server). a manual execute of the loader never carries it.
+local ARMED = 'getgenv().SLIMHUB_AUTOEXEC = true; ' .. LOADER
 
 local function armAutoExec()
 	if not CFG.autoExec then return end
 	local enqueue = queue_on_teleport or queueonteleport
 	if not enqueue then return end
-	local ok = pcall(enqueue, LOADER)
+	local genv = (getgenv and getgenv()) or _G
+	if genv.SLIMHUB_ARMED == game.JobId then return end
+	local ok = pcall(enqueue, ARMED)
 	if ok then
+		genv.SLIMHUB_ARMED = game.JobId
 		pushLog("auto exec armed  |  next join")
 	end
 end
