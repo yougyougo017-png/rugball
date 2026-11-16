@@ -23,8 +23,9 @@
 		101880234193261  Car Soccer              carsoccer
 		131576717722076  FD6 - Skyview           skyview
 
-	the taf bypass runs before the suites that need it, so its hooks are live
-	before any suite code touches the controllers.
+	the taf bypass suite still runs before football on Drive Duels. Throw A
+	Football now carries the same bypass inside qb_aimbot, so loading both there
+	would install the same hooks twice.
 
 	every suite keeps its own replace-not-stack teardown, its own _G key and
 	its own Rayfield window, so suites sharing a place (nba + swish on
@@ -46,7 +47,7 @@ Hub.ORDER = {
 	{ place = 126424052816775, label = "NBA HEROES",       suites = { "nba", "swish" } },
 	{ place = 122283827051026, label = "NBA HEROES V144",  suites = { "nba" } },
 	{ place = 134954408729617, label = "BASKETBALL DUELS", suites = { "duels" } },
-	{ place = 125942529011157, label = "THROW A FOOTBALL", suites = { "taf_bypass", "qb_aimbot" } },
+	{ place = 125942529011157, label = "THROW A FOOTBALL", suites = { "qb_aimbot" } },
 	{ place = 96120449121277,  label = "PHYSBOX HITBOUT",  suites = { "physbox" } },
 	{ place = 335760407,       label = "TPS STREET SOCCER", suites = { "tps" } },
 	{ place = 75703135112691, label = "TPS MATCH",         suites = { "tps" } },
@@ -7984,6 +7985,16 @@ if legacy and legacy.stop then
 end
 _G.SlimQBAimState = nil
 
+-- the aimbot now owns the bypass. if the standalone suite is already running
+-- (old hub build, manual load), take it down first so its hooks are not layered
+-- under ours and its panel does not sit next to this one.
+local prevAc = _G.TafAcBypass or _G.SlimTafBypass
+if prevAc and prevAc.stop then
+	pcall(prevAc.stop)
+end
+_G.TafAcBypass = nil
+_G.SlimTafBypass = nil
+
 --// config --------------------------------------------------------------------
 
 local DEFAULTS = {
@@ -8008,6 +8019,28 @@ local DEFAULTS = {
 	maxDistance = 300,
 	speedCap = 110,
 	lead = true,
+	-- anti-cheat bypass (MoveGuard + AnimGuard + movement)
+	closure = true,
+	block = true,
+	index = true,
+	anim = true,
+	animTracks = false,
+	admin = false,
+	inflate = false,
+	rootStep = false,
+	groundOnly = true,
+	stepExtra = 20,
+	infJump = false,
+	customJump = false,
+	jumpHeight = 20,
+	lowGravity = false,
+	gravity = 80,
+	walkSpeed = false,
+	walkSpeedValue = 30,
+	spoofWalk = 18,
+	spoofJumpPower = 50,
+	spoofJumpHeight = 7.2,
+	spoofGravity = 196.2,
 }
 
 local CFG = {}
@@ -8087,7 +8120,7 @@ local function sweepLegacy()
 			end)
 		end
 	end
-	for _, name in ipairs({ "QBAim", "QBAimRender", "SlimQBAim" }) do
+	for _, name in ipairs({ "QBAim", "QBAimRender", "SlimQBAim", "SlimQbAcWalkSpeed" }) do
 		pcall(function()
 			RunService:UnbindFromRenderStep(name)
 		end)
@@ -8103,7 +8136,7 @@ local LOCK_COLOR = Color3.fromRGB(255, 221, 35)
 
 local dead = false
 local inputConn = nil
-local ui = { flags = {}, window = nil, status = nil }
+local ui = { flags = {}, window = nil, status = nil, acState = nil, acCover = nil, acCounters = nil, acLogText = nil }
 local hooks = { launch = false, snap = false, powerSaved = false, rankSaved = false }
 local stats = { throws = 0, aimed = 0, auto = 0, lastSpeed = 0, missed = 0 }
 local pick = nil
@@ -8115,6 +8148,747 @@ local lastStatus = 0
 local nextClick = 0
 local autoAt = 0
 local statusLine = "starting"
+
+--// anti-cheat bypass ---------------------------------------------------------
+-- ported from the standalone taf_bypass suite so one script covers both jobs.
+-- five client-side layers, none of which replicate:
+--   closure  hookfunction on MoveGuard._check, the exact closure its loop calls
+--   registry fallback if the controller module path changes
+--   index    caps what game code reads for WalkSpeed/JumpPower/JumpHeight/Gravity
+--   namecall drops AntiCheatGuard before the report leaves the client
+--   anim     AnimWhitelist.allowed answers true, AnimTrackGuard.Prune stubbed
+-- movement is separate: DriveExtras rewrites WalkSpeed to 18 every frame, so
+-- root step moves the root part and direct speed re-writes WalkSpeed after it.
+
+local ac = {
+	reports = 0,
+	blocked = 0,
+	closures = 0,
+	reads = 0,
+	anim = 0,
+	prunes = 0,
+}
+
+local acEvents = {}
+local acLastEvent = 0
+local acLastRemote = 0
+local acLastGuard = 0
+local acLastApply = 0
+local acLastSync = 0
+local acDefensePending = false
+
+local acRemote = nil
+local acGuard = nil
+local acGuardSource = nil
+local acGuardOriginal = nil
+local acClosure = false
+local acIndexTarget = nil
+
+local acWhitelist = nil
+local acWhitelistOriginal = nil
+local acWhitelistHook = nil
+local acWhitelistOn = false
+local acTrackGuard = nil
+local acTrackOriginal = nil
+local acTrackHook = nil
+local acTrackOn = false
+local acWalkBound = false
+local acHeartbeat = nil
+local startAcTick
+
+local acSaved = {
+	admin = false,
+	adminValue = nil,
+	inflate = nil,
+	inflateHumanoid = nil,
+	jump = nil,
+	jumpHumanoid = nil,
+	gravity = nil,
+	walkSpeed = nil,
+	walkHumanoid = nil,
+}
+
+local function acLog(text)
+	if dead then return end
+	local now = os.clock()
+	if now - acLastEvent < 0.05 then return end
+	acLastEvent = now
+	table.insert(acEvents, 1, os.date("%H:%M:%S") .. "  " .. tostring(text))
+	while #acEvents > 12 do
+		table.remove(acEvents)
+	end
+end
+
+local function acNotify(text)
+	print("[QBAIM/AC] " .. tostring(text))
+	acLog(text)
+	if ui.window and ui.window.Notify then
+		pcall(function()
+			ui.window:Notify({ title = "QB // BYPASS", content = tostring(text), duration = 3 })
+		end)
+	end
+end
+
+local function currentHumanoid()
+	local ch = LP.Character
+	return ch and ch:FindFirstChildOfClass("Humanoid") or nil
+end
+
+local function refreshAcRemote()
+	local candidate = ReplicatedStorage:FindFirstChild("AntiCheatGuard")
+	if candidate and candidate:IsA("BaseRemoteEvent") then
+		acRemote = candidate
+	else
+		acRemote = nil
+	end
+end
+
+local function guardFromRegistry()
+	local ok, registry = pcall(getregistry)
+	if not ok or type(registry) ~= "table" then return nil end
+	for _, value in pairs(registry) do
+		if type(value) == "table"
+			and rawget(value, "CHECK") == 0.25
+			and rawget(value, "HOLD") == 0.6
+			and type(rawget(value, "_check")) == "function"
+		then
+			return value
+		end
+	end
+	return nil
+end
+
+local function findGuard()
+	local scripts = LP:FindFirstChild("PlayerScripts")
+	local controllers = scripts and scripts:FindFirstChild("Controllers")
+	local module = controllers and controllers:FindFirstChild("MoveGuard")
+	if module then
+		local ok, result = pcall(require, module)
+		if ok and type(result) == "table" and type(result._check) == "function" then
+			acGuard = result
+			acGuardSource = "module"
+			return "module"
+		end
+	end
+	local found = guardFromRegistry()
+	if found then
+		acGuard = found
+		acGuardSource = "registry"
+		return "registry"
+	end
+	acGuard = nil
+	acGuardSource = nil
+	return nil
+end
+
+local function installClosure()
+	if dead or acClosure then return acClosure end
+	startAcTick()
+	if (not acGuard or type(acGuard._check) ~= "function") and not findGuard() then
+		return false
+	end
+	local ok, original = pcall(hookfunction, acGuard._check, function()
+		ac.closures = ac.closures + 1
+	end)
+	if ok and original then
+		acGuardOriginal = original
+		acClosure = true
+		acLog("closure attached via " .. tostring(acGuardSource))
+		return true
+	end
+	return false
+end
+
+local function removeClosure()
+	if not acClosure then return end
+	if acGuard and type(acGuard._check) == "function" and acGuardOriginal then
+		pcall(hookfunction, acGuard._check, acGuardOriginal)
+	end
+	acGuardOriginal = nil
+	acClosure = false
+end
+
+local mt = nil
+pcall(function()
+	mt = getrawmetatable(game)
+end)
+local mtReadonly = true
+if type(isreadonly) == "function" then
+	local ok, value = pcall(isreadonly, mt)
+	if ok and value ~= nil then
+		mtReadonly = value
+	end
+end
+
+local acIndexOld = nil
+local acIndexHook = nil
+
+local function writeMetatable(fn)
+	if not mt then return false end
+	local ok = pcall(function()
+		setreadonly(mt, false)
+		fn()
+		setreadonly(mt, mtReadonly)
+	end)
+	if not ok then
+		pcall(function()
+			setreadonly(mt, mtReadonly)
+		end)
+	end
+	return ok
+end
+
+local function installIndex()
+	if not mt or acIndexHook then return acIndexHook ~= nil end
+	startAcTick()
+	acIndexOld = mt.__index
+	if not acIndexOld then return false end
+	acIndexHook = newcclosure(function(self, key)
+		local value = acIndexOld(self, key)
+		if dead or checkcaller() or type(key) ~= "string" then
+			return value
+		end
+		if self == acIndexTarget then
+			if key == "WalkSpeed" then
+				ac.reads = ac.reads + 1
+				if CFG.index then
+					return math.min(value, CFG.spoofWalk)
+				end
+			elseif key == "JumpPower" then
+				ac.reads = ac.reads + 1
+				if CFG.index then
+					return math.min(value, CFG.spoofJumpPower)
+				end
+			elseif key == "JumpHeight" then
+				ac.reads = ac.reads + 1
+				if CFG.index then
+					return math.min(value, CFG.spoofJumpHeight)
+				end
+			end
+		elseif self == Workspace and key == "Gravity" and CFG.lowGravity then
+			ac.reads = ac.reads + 1
+			if CFG.index then
+				return math.max(value, CFG.spoofGravity or value)
+			end
+		end
+		return value
+	end, "qb_ac_index")
+	local ok = writeMetatable(function()
+		mt.__index = acIndexHook
+	end)
+	if not ok then
+		acIndexHook = nil
+		acIndexOld = nil
+	end
+	return ok
+end
+
+local function removeIndex()
+	if not mt or not acIndexHook then return end
+	writeMetatable(function()
+		if mt.__index == acIndexHook then
+			mt.__index = acIndexOld
+		end
+	end)
+	acIndexHook = nil
+	acIndexOld = nil
+end
+
+local acNamecallOld = nil
+local acNamecallHook = nil
+
+local function previewArgs(...)
+	local count = select("#", ...)
+	local parts = {}
+	for i = 1, math.min(count, 4) do
+		local value = select(i, ...)
+		local ok, text = pcall(function()
+			if typeof(value) == "Instance" then
+				return value:GetFullName()
+			end
+			return tostring(value)
+		end)
+		text = ok and text or "?"
+		if #text > 40 then
+			text = string.sub(text, 1, 37) .. "..."
+		end
+		parts[#parts + 1] = text
+	end
+	return table.concat(parts, ", ")
+end
+
+local function handleReport(...)
+	ac.reports = ac.reports + 1
+	acLog("report  " .. previewArgs(...))
+	if CFG.block then
+		ac.blocked = ac.blocked + 1
+		return true
+	end
+	if not (CFG.closure or CFG.admin or CFG.inflate) then
+		acDefensePending = true
+	end
+	return false
+end
+
+local function installNamecall()
+	if not mt or acNamecallHook then return acNamecallHook ~= nil end
+	startAcTick()
+	acNamecallOld = mt.__namecall
+	if not acNamecallOld then return false end
+	acNamecallHook = newcclosure(function(self, ...)
+		if not dead and not checkcaller() then
+			local ok, method = pcall(getnamecallmethod)
+			if ok and (method == "FireServer" or method == "InvokeServer") then
+				local isGuard = self == acRemote
+				if not isGuard and typeof(self) == "Instance" and self.Name == "AntiCheatGuard" then
+					isGuard = self:IsA("BaseRemoteEvent")
+				end
+				if isGuard and handleReport(...) then
+					return nil
+				end
+			end
+		end
+		return acNamecallOld(self, ...)
+	end, "qb_ac_namecall")
+	local ok = writeMetatable(function()
+		mt.__namecall = acNamecallHook
+	end)
+	if not ok then
+		acNamecallHook = nil
+		acNamecallOld = nil
+	end
+	return ok
+end
+
+local function removeNamecall()
+	if not mt or not acNamecallHook then return end
+	writeMetatable(function()
+		if mt.__namecall == acNamecallHook then
+			mt.__namecall = acNamecallOld
+		end
+	end)
+	acNamecallHook = nil
+	acNamecallOld = nil
+end
+
+local function applyAdmin(on)
+	if on then
+		startAcTick()
+		if not acSaved.admin then
+			acSaved.admin = true
+			acSaved.adminValue = LP:GetAttribute("ACAdmin")
+		end
+		LP:SetAttribute("ACAdmin", true)
+	elseif acSaved.admin then
+		LP:SetAttribute("ACAdmin", acSaved.adminValue)
+		acSaved.admin = false
+		acSaved.adminValue = nil
+	end
+end
+
+local function applyInflate(on)
+	local humanoid = currentHumanoid()
+	if on then
+		startAcTick()
+		if humanoid then
+			if not acSaved.inflate then
+				acSaved.inflate = {
+					walk = humanoid:GetAttribute("ACWalk"),
+					jumpPower = humanoid:GetAttribute("ACJumpPower"),
+					jumpHeight = humanoid:GetAttribute("ACJumpHeight"),
+					cap = Workspace:GetAttribute("ACWalkCap"),
+					gravity = Workspace:GetAttribute("ACGravity"),
+				}
+				acSaved.inflateHumanoid = humanoid
+			elseif acSaved.inflateHumanoid ~= humanoid then
+				acSaved.inflateHumanoid = humanoid
+				acSaved.inflate.walk = humanoid:GetAttribute("ACWalk")
+				acSaved.inflate.jumpPower = humanoid:GetAttribute("ACJumpPower")
+				acSaved.inflate.jumpHeight = humanoid:GetAttribute("ACJumpHeight")
+			end
+			humanoid:SetAttribute("ACWalk", 999)
+			humanoid:SetAttribute("ACJumpPower", 999)
+			humanoid:SetAttribute("ACJumpHeight", 999)
+		end
+		Workspace:SetAttribute("ACWalkCap", 999)
+		if CFG.lowGravity then
+			Workspace:SetAttribute("ACGravity", Workspace.Gravity)
+		end
+	elseif acSaved.inflate then
+		local original = acSaved.inflate
+		local target = acSaved.inflateHumanoid or humanoid
+		if target then
+			target:SetAttribute("ACWalk", original.walk)
+			target:SetAttribute("ACJumpPower", original.jumpPower)
+			target:SetAttribute("ACJumpHeight", original.jumpHeight)
+		end
+		Workspace:SetAttribute("ACWalkCap", original.cap)
+		Workspace:SetAttribute("ACGravity", original.gravity)
+		acSaved.inflate = nil
+		acSaved.inflateHumanoid = nil
+	end
+end
+
+local function applyJump(on)
+	local humanoid = currentHumanoid()
+	if not humanoid then return end
+	if on then
+		startAcTick()
+		if not acSaved.jump or acSaved.jumpHumanoid ~= humanoid then
+			acSaved.jump = {
+				use = humanoid.UseJumpPower,
+				power = humanoid.JumpPower,
+				height = humanoid.JumpHeight,
+			}
+			acSaved.jumpHumanoid = humanoid
+		end
+		humanoid.UseJumpPower = false
+		humanoid.JumpHeight = CFG.jumpHeight
+	elseif acSaved.jump then
+		local original = acSaved.jump
+		local target = acSaved.jumpHumanoid or humanoid
+		target.UseJumpPower = original.use
+		target.JumpPower = original.power
+		target.JumpHeight = original.height
+		acSaved.jump = nil
+		acSaved.jumpHumanoid = nil
+	end
+end
+
+local function applyGravity(on)
+	if on then
+		startAcTick()
+		if not acSaved.gravity then
+			acSaved.gravity = Workspace.Gravity
+			CFG.spoofGravity = acSaved.gravity
+		end
+		Workspace.Gravity = CFG.gravity
+		if CFG.inflate then
+			Workspace:SetAttribute("ACGravity", CFG.gravity)
+		end
+	elseif acSaved.gravity then
+		Workspace.Gravity = acSaved.gravity
+		if CFG.inflate then
+			Workspace:SetAttribute("ACGravity", acSaved.gravity)
+		end
+		acSaved.gravity = nil
+	end
+end
+
+local function installAnim()
+	if acWhitelistOn then return true end
+	startAcTick()
+	local module = nil
+	local ok = pcall(function()
+		local shared = ReplicatedStorage:FindFirstChild("Shared")
+		local inst = shared and shared:FindFirstChild("AnimWhitelist")
+		if inst then
+			module = require(inst)
+		end
+	end)
+	if not (ok and type(module) == "table" and type(module.allowed) == "function") then
+		return false
+	end
+	acWhitelist = module
+	acWhitelistOriginal = module.allowed
+	acWhitelistHook = function(...)
+		ac.anim = ac.anim + 1
+		if dead then
+			return acWhitelistOriginal(...)
+		end
+		return true
+	end
+	module.allowed = acWhitelistHook
+	acWhitelistOn = true
+	acLog("AnimGuard whitelist detached")
+	return true
+end
+
+local function removeAnim()
+	if not acWhitelistOn or not acWhitelist then return end
+	pcall(function()
+		if acWhitelist.allowed == acWhitelistHook then
+			acWhitelist.allowed = acWhitelistOriginal
+		end
+	end)
+	acWhitelistOn = false
+	acWhitelistOriginal = nil
+	acWhitelistHook = nil
+end
+
+local function installTrackGuard()
+	if acTrackOn then return true end
+	startAcTick()
+	local module = nil
+	local ok = pcall(function()
+		local taf = ReplicatedStorage:FindFirstChild("TAF_Shared")
+		local client = taf and taf:FindFirstChild("Client")
+		local inst = client and client:FindFirstChild("AnimTrackGuard")
+		if inst then
+			module = require(inst)
+		end
+	end)
+	if not (ok and type(module) == "table" and type(module.Prune) == "function") then
+		return false
+	end
+	acTrackGuard = module
+	acTrackOriginal = module.Prune
+	acTrackHook = function()
+		ac.prunes = ac.prunes + 1
+		return 0
+	end
+	module.Prune = acTrackHook
+	acTrackOn = true
+	return true
+end
+
+local function removeTrackGuard()
+	if not acTrackOn or not acTrackGuard then return end
+	pcall(function()
+		if acTrackGuard.Prune == acTrackHook then
+			acTrackGuard.Prune = acTrackOriginal
+		end
+	end)
+	acTrackOn = false
+	acTrackOriginal = nil
+	acTrackHook = nil
+end
+
+local function applyWalkSpeed(on)
+	local humanoid = currentHumanoid()
+	if on then
+		startAcTick()
+		if humanoid and acSaved.walkHumanoid ~= humanoid then
+			acSaved.walkHumanoid = humanoid
+			acSaved.walkSpeed = humanoid.WalkSpeed
+		end
+		if not acWalkBound then
+			RunService:BindToRenderStep("SlimQbAcWalkSpeed", Enum.RenderPriority.Camera.Value + 3, function()
+				if dead or not CFG.walkSpeed then return end
+				local hum = currentHumanoid()
+				if not hum then return end
+				if acSaved.walkHumanoid ~= hum then
+					acSaved.walkHumanoid = hum
+					acSaved.walkSpeed = hum.WalkSpeed
+				end
+				hum.WalkSpeed = CFG.walkSpeedValue
+			end)
+			acWalkBound = true
+		end
+	else
+		if acWalkBound then
+			pcall(function()
+				RunService:UnbindFromRenderStep("SlimQbAcWalkSpeed")
+			end)
+			acWalkBound = false
+		end
+		local target = acSaved.walkHumanoid or humanoid
+		if target and acSaved.walkSpeed then
+			target.WalkSpeed = acSaved.walkSpeed
+		end
+		acSaved.walkHumanoid = nil
+		acSaved.walkSpeed = nil
+	end
+end
+
+local function stepTick(dt)
+	local humanoid = currentHumanoid()
+	local character = LP.Character
+	local root = character and character:FindFirstChild("HumanoidRootPart")
+	if not (humanoid and root) then return end
+	if humanoid.SeatPart then return end
+	if CFG.groundOnly and humanoid.FloorMaterial == Enum.Material.Air then return end
+	local direction = humanoid.MoveDirection
+	if direction.Magnitude < 0.05 then return end
+	root.CFrame = root.CFrame + direction.Unit * (CFG.stepExtra * math.min(dt, 0.1))
+end
+
+local acJumpConn = UserInputService.JumpRequest:Connect(function()
+	if dead or not CFG.infJump then return end
+	local humanoid = currentHumanoid()
+	if humanoid and humanoid.Health > 0 then
+		humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+	end
+end)
+
+local function acStateText()
+	return string.format(
+		"closure %s  |  block %s  |  index %s  |  anim %s",
+		acClosure and "ON" or "off",
+		acNamecallHook and (CFG.block and "ON" or "watch") or "off",
+		acIndexHook and (CFG.index and "ON" or "watch") or "off",
+		acWhitelistOn and "ON" or "off"
+	)
+end
+
+local function acCoverageText()
+	if acClosure then
+		return "guard coverage: closure"
+	end
+	if CFG.admin then
+		return "guard coverage: ACAdmin attribute"
+	end
+	if CFG.inflate then
+		return "guard coverage: attribute inflation"
+	end
+	return "guard coverage: NONE - MoveGuard will clamp and report"
+end
+
+local function bypassTick(dt)
+	if dead then return end
+	local now = os.clock()
+
+	if now - acLastRemote > 3 then
+		acLastRemote = now
+		refreshAcRemote()
+	end
+
+	acIndexTarget = currentHumanoid()
+
+	if now - acLastGuard > 2 then
+		acLastGuard = now
+		if CFG.closure and not acClosure then installClosure() end
+		if CFG.anim and not acWhitelistOn then installAnim() end
+		if CFG.animTracks and not acTrackOn then installTrackGuard() end
+		if CFG.walkSpeed and not acWalkBound then applyWalkSpeed(true) end
+	end
+
+	if now - acLastApply > 0.5 then
+		acLastApply = now
+		if CFG.admin then
+			LP:SetAttribute("ACAdmin", true)
+		end
+		if CFG.inflate then
+			applyInflate(true)
+		end
+		if CFG.customJump then
+			local humanoid = currentHumanoid()
+			if humanoid then
+				humanoid.UseJumpPower = false
+				humanoid.JumpHeight = CFG.jumpHeight
+			end
+		end
+		if CFG.lowGravity then
+			Workspace.Gravity = CFG.gravity
+			if CFG.inflate then
+				Workspace:SetAttribute("ACGravity", CFG.gravity)
+			end
+		end
+	end
+
+	if acDefensePending then
+		acDefensePending = false
+		CFG.admin = true
+		CFG.inflate = true
+		applyAdmin(true)
+		applyInflate(true)
+		pcall(function()
+			if ui.window then
+				ui.window:Set("qb_ac_admin", true)
+				ui.window:Set("qb_ac_inflate", true)
+			end
+		end)
+		acNotify("a report escaped - ACAdmin and inflation armed as cover")
+	end
+
+	if CFG.rootStep then
+		pcall(stepTick, dt)
+	end
+
+	if now - acLastSync > 0.4 then
+		acLastSync = now
+		if ui.acState then
+			pcall(function()
+				ui.acState:Set(acStateText())
+			end)
+		end
+		if ui.acCover then
+			pcall(function()
+				ui.acCover:Set(acCoverageText())
+			end)
+		end
+		if ui.acCounters then
+			pcall(function()
+				ui.acCounters:Set(string.format(
+					"reports %d  |  blocked %d\nclosure %d  |  index %d  |  anim %d  |  prunes %d",
+					ac.reports, ac.blocked, ac.closures, ac.reads, ac.anim, ac.prunes
+				))
+			end)
+		end
+		if ui.acLogText then
+			pcall(function()
+				ui.acLogText:Set(#acEvents > 0 and table.concat(acEvents, "\n") or "-")
+			end)
+		end
+	end
+end
+
+startAcTick = function()
+	if acHeartbeat or dead then return end
+	acHeartbeat = RunService.Heartbeat:Connect(function(dt)
+		local ok, err = pcall(bypassTick, dt)
+		if not ok then
+			warn("[QBAIM/AC] tick: " .. tostring(err))
+		end
+	end)
+end
+
+local function installBypass()
+	refreshAcRemote()
+	findGuard()
+	acIndexTarget = currentHumanoid()
+	startAcTick()
+	if CFG.closure then installClosure() end
+	installNamecall()
+	if CFG.index then installIndex() end
+	if CFG.anim then installAnim() end
+	if CFG.animTracks then installTrackGuard() end
+	if CFG.walkSpeed then applyWalkSpeed(true) end
+	if CFG.admin then applyAdmin(true) end
+	if CFG.inflate then applyInflate(true) end
+	if CFG.customJump then applyJump(true) end
+	if CFG.lowGravity then applyGravity(true) end
+end
+
+local function applyBypassAll()
+	if CFG.closure then installClosure() else removeClosure() end
+	installNamecall()
+	if CFG.index then installIndex() else removeIndex() end
+	if CFG.anim then installAnim() else removeAnim() end
+	if CFG.animTracks then installTrackGuard() else removeTrackGuard() end
+	if CFG.walkSpeed then applyWalkSpeed(true) else applyWalkSpeed(false) end
+	if CFG.admin then applyAdmin(true) else applyAdmin(false) end
+	if CFG.inflate then applyInflate(true) else applyInflate(false) end
+	if CFG.customJump then applyJump(true) else applyJump(false) end
+	if CFG.lowGravity then applyGravity(true) else applyGravity(false) end
+end
+
+local function stopBypass()
+	if acHeartbeat then
+		pcall(function()
+			acHeartbeat:Disconnect()
+		end)
+		acHeartbeat = nil
+	end
+	applyWalkSpeed(false)
+	removeAnim()
+	removeTrackGuard()
+	removeNamecall()
+	removeIndex()
+	removeClosure()
+	applyAdmin(false)
+	applyInflate(false)
+	applyJump(false)
+	applyGravity(false)
+end
+
+local function acProbe()
+	return string.format(
+		"ac closure=%s namecall=%s index=%s anim=%s reports=%d blocked=%d reads=%d guard=%s",
+		tostring(acClosure), tostring(acNamecallHook ~= nil), tostring(acIndexHook ~= nil),
+		tostring(acWhitelistOn), ac.reports, ac.blocked, ac.reads, tostring(acGuardSource)
+	)
+end
 
 --// modules -------------------------------------------------------------------
 
@@ -8169,6 +8943,12 @@ if not (TC and BC and TCfg) then
 end
 
 if not (TC and BC and TCfg) then
+	if acJumpConn then
+		pcall(function()
+			acJumpConn:Disconnect()
+		end)
+		acJumpConn = nil
+	end
 	warn("[QBAIM] game modules are not ready yet (throw/ball controller or throw config missing); run the suite again once the match has loaded")
 	return
 end
@@ -9419,6 +10199,332 @@ local function buildUI()
 		end,
 	})
 
+	-- BYPASS
+	local acTab = w:CreateTab({ Name = "BYPASS" })
+	acTab:CreateSection({ Name = "MOVE GUARD" })
+	ui.acState = acTab:CreateText({ Name = "layers", Text = acStateText() })
+	ui.acCover = acTab:CreateText({ Name = "coverage", Text = acCoverageText() })
+	reg("qb_ac_closure", "closure")
+	acTab:CreateToggle({
+		Name = "closure hook",
+		Description = "detaches MoveGuard._check, the exact closure its 0.25s loop calls. client-side only.",
+		Flag = "qb_ac_closure",
+		Value = CFG.closure,
+		Callback = function(v)
+			CFG.closure = v
+			if v then
+				if not installClosure() then
+					acNotify("closure layer unavailable - guard table not found")
+				end
+			else
+				removeClosure()
+			end
+			saveCfg()
+		end,
+	})
+	reg("qb_ac_block", "block")
+	acTab:CreateToggle({
+		Name = "block AntiCheatGuard",
+		Description = "namecall hook drops the report remote. reports still show in LOG, they just never leave.",
+		Flag = "qb_ac_block",
+		Value = CFG.block,
+		Callback = function(v)
+			CFG.block = v
+			if v then
+				installNamecall()
+			end
+			saveCfg()
+		end,
+	})
+	reg("qb_ac_index", "index")
+	acTab:CreateToggle({
+		Name = "index spoof",
+		Description = "caps WalkSpeed, JumpPower, JumpHeight and Gravity reads made by game code.",
+		Flag = "qb_ac_index",
+		Value = CFG.index,
+		Callback = function(v)
+			CFG.index = v
+			if v then
+				installIndex()
+			else
+				removeIndex()
+			end
+			saveCfg()
+		end,
+	})
+
+	acTab:CreateSection({ Name = "ANIMATION GUARDS" })
+	reg("qb_ac_anim", "anim")
+	acTab:CreateToggle({
+		Name = "AnimGuard whitelist",
+		Description = "AnimWhitelist.allowed answers true, so the client stops policing other players' tracks.",
+		Flag = "qb_ac_anim",
+		Value = CFG.anim,
+		Callback = function(v)
+			CFG.anim = v
+			if v then
+				if not installAnim() then
+					acNotify("AnimWhitelist not found - animation layer unavailable")
+				end
+			else
+				removeAnim()
+			end
+			saveCfg()
+		end,
+	})
+	reg("qb_ac_tracks", "animTracks")
+	acTab:CreateToggle({
+		Name = "animation track cap",
+		Description = "stubs AnimTrackGuard.Prune, the 16-track limiter. visual only, no report channel.",
+		Flag = "qb_ac_tracks",
+		Value = CFG.animTracks,
+		Callback = function(v)
+			CFG.animTracks = v
+			if v then
+				if not installTrackGuard() then
+					acNotify("AnimTrackGuard not found - track layer unavailable")
+				end
+			else
+				removeTrackGuard()
+			end
+			saveCfg()
+		end,
+	})
+
+	acTab:CreateSection({ Name = "FALLBACKS  (replicated attributes)" })
+	acTab:CreateText({
+		Name = "fallback note",
+		Text = "these write attributes the server can see. only needed if the closure or namecall layers fail.",
+	})
+	reg("qb_ac_admin", "admin")
+	acTab:CreateToggle({
+		Name = "ACAdmin attribute",
+		Description = "MoveGuard returns before checking anything. replicated - the server can read it.",
+		Flag = "qb_ac_admin",
+		Value = CFG.admin,
+		Callback = function(v)
+			CFG.admin = v
+			applyAdmin(v)
+			saveCfg()
+		end,
+	})
+	reg("qb_ac_inflate", "inflate")
+	acTab:CreateToggle({
+		Name = "attribute inflation",
+		Description = "forces ACWalk, ACWalkCap and the jump limits high. replicated.",
+		Flag = "qb_ac_inflate",
+		Value = CFG.inflate,
+		Callback = function(v)
+			CFG.inflate = v
+			applyInflate(v)
+			saveCfg()
+		end,
+	})
+
+	acTab:CreateSection({ Name = "TOOLS" })
+	acTab:CreateButton({
+		Name = "arm all client-side layers",
+		Description = "closure + block + index + AnimGuard. no replicated attributes touched.",
+		Callback = function()
+			CFG.closure = true
+			CFG.block = true
+			CFG.index = true
+			CFG.anim = true
+			installClosure()
+			installNamecall()
+			installIndex()
+			installAnim()
+			for _, flag in ipairs({ "qb_ac_closure", "qb_ac_block", "qb_ac_index", "qb_ac_anim" }) do
+				pcall(function()
+					w:Set(flag, true)
+				end)
+			end
+			saveCfg()
+			acNotify("client-side layers armed: closure + block + index + AnimGuard")
+		end,
+	})
+	acTab:CreateButton({
+		Name = "probe guard",
+		Description = "re-finds MoveGuard and reports which layers are attached.",
+		Callback = function()
+			refreshAcRemote()
+			local source = findGuard()
+			acNotify(string.format(
+				"guard %s | closure %s | remote %s | namecall %s",
+				tostring(source), acClosure and "attached" or "detached",
+				acRemote and "found" or "missing",
+				acNamecallHook and "hooked" or "none"
+			))
+		end,
+	})
+	acTab:CreateButton({
+		Name = "panic  (P)",
+		Description = "removes the aim hook, every bypass layer and restores the modified values.",
+		Callback = function()
+			if _G.SlimQbAim and _G.SlimQbAim.panic then
+				_G.SlimQbAim.panic()
+			end
+		end,
+	})
+
+	acTab:CreateSection({ Name = "LOG" })
+	ui.acCounters = acTab:CreateText({ Name = "counters", Text = "reports 0  |  blocked 0" })
+	ui.acLogText = acTab:CreateText({ Name = "events", Text = "-" })
+	acTab:CreateButton({
+		Name = "clear log",
+		Callback = function()
+			acEvents = {}
+		end,
+	})
+	acTab:CreateText({
+		Name = "honesty",
+		Text = "a server-side kick cannot be cancelled by a client hook. these layers stop client reports and client reads.",
+	})
+
+	-- MOVE
+	local moveTab = w:CreateTab({ Name = "MOVE" })
+	moveTab:CreateSection({ Name = "SPEED" })
+	moveTab:CreateText({
+		Name = "speed note",
+		Text = "DriveExtras rewrites WalkSpeed to 18 every frame. root step moves the root part instead.",
+	})
+	reg("qb_step", "rootStep")
+	moveTab:CreateToggle({
+		Name = "root step",
+		Description = "HumanoidRootPart.CFrame movement along your input direction.",
+		Flag = "qb_step",
+		Value = CFG.rootStep,
+		Callback = function(v)
+			CFG.rootStep = v
+			saveCfg()
+		end,
+	})
+	reg("qb_step_extra", "stepExtra")
+	moveTab:CreateSlider({
+		Name = "extra studs per second",
+		Range = { 0, 60 },
+		Increment = 1,
+		Value = CFG.stepExtra,
+		Suffix = " studs",
+		Flag = "qb_step_extra",
+		Callback = function(v)
+			CFG.stepExtra = v
+			saveCfg()
+		end,
+	})
+	reg("qb_ground", "groundOnly")
+	moveTab:CreateToggle({
+		Name = "ground only",
+		Description = "stop stepping while airborne. keeps movement closer to normal physics.",
+		Flag = "qb_ground",
+		Value = CFG.groundOnly,
+		Callback = function(v)
+			CFG.groundOnly = v
+			saveCfg()
+		end,
+	})
+
+	moveTab:CreateSection({ Name = "DIRECT SPEED" })
+	moveTab:CreateText({
+		Name = "direct speed note",
+		Text = "writes WalkSpeed after the controller's own write. needs closure, ACAdmin or inflation or MoveGuard clamps it.",
+	})
+	reg("qb_walkspeed", "walkSpeed")
+	moveTab:CreateToggle({
+		Name = "walk speed override",
+		Description = "physics movement at the chosen WalkSpeed instead of root stepping.",
+		Flag = "qb_walkspeed",
+		Value = CFG.walkSpeed,
+		Callback = function(v)
+			CFG.walkSpeed = v
+			applyWalkSpeed(v)
+			saveCfg()
+		end,
+	})
+	reg("qb_ws_value", "walkSpeedValue")
+	moveTab:CreateSlider({
+		Name = "walk speed",
+		Range = { 18, 150 },
+		Increment = 1,
+		Value = CFG.walkSpeedValue,
+		Suffix = " ws",
+		Flag = "qb_ws_value",
+		Callback = function(v)
+			CFG.walkSpeedValue = v
+			saveCfg()
+		end,
+	})
+
+	moveTab:CreateSection({ Name = "JUMP" })
+	reg("qb_infjump", "infJump")
+	moveTab:CreateToggle({
+		Name = "infinite jump",
+		Flag = "qb_infjump",
+		Value = CFG.infJump,
+		Callback = function(v)
+			CFG.infJump = v
+			saveCfg()
+		end,
+	})
+	reg("qb_jump", "customJump")
+	moveTab:CreateToggle({
+		Name = "custom jump height",
+		Description = "writes JumpHeight. needs closure, ACAdmin or inflation to survive the guard.",
+		Flag = "qb_jump",
+		Value = CFG.customJump,
+		Callback = function(v)
+			CFG.customJump = v
+			applyJump(v)
+			saveCfg()
+		end,
+	})
+	reg("qb_jump_height", "jumpHeight")
+	moveTab:CreateSlider({
+		Name = "jump height",
+		Range = { 7, 60 },
+		Increment = 1,
+		Value = CFG.jumpHeight,
+		Suffix = " studs",
+		Flag = "qb_jump_height",
+		Callback = function(v)
+			CFG.jumpHeight = v
+			if CFG.customJump then
+				applyJump(true)
+			end
+			saveCfg()
+		end,
+	})
+
+	moveTab:CreateSection({ Name = "GRAVITY" })
+	reg("qb_gravity", "lowGravity")
+	moveTab:CreateToggle({
+		Name = "low gravity",
+		Description = "writes Workspace.Gravity. needs closure, ACAdmin or inflation to survive the guard.",
+		Flag = "qb_gravity",
+		Value = CFG.lowGravity,
+		Callback = function(v)
+			CFG.lowGravity = v
+			applyGravity(v)
+			saveCfg()
+		end,
+	})
+	reg("qb_gravity_value", "gravity")
+	moveTab:CreateSlider({
+		Name = "workspace gravity",
+		Range = { 20, 300 },
+		Increment = 10,
+		Value = CFG.gravity,
+		Suffix = " g",
+		Flag = "qb_gravity_value",
+		Callback = function(v)
+			CFG.gravity = v
+			if CFG.lowGravity then
+				applyGravity(true)
+			end
+			saveCfg()
+		end,
+	})
+
 	-- INFO
 	local infoTab = w:CreateTab({ Name = "INFO" })
 	ui.status = infoTab:CreateText({ Name = "state", Text = "starting" })
@@ -9481,6 +10587,7 @@ local function probe()
 		"auto=" .. tostring(stats.auto),
 		"skipped=" .. tostring(stats.missed),
 		"last=" .. (stats.lastName and (stats.lastName .. " |v| " .. string.format("%.1f", stats.lastVel and stats.lastVel.Magnitude or 0)) or "nil"),
+		acProbe(),
 	}
 	return table.concat(rows, "\n")
 end
@@ -9506,6 +10613,8 @@ for k, v in pairs(bootCfg) do
 end
 syncUi()
 setEnabled(CFG.enabled)
+installBypass()
+applyBypassAll()
 
 local function panic()
 	CFG.enabled = false
@@ -9514,11 +10623,24 @@ local function panic()
 	CFG.arc = false
 	CFG.defLines = false
 	CFG.snap = false
+	CFG.closure = false
+	CFG.block = false
+	CFG.index = false
+	CFG.anim = false
+	CFG.animTracks = false
+	CFG.admin = false
+	CFG.inflate = false
+	CFG.rootStep = false
+	CFG.infJump = false
+	CFG.customJump = false
+	CFG.lowGravity = false
+	CFG.walkSpeed = false
 	restoreAll()
+	stopBypass()
 	clearVisuals()
 	syncUi()
 	saveCfg()
-	print("[QBAIM] panic - hooks removed, controller fields restored, overlay cleared")
+	print("[QBAIM] panic - aim hook and bypass removed, controller fields restored")
 end
 
 local function shutdown()
@@ -9526,6 +10648,16 @@ local function shutdown()
 		return
 	end
 	dead = true
+	stopBypass()
+	if acJumpConn then
+		pcall(function()
+			acJumpConn:Disconnect()
+		end)
+		acJumpConn = nil
+	end
+	pcall(function()
+		RunService:UnbindFromRenderStep("SlimQbAcWalkSpeed")
+	end)
 	restoreAll()
 	clearVisuals()
 	if ui.window then
@@ -9572,6 +10704,13 @@ _G.SlimQbAim = {
 	apply = function()
 		setEnabled(CFG.enabled)
 	end,
+	ac = {
+		state = acStateText,
+		probe = acProbe,
+		start = installBypass,
+		stop = stopBypass,
+		arm = applyBypassAll,
+	},
 }
 
 --// input ---------------------------------------------------------------------
