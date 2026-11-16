@@ -18,6 +18,19 @@ local function banner(text)
 	print("[SLIMHUB] " .. text)
 end
 
+-- the panel arms one loader per server, but a double-loaded hub can queue two.
+-- the queued copy carries SLIMHUB_AUTOEXEC, so this stamp only ever suppresses
+-- duplicate auto-exec runs - a manual execute still reloads the hub on demand.
+local genv = (getgenv and getgenv()) or _G
+if genv.SLIMHUB_AUTOEXEC then
+	genv.SLIMHUB_AUTOEXEC = nil
+	if genv.SLIMHUB_SERVED == game.JobId then
+		banner("already served this server - skipped")
+		return
+	end
+	genv.SLIMHUB_SERVED = game.JobId
+end
+
 local function fetch(url, tries)
 	local lastErr
 	for attempt = 1, (tries or 3) do
