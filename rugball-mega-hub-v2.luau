@@ -21,6 +21,7 @@
 		14315258385      Realistic Street Soccer rss
 		124780003623150  Realistic Ragdoll MMA   mma
 		101880234193261  Car Soccer              carsoccer
+		131576717722076  FD6 - Skyview           skyview
 
 	the taf bypass runs before the suites that need it, so its hooks are live
 	before any suite code touches the controllers.
@@ -53,6 +54,7 @@ Hub.ORDER = {
 	{ place = 14315258385,    label = "RSS STREET SOCCER", suites = { "rss" } },
 	{ place = 124780003623150, label = "REALISTIC RAGDOLL MMA", suites = { "mma" } },
 	{ place = 101880234193261, label = "CAR SOCCER",       suites = { "carsoccer" } },
+	{ place = 131576717722076, label = "FD6 - THE SKYVIEW EXPERIENCE", suites = { "skyview" } },
 }
 
 Hub.GAMES = {}
@@ -60,7 +62,7 @@ for _, g in ipairs(Hub.ORDER) do
 	Hub.GAMES[g.place] = g
 end
 
-Hub.SUITE_ORDER = { "football", "anime", "nba", "swish", "duels", "qb_aimbot", "taf_bypass", "physbox", "tps", "track", "rss", "mma", "carsoccer" }
+Hub.SUITE_ORDER = { "football", "anime", "nba", "swish", "duels", "qb_aimbot", "taf_bypass", "physbox", "tps", "track", "rss", "mma", "carsoccer", "skyview" }
 
 Hub.SUITE_NAMES = {
 	football   = "football panel    |  aim / tackle / block",
@@ -76,6 +78,7 @@ Hub.SUITE_NAMES = {
 	rss        = "rss street          |  auto shot / pass / tackle / header / GK dive",
 	mma        = "mma panel         |  fight / ground / subs + hud",
 	carsoccer  = "car soccer        |  autopilot / boost / ball path",
+	skyview    = "skyview panel     |  esp / teleport / movement",
 }
 
 Hub.SUITE = {}
@@ -15204,6 +15207,846 @@ _G.CarSoccer = { cfg = CFG, stop = shutdown, panic = panic }
 local status = (MatchSession and "hooks armed - waiting for a match" or "MatchSession not found - pilot disabled")
 	.. (drawingOK and "" or " | Drawing unavailable - ESP off")
 print("[CarPilot] panel loaded - autopilot, ball path ESP, speed readout | " .. status)
+end
+
+--// embedded suite: skyview  (from skyview.luau) =========================
+Hub.SUITE.skyview = function()
+--[[
+	SKYVIEW UTILITY -- FD6 - The Skyview Experience
+	place 131576717722076 | Rayfield Gen2 | replace-not-stack via _G.SkyviewPanel
+
+	what it does
+	  players  : esp (name, distance, health bar, box, tracer), player list, teleport
+	  movement : walk speed, jump power, infinite jump, noclip
+	  visuals  : fullbright, no fog, fov
+	  misc     : rejoin, panic (P), unload
+
+	nothing here fires remotes or writes game state. it reads the character and
+	the camera, and moves your own humanoid.
+
+	_G exports
+	  _G.SkyviewPanel.cfg      live config table
+	  _G.SkyviewPanel.stop     unload
+	  _G.SkyviewPanel.panic    turn every feature off
+	  _G.SkyviewPanel.esp      esp pool (workspace drawings)
+--]]
+
+local prev = _G.SkyviewPanel
+local CFG = (prev and prev.cfg) or {}
+for k, v in pairs({
+	esp = false,
+	espName = true,
+	espDistance = true,
+	espHealth = true,
+	espBox = true,
+	espTracer = true,
+	customSpeed = false,
+	walkSpeed = 32,
+	customJump = false,
+	jumpPower = 90,
+	infiniteJump = false,
+	noclip = false,
+	fullbright = false,
+	noFog = false,
+	fovOn = false,
+	fov = 70,
+}) do
+	if CFG[k] == nil then CFG[k] = v end
+end
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Lighting = game:GetService("Lighting")
+local TeleportService = game:GetService("TeleportService")
+local LP = Players.LocalPlayer
+
+-- replace-not-stack: a re-run has to take the previous copy down first
+if prev and prev.stop then
+	pcall(prev.stop)
+end
+
+--// cfg file --------------------------------------------------------------------
+-- switches survive an executor restart. best-effort, never fatal.
+
+local CFG_FILE = "slimhub-skyview.cfg"
+
+local function loadCfg()
+	if not (isfile and readfile and isfile(CFG_FILE)) then return end
+	local ok, data = pcall(readfile, CFG_FILE)
+	if not ok or type(data) ~= "string" then return end
+	for line in string.gmatch(data, "[^\r\n]+") do
+		local k, v = string.match(line, "^([%w_]+)=(.*)$")
+		if k and CFG[k] ~= nil then
+			if v == "true" then
+				CFG[k] = true
+			elseif v == "false" then
+				CFG[k] = false
+			elseif tonumber(v) then
+				CFG[k] = tonumber(v)
+			end
+		end
+	end
+end
+
+local savedCfg = ""
+local function saveCfg()
+	if not writefile then return end
+	local parts = {}
+	for k, v in pairs(CFG) do
+		local t = type(v)
+		if t == "boolean" or t == "number" then
+			table.insert(parts, k .. "=" .. tostring(v))
+		end
+	end
+	table.sort(parts)
+	local blob = table.concat(parts, "\n")
+	if blob == savedCfg then return end
+	savedCfg = blob
+	pcall(writefile, CFG_FILE, blob)
+end
+
+if not prev then
+	pcall(loadCfg)
+end
+
+--// state -----------------------------------------------------------------------
+
+local dead = false
+local ui = {}
+local status = "idle"
+local log = {}
+local selectedPlayer = nil
+local originalFov = workspace.CurrentCamera and workspace.CurrentCamera.FieldOfView or 70
+
+local function now()
+	return os.clock()
+end
+
+local function pushLog(text)
+	table.insert(log, 1, os.date("%H:%M:%S") .. "  " .. text)
+	while #log > 8 do
+		table.remove(log)
+	end
+end
+
+local function notify(text)
+	print("[SKYVIEW] " .. tostring(text))
+	if ui.window and ui.window.Notify then
+		pcall(function()
+			ui.window:Notify({ title = "SKYVIEW", content = tostring(text), duration = 3 })
+		end)
+	end
+	pushLog(tostring(text))
+end
+
+--// drawing pool ----------------------------------------------------------------
+
+local drawings = {}
+
+local function newDrawing(cls)
+	local ok, d = pcall(function()
+		return Drawing.new(cls)
+	end)
+	if ok and d then
+		table.insert(drawings, d)
+		return d
+	end
+	return nil
+end
+
+local function removeDrawing(d)
+	if not d then return end
+	pcall(function()
+		d.Visible = false
+		d:Remove()
+	end)
+end
+
+local function clearDrawings()
+	for _, d in ipairs(drawings) do
+		pcall(function()
+			d.Visible = false
+			d:Remove()
+		end)
+	end
+	drawings = {}
+end
+
+--// esp -------------------------------------------------------------------------
+
+local espCache = {}
+
+local function espFor(plr)
+	local e = espCache[plr]
+	if e then return e end
+	e = {}
+	e.box = newDrawing("Square")
+	e.hpBg = newDrawing("Square")
+	e.hpFill = newDrawing("Square")
+	e.tracer = newDrawing("Line")
+	e.name = newDrawing("Text")
+	e.dist = newDrawing("Text")
+
+	if e.box then
+		e.box.Thickness = 1
+		e.box.Filled = false
+		e.box.Color = Color3.fromRGB(120, 215, 255)
+		e.box.Transparency = 0.45
+	end
+	if e.hpBg then
+		e.hpBg.Thickness = 1
+		e.hpBg.Filled = true
+		e.hpBg.Color = Color3.fromRGB(15, 15, 18)
+		e.hpBg.Transparency = 0.35
+	end
+	if e.hpFill then
+		e.hpFill.Thickness = 1
+		e.hpFill.Filled = true
+		e.hpFill.Color = Color3.fromRGB(90, 230, 120)
+	end
+	if e.tracer then
+		e.tracer.Thickness = 1
+		e.tracer.Transparency = 0.55
+		e.tracer.Color = Color3.fromRGB(120, 215, 255)
+	end
+	if e.name then
+		e.name.Size = 13
+		e.name.Center = true
+		e.name.Outline = true
+		e.name.OutlineColor = Color3.fromRGB(0, 0, 0)
+		e.name.Font = 2
+		e.name.Color = Color3.fromRGB(255, 255, 255)
+	end
+	if e.dist then
+		e.dist.Size = 11
+		e.dist.Center = true
+		e.dist.Outline = true
+		e.dist.OutlineColor = Color3.fromRGB(0, 0, 0)
+		e.dist.Font = 2
+		e.dist.Color = Color3.fromRGB(200, 210, 220)
+	end
+
+	espCache[plr] = e
+	return e
+end
+
+local function hideEsp(e)
+	if not e then return end
+	for _, key in ipairs({ "box", "hpBg", "hpFill", "tracer", "name", "dist" }) do
+		local d = e[key]
+		if d then d.Visible = false end
+	end
+end
+
+local function dropEsp(plr)
+	local e = espCache[plr]
+	if not e then return end
+	for _, key in ipairs({ "box", "hpBg", "hpFill", "tracer", "name", "dist" }) do
+		removeDrawing(e[key])
+	end
+	espCache[plr] = nil
+end
+
+local function hpColor(frac)
+	if frac > 0.6 then return Color3.fromRGB(90, 230, 120) end
+	if frac > 0.3 then return Color3.fromRGB(250, 210, 80) end
+	return Color3.fromRGB(240, 80, 80)
+end
+
+local function espTick()
+	local cam = workspace.CurrentCamera
+	if not cam then return end
+	local vp = cam.ViewportSize
+	local myChar = LP.Character
+	local myRoot = myChar and myChar:FindFirstChild("HumanoidRootPart")
+	local myPos = myRoot and myRoot.Position or Vector3.zero
+
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr == LP then continue end
+		local e = espFor(plr)
+		local char = plr.Character
+		local hum = char and char:FindFirstChildOfClass("Humanoid")
+		local hrp = char and char:FindFirstChild("HumanoidRootPart")
+		local head = char and char:FindFirstChild("Head")
+
+		if CFG.esp and char and hum and hrp and head and hum.Health > 0 then
+			local headScreen, headOn = cam:WorldToViewportPoint(head.Position + Vector3.new(0, 0.75, 0))
+			local feetScreen, feetOn = cam:WorldToViewportPoint(hrp.Position - Vector3.new(0, 2.7, 0))
+			local visible = headOn and feetOn and headScreen.Z > 0 and feetScreen.Z > 0
+			if visible then
+				if headScreen.X < -120 or headScreen.X > vp.X + 120 or headScreen.Y < -120 or headScreen.Y > vp.Y + 120 then
+					visible = false
+				end
+			end
+
+			if visible then
+				local height = math.clamp(math.abs(feetScreen.Y - headScreen.Y), 26, 420)
+				local width = math.clamp(height * 0.42, 18, 220)
+				local left = headScreen.X - width / 2
+				local top = headScreen.Y
+				local bottom = top + height
+
+				if e.box then
+					e.box.Visible = CFG.espBox
+					e.box.Size = Vector2.new(width, height)
+					e.box.Position = Vector2.new(left, top)
+				end
+
+				if e.hpBg and e.hpFill then
+					local frac = math.clamp(hum.Health / math.max(hum.MaxHealth, 1), 0, 1)
+					local barH = height * frac
+					e.hpBg.Visible = CFG.espHealth
+					e.hpBg.Size = Vector2.new(3, height)
+					e.hpBg.Position = Vector2.new(left - 8, top)
+					e.hpFill.Visible = CFG.espHealth and frac > 0
+					e.hpFill.Size = Vector2.new(3, barH)
+					e.hpFill.Position = Vector2.new(left - 8, bottom - barH)
+					e.hpFill.Color = hpColor(frac)
+				end
+
+				if e.name then
+					e.name.Visible = CFG.espName
+					e.name.Text = plr.Name
+					e.name.Position = Vector2.new(headScreen.X, top - 20)
+				end
+				if e.dist then
+					e.dist.Visible = CFG.espDistance
+					e.dist.Text = string.format("%d studs", math.floor((hrp.Position - myPos).Magnitude))
+					e.dist.Position = Vector2.new(headScreen.X, top - 7)
+				end
+				if e.tracer then
+					e.tracer.Visible = CFG.espTracer
+					e.tracer.From = Vector2.new(vp.X / 2, vp.Y)
+					e.tracer.To = Vector2.new(headScreen.X, top + height * 0.5)
+				end
+			else
+				hideEsp(e)
+			end
+		else
+			hideEsp(e)
+		end
+	end
+end
+
+--// movement --------------------------------------------------------------------
+
+local noclipSaved = {}
+
+local function saveNoclipParts(char)
+	for _, part in ipairs(char:GetDescendants()) do
+		if part:IsA("BasePart") and noclipSaved[part] == nil then
+			noclipSaved[part] = part.CanCollide
+		end
+	end
+end
+
+local function restoreNoclip()
+	for part, value in pairs(noclipSaved) do
+		if part.Parent then
+			pcall(function() part.CanCollide = value end)
+		end
+	end
+	noclipSaved = {}
+end
+
+local function movementTick()
+	local char = LP.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if not hum then return end
+
+	if CFG.customSpeed then
+		if hum.WalkSpeed ~= CFG.walkSpeed then
+			hum.WalkSpeed = CFG.walkSpeed
+		end
+	end
+	if CFG.customJump then
+		if not hum.UseJumpPower then
+			hum.UseJumpPower = true
+		end
+		if hum.JumpPower ~= CFG.jumpPower then
+			hum.JumpPower = CFG.jumpPower
+		end
+	end
+
+	if CFG.noclip then
+		saveNoclipParts(char)
+		for part in pairs(noclipSaved) do
+			if part.Parent and part.CanCollide then
+				part.CanCollide = false
+			end
+		end
+	elseif next(noclipSaved) ~= nil then
+		restoreNoclip()
+	end
+
+	if CFG.fovOn then
+		local cam = workspace.CurrentCamera
+		if cam and cam.FieldOfView ~= CFG.fov then
+			cam.FieldOfView = CFG.fov
+		end
+	end
+end
+
+local jumpConn = UserInputService.JumpRequest:Connect(function()
+	if dead or not CFG.infiniteJump then return end
+	local char = LP.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if not hum then return end
+	if hum:GetState() ~= Enum.HumanoidStateType.Jumping and hum:GetState() ~= Enum.HumanoidStateType.Freefall then
+		hum:ChangeState(Enum.HumanoidStateType.Jumping)
+	end
+end)
+
+--// visuals ---------------------------------------------------------------------
+
+local lightSaved = nil
+
+local function applyFullbright()
+	if lightSaved then return end
+	lightSaved = {
+		Brightness = Lighting.Brightness,
+		ClockTime = Lighting.ClockTime,
+		Ambient = Lighting.Ambient,
+		OutdoorAmbient = Lighting.OutdoorAmbient,
+		GlobalShadows = Lighting.GlobalShadows,
+		EnvironmentDiffuseScale = Lighting.EnvironmentDiffuseScale,
+		EnvironmentSpecularScale = Lighting.EnvironmentSpecularScale,
+	}
+	Lighting.Brightness = 3
+	Lighting.ClockTime = 14
+	Lighting.Ambient = Color3.fromRGB(170, 170, 170)
+	Lighting.OutdoorAmbient = Color3.fromRGB(170, 170, 170)
+	Lighting.GlobalShadows = false
+	Lighting.EnvironmentDiffuseScale = 1
+	Lighting.EnvironmentSpecularScale = 1
+end
+
+local function restoreFullbright()
+	if not lightSaved then return end
+	for k, v in pairs(lightSaved) do
+		pcall(function() Lighting[k] = v end)
+	end
+	lightSaved = nil
+end
+
+local fogSaved = nil
+
+local function applyNoFog()
+	if fogSaved then return end
+	fogSaved = {
+		FogEnd = Lighting.FogEnd,
+		FogStart = Lighting.FogStart,
+	}
+	Lighting.FogEnd = 100000
+	Lighting.FogStart = 100000
+end
+
+local function restoreNoFog()
+	if not fogSaved then return end
+	for k, v in pairs(fogSaved) do
+		pcall(function() Lighting[k] = v end)
+	end
+	fogSaved = nil
+end
+
+local function restoreVisuals()
+	restoreFullbright()
+	restoreNoFog()
+	if workspace.CurrentCamera then
+		workspace.CurrentCamera.FieldOfView = originalFov
+	end
+end
+
+--// action helpers --------------------------------------------------------------
+
+local function playerNames()
+	local names = {}
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p ~= LP then
+			table.insert(names, p.Name)
+		end
+	end
+	table.sort(names)
+	return names
+end
+
+local function teleportTo(name)
+	local target = name and Players:FindFirstChild(name)
+	local char = target and target.Character
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	local myChar = LP.Character
+	local myHrp = myChar and myChar:FindFirstChild("HumanoidRootPart")
+	if not (hrp and myHrp) then
+		return false, "no target"
+	end
+	myHrp.CFrame = hrp.CFrame * CFrame.new(0, 0, 3)
+	return true
+end
+
+local function rejoin()
+	notify("rejoining")
+	pcall(function()
+		TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LP)
+	end)
+end
+
+local function setEsp(on)
+	CFG.esp = on
+	if not on then
+		for _, e in pairs(espCache) do hideEsp(e) end
+	end
+end
+
+--// panic / shutdown ------------------------------------------------------------
+
+local removingConn
+local panic
+
+local function shutdown()
+	if dead then return end
+	dead = true
+	if jumpConn then pcall(function() jumpConn:Disconnect() end) end
+	if ui.loopConn then pcall(function() ui.loopConn:Disconnect() end) end
+	if ui.keyConn then pcall(function() ui.keyConn:Disconnect() end) end
+	if removingConn then pcall(function() removingConn:Disconnect() end) end
+	restoreNoclip()
+	restoreVisuals()
+	clearDrawings()
+	espCache = {}
+	if ui.window then pcall(function() ui.window:Unload() end) end
+	_G.SkyviewPanel = { cfg = CFG }
+	print("[SKYVIEW] unloaded")
+end
+
+panic = function()
+	if dead then return end
+	CFG.esp = false
+	CFG.customSpeed = false
+	CFG.customJump = false
+	CFG.infiniteJump = false
+	CFG.noclip = false
+	CFG.fullbright = false
+	CFG.noFog = false
+	CFG.fovOn = false
+	restoreNoclip()
+	restoreVisuals()
+	for _, e in pairs(espCache) do hideEsp(e) end
+	if ui.window then
+		for _, flag in ipairs({
+			"sky_esp", "sky_speed", "sky_jump", "sky_infjump", "sky_noclip",
+			"sky_fullbright", "sky_nofog", "sky_fovon",
+		}) do
+			pcall(function() ui.window:Set(flag, false) end)
+		end
+	end
+	status = "panic  |  everything off"
+	pushLog("panic")
+	print("[SKYVIEW] panic")
+end
+
+--// UI --------------------------------------------------------------------------
+
+local Rayfield
+pcall(function()
+	Rayfield = loadstring(game:HttpGet("https://sirius.menu/gen2"))()
+end)
+
+local function buildUI()
+	if not Rayfield then
+		warn("[SKYVIEW] Rayfield failed to load")
+		return
+	end
+
+	local w = Rayfield:CreateWindow({
+		Name = "SKYVIEW // UTILITY",
+		LoadingTitle = "FD6 - THE SKYVIEW EXPERIENCE",
+		LoadingSubtitle = "esp  -  teleport  -  movement",
+		KeySystem = false,
+	})
+	ui.window = w
+
+	pcall(function()
+		w:ChangeTheme({
+			WindowColor = ColorSequence.new({
+				ColorSequenceKeypoint.new(0, Color3.fromRGB(10, 12, 18)),
+				ColorSequenceKeypoint.new(1, Color3.fromRGB(18, 24, 34)),
+			}),
+			ShadowColor = Color3.fromRGB(4, 6, 10),
+			CornerRoundness = UDim.new(0, 16),
+			ElementCornerRadius = UDim.new(0, 10),
+			PillCornerRadius = UDim.new(1, 0),
+			AccentColor = Color3.fromRGB(120, 215, 255),
+		})
+	end)
+
+	-- PLAYERS
+	local playersTab = w:CreateTab({ Name = "PLAYERS" })
+	playersTab:CreateSection({ Name = "ESP" })
+	playersTab:CreateToggle({
+		Name = "player esp",
+		Description = "draws every other player through walls with name, distance, health and a tracer.",
+		Flag = "sky_esp",
+		Value = CFG.esp,
+		Callback = function(v)
+			setEsp(v)
+		end,
+	})
+	playersTab:CreateToggle({
+		Name = "names",
+		Flag = "sky_espname",
+		Value = CFG.espName,
+		Callback = function(v) CFG.espName = v end,
+	})
+	playersTab:CreateToggle({
+		Name = "distance",
+		Flag = "sky_espdist",
+		Value = CFG.espDistance,
+		Callback = function(v) CFG.espDistance = v end,
+	})
+	playersTab:CreateToggle({
+		Name = "health bar",
+		Flag = "sky_esphealth",
+		Value = CFG.espHealth,
+		Callback = function(v) CFG.espHealth = v end,
+	})
+	playersTab:CreateToggle({
+		Name = "box",
+		Flag = "sky_espbox",
+		Value = CFG.espBox,
+		Callback = function(v) CFG.espBox = v end,
+	})
+	playersTab:CreateToggle({
+		Name = "tracer",
+		Flag = "sky_esptracer",
+		Value = CFG.espTracer,
+		Callback = function(v) CFG.espTracer = v end,
+	})
+
+	playersTab:CreateSection({ Name = "TELEPORT" })
+	ui.playerDrop = playersTab:CreateDropdown({
+		Name = "player",
+		Description = "pick who to stand next to.",
+		Options = playerNames(),
+		Placeholder = "nobody picked",
+		Flag = "sky_target",
+		Callback = function(v)
+			selectedPlayer = v
+		end,
+	})
+	playersTab:CreateButton({
+		Name = "refresh player list",
+		Callback = function()
+			if ui.playerDrop then
+				pcall(function() ui.playerDrop:Refresh(playerNames()) end)
+				notify("player list refreshed")
+			end
+		end,
+	})
+	playersTab:CreateButton({
+		Name = "teleport to player",
+		Callback = function()
+			if not selectedPlayer then
+				notify("pick a player first")
+				return
+			end
+			local ok, err = teleportTo(selectedPlayer)
+			notify(ok and ("teleported to " .. selectedPlayer) or ("teleport failed: " .. tostring(err)))
+		end,
+	})
+
+	-- MOVEMENT
+	local moveTab = w:CreateTab({ Name = "MOVEMENT" })
+	moveTab:CreateSection({ Name = "SPEED" })
+	moveTab:CreateToggle({
+		Name = "custom walk speed",
+		Description = "holds your walk speed against the game's sprint script.",
+		Flag = "sky_speed",
+		Value = CFG.customSpeed,
+		Callback = function(v) CFG.customSpeed = v end,
+	})
+	moveTab:CreateSlider({
+		Name = "walk speed",
+		Range = { 16, 120 },
+		Increment = 1,
+		Value = CFG.walkSpeed,
+		Suffix = " ws",
+		Flag = "sky_walkspeed",
+		Callback = function(v) CFG.walkSpeed = v end,
+	})
+
+	moveTab:CreateSection({ Name = "JUMP" })
+	moveTab:CreateToggle({
+		Name = "custom jump power",
+		Flag = "sky_jump",
+		Value = CFG.customJump,
+		Callback = function(v) CFG.customJump = v end,
+	})
+	moveTab:CreateSlider({
+		Name = "jump power",
+		Range = { 50, 250 },
+		Increment = 5,
+		Value = CFG.jumpPower,
+		Suffix = " jp",
+		Flag = "sky_jumppower",
+		Callback = function(v) CFG.jumpPower = v end,
+	})
+	moveTab:CreateToggle({
+		Name = "infinite jump",
+		Description = "every jump request re-enters the jumping state, so you can keep climbing.",
+		Flag = "sky_infjump",
+		Value = CFG.infiniteJump,
+		Callback = function(v) CFG.infiniteJump = v end,
+	})
+
+	moveTab:CreateSection({ Name = "COLLISION" })
+	moveTab:CreateToggle({
+		Name = "noclip",
+		Description = "turns collision off on your own character only, and puts it back when you switch off.",
+		Flag = "sky_noclip",
+		Value = CFG.noclip,
+		Callback = function(v)
+			CFG.noclip = v
+			if not v then restoreNoclip() end
+		end,
+	})
+
+	-- VISUALS
+	local visTab = w:CreateTab({ Name = "VISUALS" })
+	visTab:CreateToggle({
+		Name = "fullbright",
+		Description = "max brightness, no shadows, daylight clock. restores the exact original values on off.",
+		Flag = "sky_fullbright",
+		Value = CFG.fullbright,
+		Callback = function(v)
+			CFG.fullbright = v
+			if v then applyFullbright() else restoreFullbright() end
+		end,
+	})
+	visTab:CreateToggle({
+		Name = "no fog",
+		Flag = "sky_nofog",
+		Value = CFG.noFog,
+		Callback = function(v)
+			CFG.noFog = v
+			if v then applyNoFog() else restoreNoFog() end
+		end,
+	})
+	visTab:CreateToggle({
+		Name = "custom fov",
+		Description = "holds your field of view against the game's own camera.",
+		Flag = "sky_fovon",
+		Value = CFG.fovOn,
+		Callback = function(v) CFG.fovOn = v end,
+	})
+	visTab:CreateSlider({
+		Name = "field of view",
+		Range = { 70, 120 },
+		Increment = 1,
+		Value = CFG.fov,
+		Suffix = " fov",
+		Flag = "sky_fov",
+		Callback = function(v)
+			CFG.fov = v
+		end,
+	})
+
+	-- MISC
+	local miscTab = w:CreateTab({ Name = "MISC" })
+	ui.card = miscTab:CreateText({ Name = "state", Text = "starting" })
+	miscTab:CreateButton({
+		Name = "rejoin server",
+		Callback = function() rejoin() end,
+	})
+	miscTab:CreateButton({
+		Name = "panic  (P)",
+		Description = "turns every feature off and restores lighting, collision and fov.",
+		Callback = function() panic() end,
+	})
+	miscTab:CreateButton({
+		Name = "unload",
+		Callback = function() shutdown() end,
+	})
+	miscTab:CreateText({
+		Name = "keys",
+		Text = "P = panic   |   the panel replaces itself instead of stacking.",
+	})
+	ui.logText = miscTab:CreateText({ Name = "log", Text = "-" })
+end
+
+--// loop ------------------------------------------------------------------------
+
+local lastSync = 0
+local lastSave = 0
+
+local function tick()
+	if dead then return end
+	movementTick()
+	if CFG.esp then
+		pcall(espTick)
+	else
+		for _, e in pairs(espCache) do hideEsp(e) end
+	end
+
+	local t = now()
+	if t - lastSync > 0.4 then
+		lastSync = t
+		local char = LP.Character
+		local hum = char and char:FindFirstChildOfClass("Humanoid")
+		status = string.format(
+			"%d players  |  esp %s  |  ws %s  |  jp %s  |  noclip %s",
+			#Players:GetPlayers(),
+			CFG.esp and "on" or "off",
+			hum and tostring(math.floor(hum.WalkSpeed)) or "-",
+			hum and tostring(math.floor(hum.JumpPower)) or "-",
+			CFG.noclip and "on" or "off"
+		)
+		if ui.card then pcall(function() ui.card:Set(status) end) end
+		if ui.logText then pcall(function() ui.logText:Set(#log > 0 and table.concat(log, "\n") or "-") end) end
+	end
+	if t - lastSave > 4 then
+		lastSave = t
+		pcall(saveCfg)
+	end
+end
+
+buildUI()
+
+if ui.window then
+	local conn
+	conn = UserInputService.InputBegan:Connect(function(input, gp)
+		if gp then return end
+		if input.KeyCode == Enum.KeyCode.P then
+			panic()
+		end
+	end)
+	ui.keyConn = conn
+end
+
+ui.loopConn = RunService.Heartbeat:Connect(function()
+	local ok, err = pcall(tick)
+	if not ok then
+		warn("[SKYVIEW] tick error: " .. tostring(err))
+	end
+end)
+
+removingConn = Players.PlayerRemoving:Connect(function(plr)
+	dropEsp(plr)
+end)
+
+pushLog("panel loaded")
+pcall(saveCfg)
+
+_G.SkyviewPanel = {
+	cfg = CFG,
+	window = ui.window,
+	esp = espCache,
+	stop = shutdown,
+	panic = panic,
+	teleport = teleportTo,
+}
+
+print("[SKYVIEW] panel loaded - esp, teleport, movement")
 end
 
 --// dispatch -------------------------------------------------------------------
