@@ -12778,6 +12778,16 @@ local LP = Players.LocalPlayer
 
 local ROFC = ReplicatedStorage:FindFirstChild("ROFC")
 if not ROFC then
+	-- auto-exec loads us the moment the join starts, often before ROFC has
+	-- replicated. sit on it instead of bailing with a half-built panel.
+	local deadline = os.clock() + 40
+	while os.clock() < deadline do
+		task.wait(0.5)
+		ROFC = ReplicatedStorage:FindFirstChild("ROFC")
+		if ROFC then break end
+	end
+end
+if not ROFC then
 	warn("[MMA] ROFC modules not found in place " .. tostring(game.PlaceId))
 	_G.RagdollMmaPanel = { cfg = CFG }
 	return
@@ -12791,11 +12801,17 @@ local function tryRequire(name)
 	return nil
 end
 
-local Match = tryRequire("Match")
-local Touch = tryRequire("Touch")
-local Config = tryRequire("Config")
-local Util = tryRequire("Util")
-local Cinema = tryRequire("Cinema")
+local Match, Touch, Config, Util, Cinema
+local modDeadline = os.clock() + 20
+repeat
+	Match = tryRequire("Match")
+	Touch = tryRequire("Touch")
+	Config = tryRequire("Config")
+	Util = tryRequire("Util")
+	Cinema = tryRequire("Cinema")
+	if Match and Touch and Config and Util then break end
+	task.wait(0.5)
+until os.clock() > modDeadline
 
 if not (Match and Touch and Config and Util) then
 	warn("[MMA] required modules missing (Match/Touch/Config/Util)")
@@ -12931,7 +12947,7 @@ local CONTINUE_TEXT = { "CONTINUE" }
 local RANKED_NAMES = { "Btn_RANKED", "Btn_Ranked", "Btn_RANKEDMODE" }
 local RANKED_TEXT = { "RANKED" }
 
-local queue = { last = "idle  |  auto queue off", nextTry = 0, nextNav = 0, pressedAt = 0, tries = 0 }
+local queue = { last = "idle  |  auto queue off", nextTry = 0, nextNav = 0, pressedAt = 0, tries = 0, rankedAt = 0, endedAt = 0 }
 
 local function queueTick()
 	if dead or not CFG.autoQueue then
@@ -12944,7 +12960,7 @@ local function queueTick()
 
 	-- a live match needs nothing from us
 	if match and not match.closed and match.state ~= "ended" and not match.finish then
-		queue.pressedAt = 0
+		queue.pressedAt, queue.endedAt, queue.rankedAt = 0, 0, 0
 		queue.last = "in match  |  round " .. tostring(match.round or 1)
 		return
 	end
@@ -12954,15 +12970,34 @@ local function queueTick()
 		local cont = findButton(CONTINUE_NAMES, CONTINUE_TEXT)
 		if cont then
 			local ok = press(cont)
-			queue.pressedAt = 0
+			queue.pressedAt, queue.endedAt = 0, 0
 			queue.last = ok and "result screen  |  continue" or "result screen  |  continue failed"
 			queue.nextTry = t + 1.2
 			return
 		end
 	end
 
+	-- the match object outlives the bell. if no screen answers for it inside 8s,
+	-- drop it so the panel can capture the next one instead of sitting on a corpse.
+	if match then
+		local ended = match.closed or match.finish ~= nil or match.state == "ended"
+		if ended then
+			if queue.endedAt == 0 then queue.endedAt = t end
+			if t - queue.endedAt > 8 then
+				match = nil
+				queue.endedAt, queue.pressedAt = 0, 0
+				queue.last = "match ended  |  released"
+				pushLog("queue released the ended match")
+				queue.nextTry = t + 1
+				return
+			end
+		else
+			queue.endedAt = 0
+		end
+	end
+
 	-- cancel a queue that never found a match, then try again
-	if queue.pressedAt > 0 and t - queue.pressedAt > 14 then
+	if queue.pressedAt > 0 and t - queue.pressedAt > 30 then
 		local cancel = findButton(CANCEL_NAMES, { "CANCEL" })
 		if cancel then
 			pcall(press, cancel)
@@ -12970,18 +13005,39 @@ local function queueTick()
 		else
 			queue.last = "queue timed out  |  retrying"
 		end
-		queue.pressedAt = 0
-		queue.nextTry = t + 1
+		queue.pressedAt, queue.rankedAt = 0, 0
+		queue.nextTry = t + 2
 		return
 	end
 
+	local rankedUp = findButton({ "Btn_BACKTOLOBBY", "Btn_TabOVERVIEW" }, { "BACK TO LOBBY", "OVERVIEW" })
+	if not rankedUp then queue.rankedAt = 0 end
+
+	-- a press that left us on the ranked screen with no CANCEL button did not
+	-- start a search (the screen builds its state a beat after it mounts)
+	if queue.pressedAt > 0 and rankedUp and t - queue.pressedAt > 4 then
+		if not findButton(CANCEL_NAMES, { "CANCEL" }) then
+			queue.pressedAt, queue.rankedAt = 0, 0
+			queue.last = "queue did not start  |  repress"
+			queue.nextTry = t + 0.5
+			return
+		end
+	end
+
 	local play = findButton(QUEUE_NAMES, QUEUE_TEXT)
-	if not play then
+	if not play and rankedUp then
 		-- the ranked screen's own PLAY is the queue button; the lobby's PLAY
 		-- starts a casual bout, so it only counts once the ranked tabs are up
-		local rankedUp = findButton({ "Btn_BACKTOLOBBY", "Btn_TabOVERVIEW" }, { "BACK TO LOBBY", "OVERVIEW" })
-		if rankedUp then
+		if queue.rankedAt == 0 then
+			queue.rankedAt = t
+			queue.last = "ranked screen  |  settling"
+			return
+		end
+		if t - queue.rankedAt >= 1.2 then
 			play = findButton(RANKED_PLAY_NAMES, RANKED_PLAY_TEXT)
+		else
+			queue.last = "ranked screen  |  settling"
+			return
 		end
 	end
 	if play then
