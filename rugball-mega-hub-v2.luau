@@ -71,7 +71,7 @@ Hub.SUITE_NAMES = {
 	swish      = "swish             |  auto perfect shot",
 	duels      = "duels panel       |  court panel",
 	qb_aimbot  = "qb aimbot         |  throw a football",
-	taf_bypass = "taf bypass        |  anticheat + speed",
+	taf_bypass = "taf bypass        |  moveguard / animguard / speed",
 	physbox    = "physbox corner    |  autopilot / full power / inf stamina",
 	tps        = "tps street         |  auto shot / tackle / GK / esp",
 	track      = "track & field      |  auto race / auto field timing",
@@ -8434,172 +8434,1346 @@ end
 --// embedded suite: taf_bypass  (from taf_bypass.luau) =========================
 Hub.SUITE.taf_bypass = function()
 --[[
-	TAF anti-cheat bypass -- Throw A Football / Drive Duels family
-	place: 125942529011157 / 80119315919763  universe: 10768235926
+	TAF // AC BYPASS -- place 125942529011157
 
-	what it does:
-	  - overrides the client AnimGuard/AnimWhitelist checks by making
-	    AnimWhitelist.allowed() answer true
-	  - flips the local AntiCheatEnabled / AntiCheatAnimGuard attributes off,
-	    so the guard starts in dormant mode
-	  - installs no movement hooks, no remotes, no UI hooks except its panel
+	the guard, from MoveGuard source
+	  every 0.25s it reads LocalPlayer:GetAttribute("ACAdmin"); true means return.
+	  then, per value, if actual is more than 0.5 above the allowed value for 0.6s:
+	    WalkSpeed   allowed = max(Humanoid.ACWalk, Workspace.ACWalkCap)
+	    JumpPower   allowed = Humanoid.ACJumpPower
+	    JumpHeight  allowed = Humanoid.ACJumpHeight
+	    Gravity     allowed = Workspace.ACGravity, tolerance 1
+	  it fires ReplicatedStorage.AntiCheatGuard:FireServer(name, actual, allowed)
+	  and clamps the value back to allowed.
 
-	before enabling, restore() puts the original allowed() and attributes back.
-]]
+	the five techniques, in the order they are layered here
+	  1. closure hook   MoveGuard exposes _check, the exact closure its loop calls.
+	                    hookfunction on it makes the whole guard a no-op. client-only.
+	  2. registry scan  if the module path is gone, the guard table is found by
+	                    walking getregistry() for CHECK=0.25 / HOLD=0.6.
+	  3. index hook     __index on the Instance metatable caps WalkSpeed, JumpPower,
+	                    JumpHeight and Gravity reads made by game code.
+	  4. namecall hook  __namecall drops AntiCheatGuard before it leaves the client.
+	  5. root step      HumanoidRootPart.CFrame movement, because DriveExtras holds
+	                    Humanoid.WalkSpeed at GameConfig.QBWalkSpeed (18) every frame.
+
+	the other half of this game's client anti-cheat
+	  TAF_Shared.Client.AnimGuard stops other players' animation tracks that are
+	  not in AnimWhitelist. allowed() is a plain table field that the guard calls
+	  on every track, so replacing it disables the check without touching any
+	  replicated attribute and without a hook.
+	  TAF_Shared.Client.AnimTrackGuard prunes any player above 16 playing tracks;
+	  its Prune is also called through the module table, so it can be swapped.
+
+	the attribute layers are optional fallbacks, off by default
+	  ACAdmin and attribute inflation both write attributes that REPLICATE to the
+	  server. they work, but they are visible on the server and the other layers
+	  are not. turn them on if the closure/namecall layers ever fail.
+
+	MOVEMENT
+	  DriveExtras rewrites WalkSpeed to 18 every frame, so a plain set loses.
+	  root step moves the root part and leaves WalkSpeed alone.
+	  direct speed rewrites WalkSpeed on RenderStep at Camera+3, which lands
+	  after the controller's own write and holds. it needs guard coverage.
+
+	a server-side kick cannot be cancelled by any client hook. layers here only
+	stop what the client reports and what client code reads.
+
+	_G.TafAcBypass exports cfg/state/probe/panic/stop/testReport/armAll.
+--]]
+
+if game.PlaceId ~= 125942529011157 then
+	warn("[TAF-AC] loaded outside place 125942529011157 (this is " .. tostring(game.PlaceId) .. ")")
+end
+
+local prev = _G.TafAcBypass
+if prev and prev.stop then
+	pcall(prev.stop)
+end
+
+local DEFAULTS = {
+	closure = true,
+	block = true,
+	index = true,
+	admin = false,
+	inflate = false,
+	rootStep = false,
+	groundOnly = true,
+	stepExtra = 20,
+	infJump = false,
+	customJump = false,
+	jumpHeight = 20,
+	lowGravity = false,
+	gravity = 80,
+	spoofWalk = 18,
+	spoofJumpPower = 50,
+	spoofJumpHeight = 7.2,
+	spoofGravity = 196.2,
+	anim = true,
+	animTracks = false,
+	walkSpeed = false,
+	walkSpeedValue = 30,
+}
+
+local CFG = {}
+for key, value in pairs(DEFAULTS) do
+	CFG[key] = value
+end
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace = game:GetService("Workspace")
+local LP = Players.LocalPlayer
 
-local LocalPlayer = Players.LocalPlayer
+local dead = false
+local ui = {}
+local events = {}
+local logDirty = false
+local lastEventAt = 0
 
-local CFG = {
-	bypass = true, -- default ON for this one purpose
-	muteMenu = false,
-	speed = false,
-	speedVal = 30,
+local reportsSeen = 0
+local reportsBlocked = 0
+local closureHits = 0
+local indexReads = 0
+local animAllowedCalls = 0
+local animTrackBlocks = 0
+local defensePending = false
+
+local whitelist = nil
+local whitelistAllowedOriginal = nil
+local whitelistHooked = false
+local trackGuard = nil
+local trackGuardPruneOriginal = nil
+local trackGuardHooked = false
+local walkSpeedBound = false
+
+local acRemote = nil
+local indexTarget = nil
+local guardTable = nil
+local guardSource = nil
+local guardCheckOriginal = nil
+local closureHooked = false
+
+local saved = {
+	admin = false,
+	adminValue = nil,
+	humanoid = nil,
+	attrs = nil,
+	jump = nil,
+	jumpHumanoid = nil,
+	gravity = nil,
+	walkSpeed = nil,
+	walkHumanoid = nil,
 }
 
-local stats = _G.SlimTafBypassStats or {}
-_G.SlimTafBypassStats = stats
-stats.allowedCalls = stats.allowedCalls or 0
+--// cfg file --------------------------------------------------------------------
 
-local origAllowed = nil
-local savedEnabled, savedAnimGuard = nil, nil
-local installed = false
-local GameConfigOk, GameConfig = pcall(function()
-	return require(ReplicatedStorage:WaitForChild("TAF_Shared"):WaitForChild("Shared"):WaitForChild("GameConfig"))
-end)
-local stockSpeed = 18
-local function applySpeed()
-	local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
-	if CFG.speed then
-		if GameConfigOk and GameConfig then pcall(function() GameConfig.QBWalkSpeed = CFG.speedVal end) end
-		if hum then hum.WalkSpeed = CFG.speedVal end
-	else
-		if GameConfigOk and GameConfig then pcall(function() GameConfig.QBWalkSpeed = stockSpeed end) end
-		if hum then hum.WalkSpeed = stockSpeed end
+local CFG_FILE = "slimhub-taf-acbypass.cfg"
+local savedCfg = ""
+
+local function saveCfg()
+	if not writefile then return end
+	local parts = {}
+	for k, v in pairs(CFG) do
+		local t = type(v)
+		if t == "boolean" or t == "number" then
+			table.insert(parts, k .. "=" .. tostring(v))
+		end
+	end
+	table.sort(parts)
+	local blob = table.concat(parts, "\n")
+	if blob == savedCfg then return end
+	savedCfg = blob
+	pcall(writefile, CFG_FILE, blob)
+end
+
+local function loadCfg()
+	if not (isfile and readfile and isfile(CFG_FILE)) then return end
+	local ok, data = pcall(readfile, CFG_FILE)
+	if not ok or type(data) ~= "string" then return end
+	for line in string.gmatch(data, "[^%r%n]+") do
+		local k, v = string.match(line, "^([%w_]+)=(.*)$")
+		if k and DEFAULTS[k] ~= nil then
+			if v == "true" then
+				CFG[k] = true
+			elseif v == "false" then
+				CFG[k] = false
+			elseif tonumber(v) then
+				CFG[k] = tonumber(v)
+			end
+		end
 	end
 end
 
-local function readAttributes()
-	savedEnabled = Workspace:GetAttribute("AntiCheatEnabled")
-	savedAnimGuard = Workspace:GetAttribute("AntiCheatAnimGuard")
+if prev and type(prev.cfg) == "table" then
+	for k, v in pairs(prev.cfg) do
+		if DEFAULTS[k] ~= nil then
+			CFG[k] = v
+		end
+	end
+else
+	pcall(loadCfg)
 end
 
-local function install()
-	if installed then return true end
-	readAttributes()
-	local ok = pcall(function()
-		Workspace:SetAttribute("AntiCheatEnabled", false)
-		Workspace:SetAttribute("AntiCheatAnimGuard", false)
-	end)
-	if not ok then return false end
+--// log -------------------------------------------------------------------------
 
-	local okWhitelist, whitelist = pcall(function()
-		return require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("AnimWhitelist"))
+local function pushEvent(text, force)
+	if dead then return end
+	local now = os.clock()
+	if not force and now - lastEventAt < 0.05 then return end
+	lastEventAt = now
+	table.insert(events, 1, os.date("%H:%M:%S") .. "  " .. text)
+	while #events > 60 do
+		table.remove(events)
+	end
+	logDirty = true
+end
+
+local function notify(text)
+	print("[TAF-AC] " .. tostring(text))
+	if ui.window and ui.window.Notify then
+		pcall(function()
+			ui.window:Notify({ title = "TAF // AC BYPASS", content = tostring(text), duration = 3 })
+		end)
+	end
+	pushEvent(tostring(text), true)
+end
+
+--// guard discovery -------------------------------------------------------------
+
+local function currentHumanoid()
+	local character = LP.Character
+	return character and character:FindFirstChildOfClass("Humanoid") or nil
+end
+
+local function refreshAcRemote()
+	local candidate = ReplicatedStorage:FindFirstChild("AntiCheatGuard")
+	if candidate and candidate:IsA("BaseRemoteEvent") then
+		acRemote = candidate
+	else
+		acRemote = nil
+	end
+end
+
+local function guardTableFromRegistry()
+	local ok, registry = pcall(getregistry)
+	if not ok or type(registry) ~= "table" then return nil end
+	for _, value in pairs(registry) do
+		if type(value) == "table"
+			and rawget(value, "CHECK") == 0.25
+			and rawget(value, "HOLD") == 0.6
+			and type(rawget(value, "_check")) == "function"
+		then
+			return value
+		end
+	end
+	return nil
+end
+
+local function findGuard()
+	local playerScripts = LP:FindFirstChild("PlayerScripts")
+	local controllers = playerScripts and playerScripts:FindFirstChild("Controllers")
+	local module = controllers and controllers:FindFirstChild("MoveGuard")
+	if module then
+		local ok, result = pcall(require, module)
+		if ok and type(result) == "table" and type(result._check) == "function" then
+			guardTable = result
+			guardSource = "module"
+			return "module"
+		end
+	end
+	local found = guardTableFromRegistry()
+	if found then
+		guardTable = found
+		guardSource = "registry"
+		return "registry"
+	end
+	guardTable = nil
+	guardSource = nil
+	return nil
+end
+
+--// layer 1: closure hook -------------------------------------------------------
+
+local function installClosure()
+	if dead then return false end
+	if closureHooked then return true end
+	if not guardTable or type(guardTable._check) ~= "function" then
+		if not findGuard() then return false end
+	end
+	local ok, original = pcall(hookfunction, guardTable._check, function()
+		closureHits = closureHits + 1
 	end)
-	if not (okWhitelist and whitelist and type(whitelist.allowed) == "function") then
+	if ok and original then
+		guardCheckOriginal = original
+		closureHooked = true
+		pushEvent("closure attached via " .. tostring(guardSource), true)
+		return true
+	end
+	return false
+end
+
+local function removeClosure()
+	if not closureHooked then return end
+	pcall(hookfunction, guardTable._check, guardCheckOriginal)
+	guardCheckOriginal = nil
+	closureHooked = false
+end
+
+--// layer 2: index hook ---------------------------------------------------------
+
+local mt = getrawmetatable(game)
+local mtReadonly = true
+if type(isreadonly) == "function" then
+	local ok, value = pcall(isreadonly, mt)
+	if ok then
+		mtReadonly = value
+	end
+end
+
+local indexOld = nil
+local indexHook = nil
+
+local function writeMetatable(fn)
+	if not mt then return false end
+	local ok = pcall(function()
+		setreadonly(mt, false)
+		fn()
+		setreadonly(mt, mtReadonly)
+	end)
+	if not ok then
+		pcall(function() setreadonly(mt, mtReadonly) end)
+	end
+	return ok
+end
+
+local function installIndex()
+	if not mt or indexHook then return indexHook ~= nil end
+	indexOld = mt.__index
+	if not indexOld then return false end
+	indexHook = newcclosure(function(self, key)
+		local value = indexOld(self, key)
+		if dead or checkcaller() or type(key) ~= "string" then
+			return value
+		end
+		local target = indexTarget
+		if self == target then
+			if key == "WalkSpeed" then
+				indexReads = indexReads + 1
+				if CFG.index then
+					return math.min(value, CFG.spoofWalk)
+				end
+			elseif key == "JumpPower" then
+				indexReads = indexReads + 1
+				if CFG.index then
+					return math.min(value, CFG.spoofJumpPower)
+				end
+			elseif key == "JumpHeight" then
+				indexReads = indexReads + 1
+				if CFG.index then
+					return math.min(value, CFG.spoofJumpHeight)
+				end
+			end
+		elseif self == Workspace and key == "Gravity" and CFG.lowGravity then
+			indexReads = indexReads + 1
+			if CFG.index then
+				return math.max(value, CFG.spoofGravity or value)
+			end
+		end
+		return value
+	end, "taf_ac_index")
+	local ok = writeMetatable(function()
+		mt.__index = indexHook
+	end)
+	if not ok then
+		indexHook = nil
+		indexOld = nil
+	end
+	return ok
+end
+
+local function removeIndex()
+	if not mt or not indexHook then return end
+	writeMetatable(function()
+		if mt.__index == indexHook then
+			mt.__index = indexOld
+		end
+	end)
+	indexHook = nil
+	indexOld = nil
+end
+
+--// layer 3: namecall hook / remote block ---------------------------------------
+
+local namecallOld = nil
+local namecallHook = nil
+
+local function previewArgs(...)
+	local count = select("#", ...)
+	local parts = {}
+	for i = 1, math.min(count, 4) do
+		local value = select(i, ...)
+		local ok, text = pcall(function()
+			if typeof(value) == "Instance" then
+				return value:GetFullName()
+			end
+			return tostring(value)
+		end)
+		text = ok and text or "?"
+		if #text > 40 then
+			text = string.sub(text, 1, 37) .. "..."
+		end
+		table.insert(parts, text)
+	end
+	return table.concat(parts, ", ")
+end
+
+local function handleReport(...)
+	reportsSeen = reportsSeen + 1
+	pushEvent("REPORT  " .. previewArgs(...), true)
+	if CFG.block then
+		reportsBlocked = reportsBlocked + 1
+		return true
+	end
+	if not (CFG.closure or CFG.admin or CFG.inflate) then
+		defensePending = true
+	end
+	return false
+end
+
+local function installNamecall()
+	if not mt or namecallHook then return namecallHook ~= nil end
+	namecallOld = mt.__namecall
+	if not namecallOld then return false end
+	namecallHook = newcclosure(function(self, ...)
+		if not dead and not checkcaller() then
+			local ok, method = pcall(getnamecallmethod)
+			if ok and (method == "FireServer" or method == "InvokeServer") then
+				local isGuard = self == acRemote
+				if not isGuard and typeof(self) == "Instance" and self.Name == "AntiCheatGuard" then
+					isGuard = self:IsA("BaseRemoteEvent")
+				end
+				if isGuard then
+					if handleReport(...) then
+						return nil
+					end
+				end
+			end
+		end
+		return namecallOld(self, ...)
+	end, "taf_ac_namecall")
+	local ok = writeMetatable(function()
+		mt.__namecall = namecallHook
+	end)
+	if not ok then
+		namecallHook = nil
+		namecallOld = nil
+	end
+	return ok
+end
+
+local function removeNamecall()
+	if not mt or not namecallHook then return end
+	writeMetatable(function()
+		if mt.__namecall == namecallHook then
+			mt.__namecall = namecallOld
+		end
+	end)
+	namecallHook = nil
+	namecallOld = nil
+end
+
+--// attribute fallbacks ---------------------------------------------------------
+
+local function applyAdmin(on)
+	if on then
+		if not saved.admin then
+			saved.admin = true
+			saved.adminValue = LP:GetAttribute("ACAdmin")
+		end
+		LP:SetAttribute("ACAdmin", true)
+	else
+		if saved.admin then
+			LP:SetAttribute("ACAdmin", saved.adminValue)
+			saved.admin = false
+			saved.adminValue = nil
+		else
+			LP:SetAttribute("ACAdmin", nil)
+		end
+	end
+end
+
+local function applyInflate(on)
+	local humanoid = currentHumanoid()
+	if on then
+		if humanoid then
+			if not saved.attrs then
+				-- snapshot once: workspace attributes are already inflated on a respawn
+				saved.attrs = {
+					walk = humanoid:GetAttribute("ACWalk"),
+					jumpPower = humanoid:GetAttribute("ACJumpPower"),
+					jumpHeight = humanoid:GetAttribute("ACJumpHeight"),
+					cap = Workspace:GetAttribute("ACWalkCap"),
+					gravity = Workspace:GetAttribute("ACGravity"),
+				}
+				saved.humanoid = humanoid
+			elseif saved.humanoid ~= humanoid then
+				-- new character: re-snapshot only the humanoid's own values
+				saved.humanoid = humanoid
+				saved.attrs.walk = humanoid:GetAttribute("ACWalk")
+				saved.attrs.jumpPower = humanoid:GetAttribute("ACJumpPower")
+				saved.attrs.jumpHeight = humanoid:GetAttribute("ACJumpHeight")
+			end
+			humanoid:SetAttribute("ACWalk", 999)
+			humanoid:SetAttribute("ACJumpPower", 999)
+			humanoid:SetAttribute("ACJumpHeight", 999)
+		end
+		Workspace:SetAttribute("ACWalkCap", 999)
+		if CFG.lowGravity then
+			Workspace:SetAttribute("ACGravity", Workspace.Gravity)
+		end
+	else
+		local original = saved.attrs
+		if original then
+			local target = saved.humanoid or humanoid
+			if target then
+				target:SetAttribute("ACWalk", original.walk)
+				target:SetAttribute("ACJumpPower", original.jumpPower)
+				target:SetAttribute("ACJumpHeight", original.jumpHeight)
+			end
+			Workspace:SetAttribute("ACWalkCap", original.cap)
+			Workspace:SetAttribute("ACGravity", original.gravity)
+			saved.attrs = nil
+			saved.humanoid = nil
+		end
+	end
+end
+
+local function applyJump(on)
+	local humanoid = currentHumanoid()
+	if not humanoid then return end
+	if on then
+		if not saved.jump or saved.jumpHumanoid ~= humanoid then
+			saved.jump = {
+				use = humanoid.UseJumpPower,
+				power = humanoid.JumpPower,
+				height = humanoid.JumpHeight,
+			}
+			saved.jumpHumanoid = humanoid
+		end
+		humanoid.UseJumpPower = false
+		humanoid.JumpHeight = CFG.jumpHeight
+	else
+		local original = saved.jump
+		if original then
+			local target = saved.jumpHumanoid or humanoid
+			target.UseJumpPower = original.use
+			target.JumpPower = original.power
+			target.JumpHeight = original.height
+			saved.jump = nil
+			saved.jumpHumanoid = nil
+		end
+	end
+end
+
+local function applyGravity(on)
+	if on then
+		if not saved.gravity then
+			saved.gravity = Workspace.Gravity
+			CFG.spoofGravity = saved.gravity
+		end
+		Workspace.Gravity = CFG.gravity
+		if CFG.inflate then
+			Workspace:SetAttribute("ACGravity", CFG.gravity)
+		end
+	else
+		if saved.gravity then
+			Workspace.Gravity = saved.gravity
+			if CFG.inflate then
+				Workspace:SetAttribute("ACGravity", saved.gravity)
+			end
+			saved.gravity = nil
+		end
+	end
+end
+
+--// animation guards ------------------------------------------------------------
+
+local whitelistHook = nil
+local trackGuardHook = nil
+
+local function installAnim()
+	if whitelistHooked then return true end
+	local ok, module = pcall(function()
+		return require(ReplicatedStorage.Shared.AnimWhitelist)
+	end)
+	if not (ok and type(module) == "table" and type(module.allowed) == "function") then
 		return false
 	end
-
-	origAllowed = whitelist.allowed
-	whitelist.allowed = function(...)
-		stats.allowedCalls = stats.allowedCalls + 1
-		if CFG.bypass then return true end
-		return origAllowed(...)
+	whitelist = module
+	whitelistAllowedOriginal = module.allowed
+	whitelistHook = function(...)
+		animAllowedCalls = animAllowedCalls + 1
+		if dead then
+			return whitelistAllowedOriginal(...)
+		end
+		return true
 	end
-	installed = true
+	module.allowed = whitelistHook
+	whitelistHooked = true
+	pushEvent("AnimGuard whitelist detached", true)
 	return true
 end
 
-local function uninstall()
-	CFG.speed = false
-	applySpeed()
-	if not installed then return end
+local function removeAnim()
+	if not whitelistHooked or not whitelist then return end
 	pcall(function()
-		if savedEnabled ~= nil then Workspace:SetAttribute("AntiCheatEnabled", savedEnabled) else Workspace:SetAttribute("AntiCheatEnabled", nil) end
-		if savedAnimGuard ~= nil then Workspace:SetAttribute("AntiCheatAnimGuard", savedAnimGuard) else Workspace:SetAttribute("AntiCheatAnimGuard", nil) end
+		if whitelist.allowed == whitelistHook then
+			whitelist.allowed = whitelistAllowedOriginal
+		end
 	end)
-	local okWhitelist, whitelist = pcall(function()
-		return require(ReplicatedStorage.Shared.AnimWhitelist)
-	end)
-	if okWhitelist and whitelist and origAllowed then
-		pcall(function() whitelist.allowed = origAllowed end)
-	end
-	installed = false
-	print("[SlimTaf] anti-cheat bypass removed")
+	whitelistHooked = false
+	whitelistAllowedOriginal = nil
+	whitelistHook = nil
 end
 
-install()
-applySpeed()
-RunService:BindToRenderStep("SlimTafSpeed", Enum.RenderPriority.Camera.Value + 3, function() applySpeed() end)
-print("[SlimTaf] anti-cheat bypass loaded - AnimGuard allowed() now answers true")
-
---// minimal Rayfield panel ------------------------------------------------------
-local Rayfield
-pcall(function() Rayfield = loadstring(game:HttpGet("https://sirius.menu/gen2"))() end)
-
-local window, statusBox
-local shutOnce = false
-local function shutdown()
-	if shutOnce then return end
-	shutOnce = true
-	pcall(function() RunService:UnbindFromRenderStep("SlimTafSpeed") end)
-	uninstall()
-	if window then
-		pcall(function() window:Unload() end)
-		pcall(function() if window.screenGui then window.screenGui:Destroy() end end)
+local function installTrackGuard()
+	if trackGuardHooked then return true end
+	local ok, module = pcall(function()
+		return require(ReplicatedStorage.TAF_Shared.Client.AnimTrackGuard)
+	end)
+	if not (ok and type(module) == "table" and type(module.Prune) == "function") then
+		return false
 	end
-	_G.SlimTafBypass = nil
-	print("[SlimTaf] panel unloaded")
+	trackGuard = module
+	trackGuardPruneOriginal = module.Prune
+	trackGuardHook = function()
+		animTrackBlocks = animTrackBlocks + 1
+		return 0
+	end
+	module.Prune = trackGuardHook
+	trackGuardHooked = true
+	return true
+end
+
+local function removeTrackGuard()
+	if not trackGuardHooked or not trackGuard then return end
+	pcall(function()
+		if trackGuard.Prune == trackGuardHook then
+			trackGuard.Prune = trackGuardPruneOriginal
+		end
+	end)
+	trackGuardHooked = false
+	trackGuardPruneOriginal = nil
+	trackGuardHook = nil
+end
+
+--// direct walk speed -----------------------------------------------------------
+
+local function applyWalkSpeed(on)
+	local humanoid = currentHumanoid()
+	if on then
+		if humanoid and saved.walkHumanoid ~= humanoid then
+			saved.walkHumanoid = humanoid
+			saved.walkSpeed = humanoid.WalkSpeed
+		end
+		if not walkSpeedBound then
+			RunService:BindToRenderStep("SlimTafWalkSpeed", Enum.RenderPriority.Camera.Value + 3, function()
+				if dead or not CFG.walkSpeed then return end
+				local hum = currentHumanoid()
+				if not hum then return end
+				if saved.walkHumanoid ~= hum then
+					saved.walkHumanoid = hum
+					saved.walkSpeed = hum.WalkSpeed
+				end
+				hum.WalkSpeed = CFG.walkSpeedValue
+			end)
+			walkSpeedBound = true
+		end
+	else
+		if walkSpeedBound then
+			pcall(function() RunService:UnbindFromRenderStep("SlimTafWalkSpeed") end)
+			walkSpeedBound = false
+		end
+		local target = saved.walkHumanoid or humanoid
+		if target and saved.walkSpeed then
+			target.WalkSpeed = saved.walkSpeed
+		end
+		saved.walkHumanoid = nil
+		saved.walkSpeed = nil
+	end
+end
+
+--// layer 4: root step ----------------------------------------------------------
+
+local function stepTick(dt)
+	local humanoid = currentHumanoid()
+	local character = LP.Character
+	local root = character and character:FindFirstChild("HumanoidRootPart")
+	if not (humanoid and root) then return end
+	if humanoid.SeatPart then return end
+	if CFG.groundOnly and humanoid.FloorMaterial == Enum.Material.Air then return end
+	local direction = humanoid.MoveDirection
+	if direction.Magnitude < 0.05 then return end
+	root.CFrame = root.CFrame + direction.Unit * (CFG.stepExtra * math.min(dt, 0.1))
+end
+
+--// jump ------------------------------------------------------------------------
+
+local jumpConn = UserInputService.JumpRequest:Connect(function()
+	if dead or not CFG.infJump then return end
+	local humanoid = currentHumanoid()
+	if humanoid and humanoid.Health > 0 then
+		humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+	end
+end)
+
+--// panic / shutdown ------------------------------------------------------------
+
+local function restoreEverything()
+	applyAdmin(false)
+	applyInflate(false)
+	applyJump(false)
+	applyGravity(false)
+end
+
+local function shutdown()
+	if dead then return end
+	dead = true
+	if ui.loopConn then pcall(function() ui.loopConn:Disconnect() end) end
+	if ui.keyConn then pcall(function() ui.keyConn:Disconnect() end) end
+	if jumpConn then pcall(function() jumpConn:Disconnect() end) end
+	applyWalkSpeed(false)
+	removeAnim()
+	removeTrackGuard()
+	removeNamecall()
+	removeIndex()
+	removeClosure()
+	restoreEverything()
+	if ui.window then pcall(function() ui.window:Unload() end) end
+	_G.TafAcBypass = { cfg = CFG }
+	print("[TAF-AC] unloaded")
+end
+
+local panic
+
+panic = function()
+	if dead then return end
+	CFG.closure = false
+	CFG.block = false
+	CFG.index = false
+	CFG.admin = false
+	CFG.inflate = false
+	CFG.rootStep = false
+	CFG.infJump = false
+	CFG.customJump = false
+	CFG.lowGravity = false
+	CFG.anim = false
+	CFG.animTracks = false
+	CFG.walkSpeed = false
+	restoreEverything()
+	applyWalkSpeed(false)
+	removeAnim()
+	removeTrackGuard()
+	removeClosure()
+	removeIndex()
+	removeNamecall()
+	if ui.window then
+		for _, flag in ipairs({
+			"taf_closure", "taf_block", "taf_index", "taf_admin",
+			"taf_inflate", "taf_step", "taf_infjump", "taf_jump", "taf_gravity",
+			"taf_anim", "taf_animtracks", "taf_walkspeed",
+		}) do
+			pcall(function() ui.window:Set(flag, false) end)
+		end
+	end
+	pushEvent("PANIC  hooks removed, attributes restored", true)
+	print("[TAF-AC] panic")
+end
+
+--// UI --------------------------------------------------------------------------
+
+local Rayfield
+pcall(function()
+	Rayfield = loadstring(game:HttpGet("https://sirius.menu/gen2"))()
+end)
+
+local function stateText()
+	local parts = {
+		"closure " .. (closureHooked and "ON" or "off"),
+		"block " .. (namecallHook and (CFG.block and "ON" or "watch") or "off"),
+		"index " .. (indexHook and (CFG.index and "ON" or "watch") or "off"),
+		"admin " .. (CFG.admin and "on" or "off"),
+		"inflate " .. (CFG.inflate and "on" or "off"),
+	}
+	return table.concat(parts, "  |  ")
+end
+
+local function coverageText()
+	local covered = closureHooked or CFG.admin or CFG.inflate
+	if covered then
+		return "guard coverage: yes (" .. (closureHooked and "closure" or (CFG.admin and "ACAdmin" or "inflation")) .. ")"
+	end
+	return "guard coverage: NO - MoveGuard will clamp and report"
 end
 
 local function buildUI()
-	if not Rayfield then return end
-	local w = Rayfield:CreateWindow({
-		Name = "TAF | SLIM",
-		LoadingTitle = "SLIM TAF",
-		LoadingSubtitle = "anti-cheat bypass",
+	if not Rayfield then
+		warn("[TAF-AC] Rayfield failed to load")
+		return
+	end
+
+	-- CFG is the source of truth. Rayfield replays its saved flags while the
+	-- elements are created, and that can fire callbacks which mutate CFG.
+	-- snapshot here, restore after the window is built.
+	local desired = {}
+	for key, value in pairs(CFG) do
+		desired[key] = value
+	end
+
+	local window = Rayfield:CreateWindow({
+		Name = "TAF // AC BYPASS",
+		LoadingTitle = "THROW A FOOTBALL",
+		LoadingSubtitle = "MoveGuard  -  five layers",
 		KeySystem = false,
 	})
-	window = w
-	local tab = w:CreateTab({ name = "STEALTH" })
-	tab:CreateToggle({
-		name = "anti-cheat bypass",
-		description = "muffle AnimGuard + keep animations allowed",
-		value = CFG.bypass,
-		callback = function(v)
-			CFG.bypass = v
-			if v then install() else uninstall() end
+	ui.window = window
+
+	pcall(function()
+		window:ChangeTheme({
+			WindowColor = ColorSequence.new({
+				ColorSequenceKeypoint.new(0, Color3.fromRGB(8, 14, 10)),
+				ColorSequenceKeypoint.new(1, Color3.fromRGB(16, 26, 18)),
+			}),
+			ShadowColor = Color3.fromRGB(4, 8, 5),
+			CornerRoundness = UDim.new(0, 16),
+			ElementCornerRadius = UDim.new(0, 10),
+			PillCornerRadius = UDim.new(1, 0),
+			AccentColor = Color3.fromRGB(120, 230, 140),
+		})
+	end)
+
+	-- BYPASS
+	local bypassTab = window:CreateTab({ Name = "BYPASS" })
+	ui.stateText = bypassTab:CreateText({ Name = "layers", Text = stateText() })
+	ui.coverText = bypassTab:CreateText({ Name = "coverage", Text = coverageText() })
+
+	bypassTab:CreateToggle({
+		Name = "closure hook",
+		Description = "detaches MoveGuard._check, the exact closure its 0.25s loop calls. client-side only, nothing replicates.",
+		Flag = "taf_closure",
+		Value = CFG.closure,
+		Callback = function(v)
+			CFG.closure = v
+			if v then
+				if not installClosure() then
+					notify("closure layer unavailable - guard table not found")
+				end
+			else
+				removeClosure()
+			end
 		end,
 	})
-	tab:CreateToggle({
-		name = "speed",
-		description = "patch QBWalkSpeed + WalkSpeed, survives the per-frame reset",
-		value = CFG.speed,
-		callback = function(v) CFG.speed = v applySpeed() end,
+	bypassTab:CreateToggle({
+		Name = "block AntiCheatGuard",
+		Description = "namecall hook drops the report remote. reports still show in LOG, just never leave.",
+		Flag = "taf_block",
+		Value = CFG.block,
+		Callback = function(v)
+			CFG.block = v
+			if v then
+				installNamecall()
+			end
+		end,
 	})
-	tab:CreateSlider({
-		name = "walkspeed",
-		description = "stock is 18",
-		range = {5, 150},
-		increment = 1,
-		value = CFG.speedVal,
-		suffix = " ws",
-		callback = function(v) CFG.speedVal = v applySpeed() end,
+	bypassTab:CreateToggle({
+		Name = "index spoof",
+		Description = "caps WalkSpeed, JumpPower, JumpHeight and Gravity reads made by game code at the legitimate values.",
+		Flag = "taf_index",
+		Value = CFG.index,
+		Callback = function(v)
+			CFG.index = v
+			if v then
+				installIndex()
+			end
+		end,
 	})
-	tab:CreateButton({ name = "reload bypass", description = "re-install the whitelist hook", callback = function() install() end })
-	tab:CreateButton({ name = "unload", description = "uninstall cleanly", callback = shutdown })
-	statusBox = tab:CreateConsole({ name = "log", height = 140, follow = false })
-	if statusBox then pcall(function() statusBox:Set("slim taf loaded | anti-cheat bypass") end) end
+
+	bypassTab:CreateSection({ Name = "ANIMATION GUARDS" })
+	bypassTab:CreateToggle({
+		Name = "AnimGuard whitelist",
+		Description = "AnimWhitelist.allowed answers true, so the client stops policing other players' animation tracks. table field only.",
+		Flag = "taf_anim",
+		Value = CFG.anim,
+		Callback = function(v)
+			CFG.anim = v
+			if v then
+				if not installAnim() then
+					notify("AnimWhitelist not found - animation layer unavailable")
+				end
+			else
+				removeAnim()
+			end
+		end,
+	})
+	bypassTab:CreateToggle({
+		Name = "animation track cap",
+		Description = "stubs AnimTrackGuard.Prune, the 16-track limiter. visual only, no report channel.",
+		Flag = "taf_animtracks",
+		Value = CFG.animTracks,
+		Callback = function(v)
+			CFG.animTracks = v
+			if v then
+				if not installTrackGuard() then
+					notify("AnimTrackGuard not found - track layer unavailable")
+				end
+			else
+				removeTrackGuard()
+			end
+		end,
+	})
+
+	bypassTab:CreateSection({ Name = "FALLBACKS  (replicated attributes)" })
+	bypassTab:CreateText({
+		Name = "fallback note",
+		Text = "these write attributes the server can see. only needed if the closure or namecall layers fail.",
+	})
+	bypassTab:CreateToggle({
+		Name = "ACAdmin attribute",
+		Description = "MoveGuard returns before checking anything. replicated - the server can read it.",
+		Flag = "taf_admin",
+		Value = CFG.admin,
+		Callback = function(v)
+			CFG.admin = v
+			applyAdmin(v)
+		end,
+	})
+	bypassTab:CreateToggle({
+		Name = "attribute inflation",
+		Description = "forces ACWalk, ACWalkCap and the jump limits high so the guard sees nothing. replicated.",
+		Flag = "taf_inflate",
+		Value = CFG.inflate,
+		Callback = function(v)
+			CFG.inflate = v
+			applyInflate(v)
+		end,
+	})
+
+	bypassTab:CreateSection({ Name = "TOOLS" })
+	bypassTab:CreateButton({
+		Name = "arm all client-side layers",
+		Description = "closure + block + index + AnimGuard. no replicated attributes touched.",
+		Callback = function()
+			CFG.closure = true
+			CFG.block = true
+			CFG.index = true
+			CFG.anim = true
+			installClosure()
+			installNamecall()
+			installIndex()
+			installAnim()
+			for _, flag in ipairs({ "taf_closure", "taf_block", "taf_index", "taf_anim" }) do
+				pcall(function() window:Set(flag, true) end)
+			end
+			notify("client-side layers armed: closure + block + index + AnimGuard")
+		end,
+	})
+	bypassTab:CreateButton({
+		Name = "probe guard",
+		Description = "re-finds MoveGuard and reports which layers are attached.",
+		Callback = function()
+			refreshAcRemote()
+			local source = findGuard()
+			notify(string.format(
+				"guard %s | closure %s | remote %s | block %s",
+				tostring(source),
+				closureHooked and "attached" or "detached",
+				acRemote and "found" or "missing",
+				namecallHook and "hooked" or "none"
+			))
+		end,
+	})
+
+	-- MOVEMENT
+	local moveTab = window:CreateTab({ Name = "MOVEMENT" })
+	moveTab:CreateSection({ Name = "SPEED" })
+	moveTab:CreateText({
+		Name = "speed note",
+		Text = "DriveExtras rewrites Humanoid.WalkSpeed to 18 every frame. root step moves the root part instead and leaves WalkSpeed at 18.",
+	})
+	moveTab:CreateToggle({
+		Name = "root step",
+		Description = "HumanoidRootPart.CFrame movement along your input direction.",
+		Flag = "taf_step",
+		Value = CFG.rootStep,
+		Callback = function(v) CFG.rootStep = v end,
+	})
+	moveTab:CreateSlider({
+		Name = "extra studs per second",
+		Range = { 0, 60 },
+		Increment = 1,
+		Value = CFG.stepExtra,
+		Suffix = " studs",
+		Flag = "taf_stepextra",
+		Callback = function(v) CFG.stepExtra = v end,
+	})
+	moveTab:CreateToggle({
+		Name = "ground only",
+		Description = "stop stepping while airborne. keeps movement closer to normal physics.",
+		Flag = "taf_groundonly",
+		Value = CFG.groundOnly,
+		Callback = function(v) CFG.groundOnly = v end,
+	})
+
+	moveTab:CreateSection({ Name = "DIRECT SPEED" })
+	moveTab:CreateText({
+		Name = "direct speed note",
+		Text = "writes Humanoid.WalkSpeed on RenderStep, after the controller's own write. needs closure, ACAdmin or inflation or MoveGuard clamps it back.",
+	})
+	moveTab:CreateToggle({
+		Name = "walk speed override",
+		Description = "physics movement at the chosen WalkSpeed instead of root stepping.",
+		Flag = "taf_walkspeed",
+		Value = CFG.walkSpeed,
+		Callback = function(v)
+			CFG.walkSpeed = v
+			applyWalkSpeed(v)
+		end,
+	})
+	moveTab:CreateSlider({
+		Name = "walk speed",
+		Range = { 18, 150 },
+		Increment = 1,
+		Value = CFG.walkSpeedValue,
+		Suffix = " ws",
+		Flag = "taf_walkspeedvalue",
+		Callback = function(v) CFG.walkSpeedValue = v end,
+	})
+
+	moveTab:CreateSection({ Name = "JUMP" })
+	moveTab:CreateToggle({
+		Name = "infinite jump",
+		Flag = "taf_infjump",
+		Value = CFG.infJump,
+		Callback = function(v) CFG.infJump = v end,
+	})
+	moveTab:CreateToggle({
+		Name = "custom jump height",
+		Description = "writes JumpHeight. needs closure, ACAdmin or inflation to survive the guard.",
+		Flag = "taf_jump",
+		Value = CFG.customJump,
+		Callback = function(v)
+			CFG.customJump = v
+			applyJump(v)
+		end,
+	})
+	moveTab:CreateSlider({
+		Name = "jump height",
+		Range = { 7, 60 },
+		Increment = 1,
+		Value = CFG.jumpHeight,
+		Suffix = " studs",
+		Flag = "taf_jumpheight",
+		Callback = function(v)
+			CFG.jumpHeight = v
+			if CFG.customJump then
+				applyJump(true)
+			end
+		end,
+	})
+
+	moveTab:CreateSection({ Name = "GRAVITY" })
+	moveTab:CreateToggle({
+		Name = "low gravity",
+		Description = "writes Workspace.Gravity. needs closure, ACAdmin or inflation to survive the guard.",
+		Flag = "taf_gravity",
+		Value = CFG.lowGravity,
+		Callback = function(v)
+			CFG.lowGravity = v
+			applyGravity(v)
+		end,
+	})
+	moveTab:CreateSlider({
+		Name = "workspace gravity",
+		Range = { 20, 300 },
+		Increment = 10,
+		Value = CFG.gravity,
+		Suffix = " g",
+		Flag = "taf_gravityvalue",
+		Callback = function(v)
+			CFG.gravity = v
+			if CFG.lowGravity then
+				applyGravity(true)
+			end
+		end,
+	})
+
+	-- LOG
+	local logTab = window:CreateTab({ Name = "LOG" })
+	ui.reportText = logTab:CreateText({ Name = "counters", Text = "reports 0  |  blocked 0" })
+	ui.logText = logTab:CreateText({ Name = "events", Text = "-" })
+	logTab:CreateButton({
+		Name = "clear log",
+		Callback = function()
+			events = {}
+			logDirty = true
+		end,
+	})
+	logTab:CreateButton({
+		Name = "panic  (P)",
+		Description = "removes every hook and restores ACAdmin, attributes, jump and gravity.",
+		Callback = function() panic() end,
+	})
+	logTab:CreateButton({
+		Name = "unload",
+		Callback = function() shutdown() end,
+	})
+	logTab:CreateText({
+		Name = "honesty",
+		Text = "a server-side kick cannot be cancelled by any client hook. these layers stop client reports and client reads.",
+	})
+	logTab:CreateText({
+		Name = "keys",
+		Text = "P = panic   |   re-running replaces this panel",
+	})
+
+	-- Rayfield restores its own stale flag values on a new window; push cfg back.
+	for key, value in pairs(desired) do
+		CFG[key] = value
+	end
+	local sync = {
+		taf_closure = CFG.closure,
+		taf_block = CFG.block,
+		taf_index = CFG.index,
+		taf_admin = CFG.admin,
+		taf_inflate = CFG.inflate,
+		taf_step = CFG.rootStep,
+		taf_stepextra = CFG.stepExtra,
+		taf_groundonly = CFG.groundOnly,
+		taf_infjump = CFG.infJump,
+		taf_jump = CFG.customJump,
+		taf_jumpheight = CFG.jumpHeight,
+		taf_gravity = CFG.lowGravity,
+		taf_gravityvalue = CFG.gravity,
+		taf_anim = CFG.anim,
+		taf_animtracks = CFG.animTracks,
+		taf_walkspeed = CFG.walkSpeed,
+		taf_walkspeedvalue = CFG.walkSpeedValue,
+	}
+	for flag, value in pairs(sync) do
+		pcall(function() window:Set(flag, value) end)
+	end
+	-- the stale callbacks may have applied side effects; normalise them to CFG
+	if CFG.admin then applyAdmin(true) else applyAdmin(false) end
+	if CFG.inflate then applyInflate(true) else applyInflate(false) end
+	if CFG.customJump then applyJump(true) else applyJump(false) end
+	if CFG.lowGravity then applyGravity(true) else applyGravity(false) end
+	if CFG.walkSpeed then applyWalkSpeed(true) else applyWalkSpeed(false) end
+	if CFG.anim then installAnim() else removeAnim() end
+	if CFG.animTracks then installTrackGuard() else removeTrackGuard() end
+	if CFG.closure then installClosure() else removeClosure() end
+	if CFG.index then installIndex() else removeIndex() end
 end
 
-local uiOk = pcall(buildUI)
-if not uiOk then warn("[SlimTaf] rayfield failed to load - running headless") end
+--// loop ------------------------------------------------------------------------
 
-_G.SlimTafBypass = { cfg = CFG, stats = stats, install = install, uninstall = uninstall, stop = shutdown }
+local lastApply = 0
+local lastSync = 0
+local lastSave = 0
+local lastGuardCheck = 0
+local lastRemoteCheck = 0
+
+local function tick(dt)
+	if dead then return end
+	local now = os.clock()
+
+	if now - lastRemoteCheck > 3 then
+		lastRemoteCheck = now
+		refreshAcRemote()
+	end
+
+	indexTarget = currentHumanoid()
+
+	if now - lastGuardCheck > 2 then
+		lastGuardCheck = now
+		if CFG.closure and not closureHooked then installClosure() end
+		if CFG.anim and not whitelistHooked then installAnim() end
+		if CFG.animTracks and not trackGuardHooked then installTrackGuard() end
+		if CFG.walkSpeed and not walkSpeedBound then applyWalkSpeed(true) end
+	end
+
+	if now - lastApply > 0.5 then
+		lastApply = now
+		if CFG.admin then
+			LP:SetAttribute("ACAdmin", true)
+		end
+		if CFG.inflate then
+			applyInflate(true)
+		end
+		if CFG.customJump then
+			local humanoid = currentHumanoid()
+			if humanoid then
+				humanoid.UseJumpPower = false
+				humanoid.JumpHeight = CFG.jumpHeight
+			end
+		end
+		if CFG.lowGravity then
+			Workspace.Gravity = CFG.gravity
+			if CFG.inflate then
+				Workspace:SetAttribute("ACGravity", CFG.gravity)
+			end
+		end
+	end
+
+	if defensePending then
+		defensePending = false
+		CFG.admin = true
+		CFG.inflate = true
+		applyAdmin(true)
+		applyInflate(true)
+		if ui.window then
+			pcall(function() ui.window:Set("taf_admin", true) end)
+			pcall(function() ui.window:Set("taf_inflate", true) end)
+		end
+		notify("a report escaped - ACAdmin + inflation armed as cover")
+	end
+
+	if CFG.rootStep then
+		pcall(stepTick, dt)
+	end
+
+	if now - lastSync > 0.4 then
+		lastSync = now
+		if ui.stateText then
+			pcall(function() ui.stateText:Set(stateText()) end)
+		end
+		if ui.coverText then
+			pcall(function() ui.coverText:Set(coverageText()) end)
+		end
+		if ui.reportText then
+			pcall(function()
+				ui.reportText:Set(string.format(
+					"reports %d  |  blocked %d\nclosure %d  |  index %d  |  anim whitelist %d  |  track prunes %d",
+					reportsSeen, reportsBlocked, closureHits, indexReads, animAllowedCalls, animTrackBlocks
+				))
+			end)
+		end
+		if logDirty then
+			logDirty = false
+			if ui.logText then
+				local text = #events > 0 and table.concat(events, "\n") or "-"
+				pcall(function() ui.logText:Set(text) end)
+			end
+		end
+	end
+
+	if now - lastSave > 4 then
+		lastSave = now
+		pcall(saveCfg)
+	end
+end
+
+--// start -----------------------------------------------------------------------
+
+refreshAcRemote()
+findGuard()
+indexTarget = currentHumanoid()
+
+if CFG.closure then installClosure() end
+-- always install: even with blocking off it is the report watcher
+installNamecall()
+if CFG.index then installIndex() end
+if CFG.anim then installAnim() end
+if CFG.animTracks then installTrackGuard() end
+if CFG.walkSpeed then applyWalkSpeed(true) end
+if CFG.admin then applyAdmin(true) end
+if CFG.inflate then applyInflate(true) end
+if CFG.customJump then applyJump(true) end
+if CFG.lowGravity then applyGravity(true) end
+
+buildUI()
+
+if ui.window then
+	ui.keyConn = UserInputService.InputBegan:Connect(function(input, processed)
+		if processed then return end
+		if input.KeyCode == Enum.KeyCode.P then
+			panic()
+		end
+	end)
+end
+
+ui.loopConn = RunService.Heartbeat:Connect(function(dt)
+	local ok, err = pcall(tick, dt)
+	if not ok then
+		warn("[TAF-AC] tick error: " .. tostring(err))
+	end
+end)
+
+_G.TafAcBypass = {
+	cfg = CFG,
+	window = ui.window,
+	stop = shutdown,
+	panic = panic,
+	state = function()
+		return string.format(
+			"closure=%s(%d) block=%s index=%s(%d) anim=%s(%d) tracks=%s admin=%s inflate=%s speed=%s reports=%d blocked=%d guard=%s",
+			tostring(closureHooked), closureHits, tostring(namecallHook ~= nil), tostring(indexHook ~= nil),
+			indexReads, tostring(whitelistHooked), animAllowedCalls, tostring(trackGuardHooked),
+			tostring(CFG.admin), tostring(CFG.inflate), tostring(walkSpeedBound),
+			reportsSeen, reportsBlocked, tostring(guardSource)
+		)
+	end,
+	probe = function()
+		refreshAcRemote()
+		local source = findGuard()
+		local humanoid = currentHumanoid()
+		return {
+			guardSource = source,
+			closureHooked = closureHooked,
+			closureHits = closureHits,
+			namecall = namecallHook ~= nil,
+			index = indexHook ~= nil,
+			indexReads = indexReads,
+			anim = whitelistHooked,
+			animCalls = animAllowedCalls,
+			animTracks = trackGuardHooked,
+			trackBlocks = animTrackBlocks,
+			walkSpeed = walkSpeedBound,
+			remote = acRemote ~= nil,
+			admin = LP:GetAttribute("ACAdmin"),
+			acWalk = humanoid and humanoid:GetAttribute("ACWalk"),
+			cap = Workspace:GetAttribute("ACWalkCap"),
+			gravityAttr = Workspace:GetAttribute("ACGravity"),
+			gravity = Workspace.Gravity,
+			reportsSeen = reportsSeen,
+			reportsBlocked = reportsBlocked,
+		}
+	end,
+	testReport = function(...)
+		local before = reportsSeen
+		local swallowed = handleReport(...)
+		return swallowed, reportsSeen > before
+	end,
+	armAll = function()
+		CFG.closure = true
+		CFG.block = true
+		CFG.index = true
+		CFG.anim = true
+		installClosure()
+		installNamecall()
+		installIndex()
+		installAnim()
+	end,
+}
+
+_G.SlimTafBypass = _G.TafAcBypass
+
+pushEvent("panel loaded", true)
+pcall(saveCfg)
+
+print("[TAF-AC] loaded - closure, index, namecall, root step")
 end
 
 --// embedded suite: physbox  (from physbox.luau) =========================
