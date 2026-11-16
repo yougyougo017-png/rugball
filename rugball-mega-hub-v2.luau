@@ -8843,6 +8843,10 @@ local function installLaunch()
 				drift = Vector3.new(0, 0, 0)
 			end
 		end
+		stats.lastPos = pos
+		stats.lastVel = vel
+		stats.lastPoint = e and e.point or nil
+		stats.lastName = e and e.name or nil
 		return orig(self, pos, vel, grav, perfect, wobble, drift)
 	end
 	local ok = pcall(function()
@@ -9476,6 +9480,7 @@ local function probe()
 		"aimed=" .. tostring(stats.aimed),
 		"auto=" .. tostring(stats.auto),
 		"skipped=" .. tostring(stats.missed),
+		"last=" .. (stats.lastName and (stats.lastName .. " |v| " .. string.format("%.1f", stats.lastVel and stats.lastVel.Magnitude or 0)) or "nil"),
 	}
 	return table.concat(rows, "\n")
 end
