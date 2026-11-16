@@ -7975,6 +7975,15 @@ if prev and prev.stop then
 	pcall(prev.stop)
 end
 
+-- the previous hub build shipped this suite as _G.SlimQBAimState and used
+-- QBAimHud / QBAimEsp / QBAimThrow. shut that copy down too, otherwise its
+-- Launch hook and HUD would survive the upgrade.
+local legacy = _G.SlimQBAimState
+if legacy and legacy.stop then
+	pcall(legacy.stop)
+end
+_G.SlimQBAimState = nil
+
 --// config --------------------------------------------------------------------
 
 local DEFAULTS = {
@@ -7996,7 +8005,7 @@ local DEFAULTS = {
 	autoDelay = 0.55,
 	respectUi = true,
 	minGap = 5,
-	maxDistance = 260,
+	maxDistance = 300,
 	speedCap = 110,
 	lead = true,
 }
@@ -8055,14 +8064,47 @@ local TAG = "SlimQbAim"
 local HUD_NAME = "SlimQbAimHud"
 local FX_NAME = "SlimQbAimFx"
 
+-- anything an earlier build of this suite (or the old 17 KB one) left behind if
+-- the session was reloaded without a clean unload. these names are specific
+-- enough that clearing them cannot touch the game's own UI.
+local function sweepLegacy()
+	local pg = LP:FindFirstChild("PlayerGui")
+	if pg then
+		for _, name in ipairs({ "QBAimHud", "QBAimGui", "QBAimEsp", HUD_NAME }) do
+			local inst = pg:FindFirstChild(name)
+			if inst then
+				pcall(function()
+					inst:Destroy()
+				end)
+			end
+		end
+	end
+	for _, name in ipairs({ "QBAimEsp", "QBAimArc", "QBAimFx", FX_NAME }) do
+		local inst = Workspace:FindFirstChild(name)
+		if inst then
+			pcall(function()
+				inst:Destroy()
+			end)
+		end
+	end
+	for _, name in ipairs({ "QBAim", "QBAimRender", "SlimQBAim" }) do
+		pcall(function()
+			RunService:UnbindFromRenderStep(name)
+		end)
+	end
+end
+
+sweepLegacy()
+
 local OPEN_COLOR = Color3.fromRGB(120, 230, 140)
 local CUT_COLOR = Color3.fromRGB(255, 96, 96)
 local FAR_COLOR = Color3.fromRGB(255, 160, 60)
 local LOCK_COLOR = Color3.fromRGB(255, 221, 35)
 
 local dead = false
-local ui = { flags = {} }
-local hooks = {}
+local inputConn = nil
+local ui = { flags = {}, window = nil, status = nil }
+local hooks = { launch = false, snap = false, powerSaved = false, rankSaved = false }
 local stats = { throws = 0, aimed = 0, auto = 0, lastSpeed = 0, missed = 0 }
 local pick = nil
 local targetList = {}
@@ -8361,6 +8403,12 @@ local function build(now)
 	end
 
 	table.sort(list, function(a, b)
+		if a.reachable ~= b.reachable then
+			return a.reachable
+		end
+		if a.open ~= b.open then
+			return a.open
+		end
 		return a.score > b.score
 	end)
 	targetList = list
@@ -8372,7 +8420,25 @@ local function build(now)
 	elseif CFG.autoTarget then
 		pick = list[1]
 	else
+		-- crosshair mode: the receiver closest to where the camera is looking,
+		-- inside the same cone that the assist slider widens.
+		local cam = Workspace.CurrentCamera
 		pick = nil
+		if cam then
+			local look = cam.CFrame.LookVector
+			local bestDot = math.cos(math.rad(math.clamp(CFG.assistAngle, 10, 80)))
+			for i = 1, #list do
+				local e = list[i]
+				local d = e.point - origin
+				if d.Magnitude > 0.1 then
+					local dot = look:Dot(d.Unit)
+					if dot > bestDot then
+						bestDot = dot
+						pick = e
+					end
+				end
+			end
+		end
 	end
 end
 
@@ -8728,6 +8794,9 @@ local function updateHud(now)
 			"pwr %d%%   need %.1f   cap %.0f",
 			math.floor(e.slider * 100), e.speed, CFG.speedCap
 		)
+	elseif not CFG.autoTarget then
+		lines[#lines + 1] = "crosshair mode: look at a receiver"
+		lines[#lines + 1] = "or press F to cycle"
 	else
 		lines[#lines + 1] = "no receiver in range"
 		lines[#lines + 1] = "waiting for a route"
@@ -8760,7 +8829,7 @@ local function installLaunch()
 			if CFG.idealSpeed then
 				local dir = TCfg.launchDirection(pos, e.point)
 				local speed = TCfg.idealSpeed(pos, e.point, dir)
-				if speed and speed <= CFG.speedCap then
+				if speed and speed <= CFG.speedCap and e.reachable then
 					vel = dir * speed
 					stats.aimed = stats.aimed + 1
 					stats.lastSpeed = speed
@@ -8793,7 +8862,7 @@ local function installSnap()
 	end
 	local function resolver()
 		local e = pick
-		if not e then
+		if not e or not e.reachable then
 			return nil
 		end
 		return { { Position = e.raw, Velocity = e.vel or Vector3.zero } }
@@ -9058,7 +9127,7 @@ local function buildUI()
 	reg("qb_auto", "autoTarget")
 	aimTab:CreateToggle({
 		Name = "auto target",
-		Description = "picks the receiver with the most separation instead of the one nearest the crosshair.",
+		Description = "picks the most open receiver automatically. off means the receiver nearest your camera crosshair.",
 		Flag = "qb_auto",
 		Value = CFG.autoTarget,
 		Callback = function(v)
@@ -9167,7 +9236,8 @@ local function buildUI()
 	reg("qb_range", "maxDistance")
 	aimTab:CreateSlider({
 		Name = "max distance",
-		Range = { 40, 300 },
+		Description = "longest throw the solver will aim. 300 is about the range limit of a 110 studs/s throw.",
+		Range = { 40, 320 },
 		Increment = 5,
 		Value = CFG.maxDistance,
 		Suffix = " st",
@@ -9464,6 +9534,12 @@ local function shutdown()
 	if fxFolder then
 		fxFolder:Destroy()
 	end
+	if inputConn then
+		pcall(function()
+			inputConn:Disconnect()
+		end)
+		inputConn = nil
+	end
 	pcall(function()
 		RunService:UnbindFromRenderStep(TAG)
 	end)
@@ -9495,7 +9571,7 @@ _G.SlimQbAim = {
 
 --// input ---------------------------------------------------------------------
 
-UserInputService.InputBegan:Connect(function(input, gpe)
+inputConn = UserInputService.InputBegan:Connect(function(input, gpe)
 	if dead or gpe then
 		return
 	end
