@@ -13,7 +13,7 @@
 		126424052816775  NBA: Heroes              nba, then swish
 		122283827051026  NBA: Heroes (place v144) nba
 		134954408729617  Basketball Duels         duels
-		125942529011157  Throw A Football         taf bypass, then qb aimbot
+		125942529011157  Throw A Football         qb aimbot (bypass built in)
 		96120449121277   PhysBox (HitBout)       physbox
 		335760407        TPS: Street Soccer      tps
 		75703135112691   TPS: Street Soccer      tps (match sub-place)
@@ -71,7 +71,7 @@ Hub.SUITE_NAMES = {
 	nba        = "nba panel         |  court suite",
 	swish      = "swish             |  auto perfect shot",
 	duels      = "duels panel       |  court panel",
-	qb_aimbot  = "qb aimbot         |  ballistic solver",
+	qb_aimbot  = "qb aimbot         |  ballistic solver / auto play / rebirth",
 	taf_bypass = "taf bypass        |  moveguard / animguard / speed",
 	physbox    = "physbox corner    |  autopilot / full power / inf stamina",
 	tps        = "tps street         |  auto shot / tackle / GK / esp",
@@ -7944,9 +7944,10 @@ Hub.SUITE.qb_aimbot = function()
 
 	what "better" means here
 	  * target = the receiver with the most separation from the nearest defender,
-	    not the one closest to the crosshair. separation is measured to the catch
-	    point and to the throw line, so a defender sitting under the route still
-	    counts as coverage.
+	    not the one closest to the crosshair. the defender list is the game's own
+	    GameRigs.Away.Covers unit, and separation is measured to the catch point
+	    and to the throw line, so a defender sitting under the route still counts
+	    as coverage.
 	  * the lead uses the game's own three-pass leadPoint loop, so a running
 	    receiver is met where he will be, not where he is.
 	  * BallController.Launch is wrapped, not replaced: the controller's state
@@ -7956,7 +7957,16 @@ Hub.SUITE.qb_aimbot = function()
 	  * power assist is the game's own PowerAssist field; the rank override is
 	    opt-in and off by default.
 	  * auto throw drives the game's real throw input (a mouse click) instead of
-	    calling Launch behind the controller's back.
+	    calling Launch behind the controller's back. it waits for a clean look,
+	    then charges and releases.
+	  * auto play calls ModeController.StartGame, the same path the Play button
+	    takes, so it obeys the lobby, tutorial and match state machine. it retries
+	    whenever the game says a match cannot start yet. once a ball is in hand it
+	    waits holdWait for separation and then releases even into tight coverage,
+	    so a covered drive cannot stall.
+	  * auto rebirth uses the Rebirth panel's own Request("Rebirth") path and only
+	    fires when the profile money covers Formulas.rebirthCost for the next
+	    level, so the server still validates every reset.
 
 	keys
 	  RightShift  master toggle        F  cycle target
@@ -7964,7 +7974,8 @@ Hub.SUITE.qb_aimbot = function()
 	  T           auto throw           E  release now
 	  P           panic
 
-	_G.SlimQbAim exports cfg, stats, pick, list, probe, throw, cycle, panic, stop.
+	_G.SlimQbAim exports cfg, stats, pick, list, probe, throw, cycle, panic, stop,
+	play, rebirth, farm.
 --]]
 
 if game.PlaceId ~= 125942529011157 then
@@ -8014,6 +8025,11 @@ local DEFAULTS = {
 	hud = true,
 	autoThrow = false,
 	autoDelay = 0.55,
+	holdWait = 2.5,
+	autoPlay = false,
+	playDelay = 4,
+	autoRebirth = false,
+	rebirthDelay = 5,
 	respectUi = true,
 	minGap = 5,
 	maxDistance = 300,
@@ -8136,9 +8152,9 @@ local LOCK_COLOR = Color3.fromRGB(255, 221, 35)
 
 local dead = false
 local inputConn = nil
-local ui = { flags = {}, window = nil, status = nil, acState = nil, acCover = nil, acCounters = nil, acLogText = nil }
+local ui = { flags = {}, window = nil, status = nil, acState = nil, acCover = nil, acCounters = nil, acLogText = nil, farm = nil }
 local hooks = { launch = false, snap = false, powerSaved = false, rankSaved = false }
-local stats = { throws = 0, aimed = 0, auto = 0, lastSpeed = 0, missed = 0 }
+local stats = { throws = 0, aimed = 0, auto = 0, plays = 0, rebirths = 0, lastSpeed = 0, missed = 0 }
 local pick = nil
 local targetList = {}
 local cycle = 0
@@ -8147,6 +8163,7 @@ local lastHud = 0
 local lastStatus = 0
 local nextClick = 0
 local autoAt = 0
+local holdAt = 0
 local statusLine = "starting"
 
 --// anti-cheat bypass ---------------------------------------------------------
@@ -8914,6 +8931,7 @@ local TAF = ReplicatedStorage:FindFirstChild("TAF_Shared")
 local Shared = TAF and TAF:FindFirstChild("Shared")
 local TCfg = softRequire(Shared and Shared:FindFirstChild("ThrowConfig"))
 local GCfg = softRequire(Shared and Shared:FindFirstChild("GameConfig"))
+local Formulas = softRequire(Shared and Shared:FindFirstChild("Formulas"))
 
 if not BC and TAF then
 	local Client = TAF:FindFirstChild("Client")
@@ -8955,6 +8973,180 @@ end
 
 local HANDS = tonumber(GCfg and GCfg.HandsHeight) or 1.3
 local GRAVITY = tonumber(TCfg.Gravity) or 40
+
+--// auto play + rebirth --------------------------------------------------------
+-- ModeController owns the lobby/match state machine ("Practice", "Game",
+-- "Encounter", "Spectate"). StartGame asks the server for GameStart and only
+-- works outside a live game, so the loop below is a queue tick, not a teleport.
+-- RebirthPanel:Request("Rebirth") is the same path the panel button takes; the
+-- server validates the cost and owns the reset.
+
+local ModeCtl = nil
+local PanelCtl = nil
+local playAt = 0
+local rebirthAt = 0
+local playPending = false
+local rebirthPending = false
+local lastMode = nil
+
+local function requireController(name)
+	local inst = Controllers and Controllers:FindFirstChild(name)
+	if not inst then return nil end
+	local ok, mod = pcall(require, inst)
+	if ok and type(mod) == "table" then
+		return mod
+	end
+	return nil
+end
+
+local function modeController()
+	if not ModeCtl then
+		ModeCtl = requireController("ModeController")
+	end
+	return ModeCtl
+end
+
+local function panelController()
+	if not PanelCtl then
+		PanelCtl = requireController("PanelController")
+	end
+	return PanelCtl
+end
+
+local function rebirthCost(level)
+	if Formulas and type(Formulas.rebirthCost) == "function" then
+		local ok, value = pcall(Formulas.rebirthCost, level)
+		if ok and tonumber(value) then
+			return tonumber(value)
+		end
+	end
+	return math.floor(7500 * 2.5 ^ math.max(0, tonumber(level) or 0) + 0.5)
+end
+
+local function shortMoney(value)
+	local n = tonumber(value) or 0
+	if n >= 1e9 then
+		return string.format("%.2fB", n / 1e9)
+	elseif n >= 1e6 then
+		return string.format("%.2fM", n / 1e6)
+	elseif n >= 1e3 then
+		return string.format("%.1fK", n / 1e3)
+	end
+	return string.format("%d", n)
+end
+
+local function profileNumber(name)
+	local value = LP:GetAttribute(name)
+	if value == nil then
+		local dc = DC
+		local profile = dc and dc.Profile
+		if type(profile) == "table" then
+			value = profile[name]
+		end
+	end
+	return tonumber(value)
+end
+
+local function farmText()
+	local mc = modeController()
+	local level = profileNumber("Rebirths") or 0
+	local money = profileNumber("Money") or 0
+	local cost = rebirthCost(level)
+	return string.format(
+		"mode %s  |  R%d  |  $%s of $%s  |  plays %d  |  rebirths %d",
+		tostring(mc and mc.Mode or "?"), level, shortMoney(money), shortMoney(cost),
+		stats.plays, stats.rebirths
+	)
+end
+
+local function startMatch()
+	if playPending then return end
+	local mc = modeController()
+	if not mc then
+		statusLine = "auto play: controller missing"
+		return
+	end
+	playPending = true
+	task.spawn(function()
+		local ok, started, why = pcall(mc.StartGame, mc)
+		playPending = false
+		if ok and started then
+			stats.plays = stats.plays + 1
+			stats.lastPlay = os.date("%H:%M:%S")
+			statusLine = "auto play: match " .. tostring(stats.plays) .. " started"
+		else
+			statusLine = "auto play: " .. tostring(ok and why or started)
+		end
+	end)
+end
+
+local function requestRebirth()
+	if rebirthPending then return end
+	local pc = panelController()
+	if not pc then
+		statusLine = "auto rebirth: controller missing"
+		return
+	end
+	rebirthPending = true
+	local before = profileNumber("Rebirths") or 0
+	task.spawn(function()
+		local ok, result = pcall(pc.Request, pc, "Rebirth")
+		rebirthPending = false
+		if not (ok and result) then
+			statusLine = "auto rebirth: request refused"
+			rebirthAt = os.clock() + 8
+			return
+		end
+		local deadline = os.clock() + 3
+		local after = before
+		repeat
+			task.wait(0.2)
+			after = profileNumber("Rebirths") or before
+		until after > before or os.clock() > deadline
+		if after > before then
+			stats.rebirths = stats.rebirths + 1
+			stats.lastRebirth = string.format("R%d to R%d", before, after)
+			statusLine = "auto rebirth: R" .. tostring(after)
+		else
+			statusLine = "auto rebirth: server held it"
+			rebirthAt = os.clock() + 10
+		end
+	end)
+end
+
+local function autoFarmStep(now)
+	if dead then return end
+	if CFG.autoPlay then
+		local mc = modeController()
+		if mc then
+			local mode = tostring(mc.Mode or "?")
+			if mode ~= lastMode then
+				lastMode = mode
+				if mode ~= "Game" then
+					statusLine = "auto play: " .. mode:lower()
+				end
+			end
+			if mode ~= "Game" and now >= playAt and not playPending then
+				playAt = now + math.max(2, tonumber(CFG.playDelay) or 4)
+				local ok, can, reason = pcall(mc.CanStart, mc)
+				if ok and can then
+					startMatch()
+				elseif ok then
+					statusLine = "auto play: " .. tostring(reason)
+				end
+			end
+		end
+	end
+	if CFG.autoRebirth and now >= rebirthAt and not rebirthPending then
+		rebirthAt = now + math.max(3, tonumber(CFG.rebirthDelay) or 5)
+		local level = profileNumber("Rebirths") or 0
+		local money = profileNumber("Money") or 0
+		local cost = rebirthCost(level)
+		if money >= cost then
+			requestRebirth()
+		end
+	end
+end
 
 --// rig model -----------------------------------------------------------------
 
@@ -9048,12 +9240,17 @@ end
 
 local function defenderPositions()
 	local out = {}
-	local all = GR and GR.All
-	if type(all) ~= "table" then
+	-- GameRigs separates the two units explicitly: Home is your offense,
+	-- Away.Covers is the secondary that actually covers your receivers.
+	-- All[].Side is labelled from the other team's point of view, so filtering
+	-- by Side picked up your own receivers and every catch looked covered.
+	local away = GR and GR.Away
+	local covers = type(away) == "table" and away.Covers or nil
+	if type(covers) ~= "table" then
 		return out
 	end
-	for _, r in ipairs(all) do
-		if type(r) == "table" and r.Side ~= "Home" then
+	for _, r in ipairs(covers) do
+		if type(r) == "table" then
 			local job = tostring(r.Job or "")
 			local p = baseOf(r)
 			if p and job ~= "Down" and job ~= "Dive" then
@@ -9800,20 +9997,25 @@ local function releaseNow()
 	return false
 end
 
-local function autoThrowStep(now)
-	if not CFG.autoThrow or dead then
+local function autoThrowStep(now, force)
+	if not (CFG.autoThrow or force) or dead then
 		autoAt = 0
+		holdAt = 0
 		return
 	end
 	local e = pick
-	if not e or not e.open or not e.reachable then
+	if not e or not e.reachable then
 		autoAt = 0
 		return
 	end
 	local okHold, holding = pcall(TC.IsHolding, TC)
 	if not okHold or not holding then
 		autoAt = 0
+		holdAt = 0
 		return
+	end
+	if holdAt == 0 then
+		holdAt = now
 	end
 	if CFG.respectUi and uiOpen() then
 		autoAt = 0
@@ -9821,6 +10023,13 @@ local function autoThrowStep(now)
 	end
 	if not gameActive() then
 		autoAt = 0
+		return
+	end
+	-- an open receiver is thrown to as soon as it appears. when auto play is
+	-- forcing the ball, a covered look is still released after holdWait so a
+	-- tight window cannot stall the drive forever.
+	local ready = e.open or (force and now - holdAt >= CFG.holdWait)
+	if not ready then
 		return
 	end
 	if now < nextClick then
@@ -9839,7 +10048,8 @@ local function autoThrowStep(now)
 			end
 		end
 	else
-		autoAt = 0
+		-- first click starts the charge, second click commits the throw
+		autoAt = now
 		nextClick = now + 0.3
 		mouseClick()
 	end
@@ -10177,6 +10387,20 @@ local function buildUI()
 			saveCfg()
 		end,
 	})
+	reg("qb_wait", "holdWait")
+	autoTab:CreateSlider({
+		Name = "wait for open",
+		Description = "seconds auto play holds the ball for a receiver to separate before releasing into coverage.",
+		Range = { 0.5, 6 },
+		Increment = 0.1,
+		Value = CFG.holdWait,
+		Suffix = " s",
+		Flag = "qb_wait",
+		Callback = function(v)
+			CFG.holdWait = v
+			saveCfg()
+		end,
+	})
 	autoTab:CreateButton({
 		Name = "throw now",
 		Description = "one click: starts the charge if idle, releases it if already charging.",
@@ -10196,6 +10420,82 @@ local function buildUI()
 		Name = "back to auto pick",
 		Callback = function()
 			cycle = 0
+		end,
+	})
+
+	autoTab:CreateSection({ Name = "AUTO PLAY" })
+	autoTab:CreateText({
+		Name = "auto play note",
+		Text = "auto play queues through the game's own play state machine, so it respects the lobby, tutorial and match flow. while a match is live it throws even if auto throw is off. auto rebirth only fires when money covers the next cost.",
+	})
+	reg("qb_play", "autoPlay")
+	autoTab:CreateToggle({
+		Name = "auto play",
+		Description = "queues a new match whenever you are not already in one, then plays it with the aimbot.",
+		Flag = "qb_play",
+		Value = CFG.autoPlay,
+		Callback = function(v)
+			CFG.autoPlay = v
+			playAt = 0
+			if v then
+				autoAt = 0
+			end
+			saveCfg()
+		end,
+	})
+	reg("qb_play_delay", "playDelay")
+	autoTab:CreateSlider({
+		Name = "queue retry",
+		Description = "seconds between attempts when the game reports that a match cannot start yet.",
+		Range = { 2, 30 },
+		Increment = 1,
+		Value = CFG.playDelay,
+		Suffix = " s",
+		Flag = "qb_play_delay",
+		Callback = function(v)
+			CFG.playDelay = v
+			saveCfg()
+		end,
+	})
+	reg("qb_rebirth", "autoRebirth")
+	autoTab:CreateToggle({
+		Name = "auto rebirth",
+		Description = "takes the next rebirth as soon as the money covers it, through the Rebirth panel request.",
+		Flag = "qb_rebirth",
+		Value = CFG.autoRebirth,
+		Callback = function(v)
+			CFG.autoRebirth = v
+			rebirthAt = 0
+			saveCfg()
+		end,
+	})
+	reg("qb_rebirth_delay", "rebirthDelay")
+	autoTab:CreateSlider({
+		Name = "rebirth check",
+		Description = "seconds between affordability checks. the server still validates every request.",
+		Range = { 3, 60 },
+		Increment = 1,
+		Value = CFG.rebirthDelay,
+		Suffix = " s",
+		Flag = "qb_rebirth_delay",
+		Callback = function(v)
+			CFG.rebirthDelay = v
+			saveCfg()
+		end,
+	})
+	ui.farm = autoTab:CreateText({ Name = "farm state", Text = farmText() })
+	autoTab:CreateButton({
+		Name = "start match now",
+		Description = "one queue attempt through ModeController.StartGame.",
+		Callback = function()
+			startMatch()
+		end,
+	})
+	autoTab:CreateButton({
+		Name = "rebirth now",
+		Description = "one RebirthPanel request, even if auto rebirth is off.",
+		Callback = function()
+			requestRebirth()
 		end,
 	})
 
@@ -10585,6 +10885,11 @@ local function probe()
 		"throws=" .. tostring(stats.throws),
 		"aimed=" .. tostring(stats.aimed),
 		"auto=" .. tostring(stats.auto),
+		"plays=" .. tostring(stats.plays),
+		"rebirths=" .. tostring(stats.rebirths),
+		"lastPlay=" .. tostring(stats.lastPlay or "nil"),
+		"lastRebirth=" .. tostring(stats.lastRebirth or "nil"),
+		"farm=" .. farmText(),
 		"skipped=" .. tostring(stats.missed),
 		"last=" .. (stats.lastName and (stats.lastName .. " |v| " .. string.format("%.1f", stats.lastVel and stats.lastVel.Magnitude or 0)) or "nil"),
 		acProbe(),
@@ -10619,6 +10924,8 @@ applyBypassAll()
 local function panic()
 	CFG.enabled = false
 	CFG.autoThrow = false
+	CFG.autoPlay = false
+	CFG.autoRebirth = false
 	CFG.esp = false
 	CFG.arc = false
 	CFG.defLines = false
@@ -10704,6 +11011,9 @@ _G.SlimQbAim = {
 	apply = function()
 		setEnabled(CFG.enabled)
 	end,
+	play = startMatch,
+	rebirth = requestRebirth,
+	farm = farmText,
 	ac = {
 		state = acStateText,
 		probe = acProbe,
@@ -10769,7 +11079,8 @@ RunService:BindToRenderStep(TAG, Enum.RenderPriority.Camera.Value + 2, function(
 		drawVisuals()
 		drawArc()
 		drawDefLine()
-		autoThrowStep(now)
+		autoFarmStep(now)
+		autoThrowStep(now, CFG.autoPlay)
 	else
 		clearVisuals()
 	end
@@ -10785,6 +11096,11 @@ RunService:BindToRenderStep(TAG, Enum.RenderPriority.Camera.Value + 2, function(
 				pick and (pick.name .. "  " .. string.format("%.0f st", pick.dist)) or "no target"
 			))
 		end)
+		if ui.farm then
+			pcall(function()
+				ui.farm:Set(farmText())
+			end)
+		end
 	end
 end)
 
