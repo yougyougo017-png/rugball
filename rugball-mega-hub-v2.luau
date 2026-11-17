@@ -77,7 +77,7 @@ Hub.SUITE_NAMES = {
 	tps        = "tps street         |  auto shot / tackle / GK / esp",
 	track      = "track & field      |  auto race / auto field timing",
 	rss        = "rss street          |  auto shot / pass / tackle / header / GK dive",
-	mma        = "mma panel         |  fight / ground / subs + hud",
+	mma        = "mma panel         |  fight / ground / rage / subs + hud",
 	carsoccer  = "car soccer        |  autopilot / boost / ball path",
 	skyview    = "skyview panel     |  esp / teleport / movement",
 }
@@ -16511,6 +16511,13 @@ Hub.SUITE.mma = function()
 -- AUTO | full match is one switch: every fight and ground auto is treated as
 -- on. off, the individual toggles go back to being the only thing that runs.
 --
+-- RAGE | the same client-owned simulation is also the cheat surface. power scales
+-- every strike the game resolves, koHP is the head-health threshold its own KO
+-- branch reads, stamina and stun are fields the sim writes every frame. the tab
+-- edits those values live: damage multiplier, one-punch threshold, super armour,
+-- endless stamina, faster hands, a frozen opponent, plus instant knockout and
+-- instant win buttons that call the match's own knockdown and stoppage paths.
+--
 -- this game is a client-authoritative boxing sim: damage, contact and knockdowns are
 -- all resolved on the client from its own Match/Fighter state. so there is nothing to
 -- spoof over the wire -- the panel drives the game's own methods:
@@ -16552,6 +16559,15 @@ for k, v in pairs({
 	aggro = 60,
 	staminaFloor = 20,
 	strikeStyle = "smart",
+	rageMode = false,
+	rageBoost = false,
+	rageDamage = 8,
+	rageOnePunch = false,
+	rageGod = false,
+	rageStamina = false,
+	rageSpeed = false,
+	rageSpeedValue = 1.6,
+	rageFreeze = false,
 	hud = true,
 	hudBars = true,
 	hudNames = true,
@@ -17489,6 +17505,156 @@ local function skipTick()
 	end
 end
 
+--// rage ------------------------------------------------------------------------
+-- the match is simulated on this client, so the fighter's own numbers are the
+-- lever. power is the first term in every strike formula, koHP is the head
+-- health the KO branch compares against, stamina and stun are written by the sim
+-- every frame. every base value is remembered the first time a fighter is touched
+-- and put back by restoreRage, so switching the tab off leaves a normal match.
+
+local rageSaved = setmetatable({}, { __mode = "k" })
+local lastOppHead = setmetatable({}, { __mode = "k" })
+
+local function rageOn(key)
+	if CFG.rageMode then return true end
+	return CFG[key] == true
+end
+
+local function rememberFighter(f)
+	local base = rageSaved[f]
+	if base then return base end
+	base = {
+		power = f.power,
+		speedMul = f.speedMul,
+		strikeSpeed = f.strikeSpeed,
+		koHP = f.koHP,
+	}
+	rageSaved[f] = base
+	return base
+end
+
+local function restoreRage()
+	for f, base in pairs(rageSaved) do
+		if f then
+			pcall(function()
+				f.power = base.power
+				f.speedMul = base.speedMul
+				f.strikeSpeed = base.strikeSpeed
+				f.koHP = base.koHP
+			end)
+		end
+		rageSaved[f] = nil
+	end
+end
+
+local function rageTick(m)
+	if not m or m.closed or m.state ~= "fight" or m.finish then return end
+	local p, o = m.player, m.opp
+	if not (p and o) then return end
+
+	local mult = math.clamp(tonumber(CFG.rageDamage) or 1, 1, 50)
+	local wantSpeed = math.clamp(tonumber(CFG.rageSpeedValue) or 1.6, 1, 3)
+	local boost = rageOn("rageBoost")
+	local god = rageOn("rageGod")
+	local endless = god or rageOn("rageStamina")
+	local fast = god or rageOn("rageSpeed")
+	local punch = rageOn("rageOnePunch")
+	local freeze = rageOn("rageFreeze")
+
+	local pb = rememberFighter(p)
+	local ob = rememberFighter(o)
+
+	p.power = (pb.power or 1) * (boost and mult or 1)
+	p.speedMul = (pb.speedMul or 1) * (fast and wantSpeed or 1)
+	p.strikeSpeed = (pb.strikeSpeed or 1) * (fast and wantSpeed or 1)
+	o.koHP = punch and 100 or ob.koHP
+
+	if punch then
+		-- the sim rewrites koHP every frame, so the threshold alone is not enough:
+		-- the first head damage we see is a landed strike, so hand that straight to
+		-- the game's own knockdown path.
+		local before = lastOppHead[o]
+		if before and o.hp.head < before then
+			o.hp.head = 0
+			o.knockdowns = math.max(3, o.knockdowns or 0)
+			pcall(function()
+				m:knockdown(p, o, { kind = "straight", zone = "head", dmg = 10 }, nil)
+			end)
+			pushLog("rage  |  one punch")
+		end
+		lastOppHead[o] = o.hp.head
+	end
+
+	if freeze then
+		o.power = 0
+		o.speedMul = (ob.speedMul or 1) * 0.25
+		o.strikeSpeed = (ob.strikeSpeed or 1) * 0.25
+		o.stamina = 0
+	else
+		o.power = ob.power
+		o.speedMul = ob.speedMul
+		o.strikeSpeed = ob.strikeSpeed
+	end
+
+	if endless then
+		p.stamina = p.maxStamina or 100
+	end
+
+	if god then
+		if p.hp then
+			for k in pairs(p.hp) do
+				p.hp[k] = 100
+			end
+		end
+		p.stun = 0
+		p.rockedT = 0
+	end
+end
+
+local function instantKO()
+	local m = match
+	if not m or m.closed or m.state ~= "fight" or m.finish then
+		return false, "no live match"
+	end
+	local p, o = m.player, m.opp
+	if not (p and o) then
+		return false, "no fighters"
+	end
+	pcall(function()
+		o.hp.head = 0
+		o.knockdowns = math.max(3, o.knockdowns or 0)
+	end)
+	local ok, err = pcall(function()
+		m:knockdown(p, o, { kind = "straight", zone = "head", dmg = 10 }, nil)
+	end)
+	if ok then
+		pushLog("rage  |  instant knockdown")
+	end
+	return ok, err
+end
+
+local function instantWin()
+	local m = match
+	if not m or m.closed or m.state ~= "fight" or m.finish then
+		return false, "no live match"
+	end
+	-- the fifth argument is the game's own "call it anyway" bypass: it skips the
+	-- ranked guard that otherwise only lets doctor, corner and tko stoppages through.
+	local ok, err = pcall(function()
+		m:stoppage(m.player, "KO", "Punch", "ko", true)
+	end)
+	if not ok or not m.finish then
+		pcall(function()
+			m:stoppage(m.player, "TKO", "Punches", "tko", true)
+		end)
+	end
+	if m.finish then
+		pushLog("rage  |  stoppage forced")
+		return true
+	end
+	return false, err or "stoppage refused"
+end
+
 --// log watchers ----------------------------------------------------------------
 
 local function statFor(m, f)
@@ -18006,6 +18172,7 @@ local function buildUI()
 	end)
 
 	local fightTab = w:CreateTab({ name = "FIGHT" })
+	local rageTab = w:CreateTab({ name = "RAGE" })
 	local groundTab = w:CreateTab({ name = "GROUND" })
 	local rankedTab = w:CreateTab({ name = "RANKED" })
 	local hudTab = w:CreateTab({ name = "HUD" })
@@ -18125,6 +18292,125 @@ local function buildUI()
 		flag = "mma_autoSkip",
 		value = CFG.autoSkip,
 		callback = function(v) CFG.autoSkip = v end,
+	})
+
+	-- RAGE
+	ui.rageCard = rageTab:CreateText({ name = "rage  |  off", text = "no rage layers active" })
+	rageTab:CreateToggle({
+		name = "RAGE MODE  |  everything on",
+		description = "one switch for the whole hacker stack: damage multiplier, one punch, super armour, endless stamina, faster hands and a frozen opponent. it also turns auto fight and auto aim on so the match plays itself.",
+		flag = "mma_rageMode",
+		value = CFG.rageMode,
+		callback = function(v)
+			CFG.rageMode = v
+			if v then
+				CFG.autoFight = true
+				CFG.autoAim = true
+				if ui.window then
+					pcall(function() ui.window:Set("mma_autoFight", true) end)
+					pcall(function() ui.window:Set("mma_autoAim", true) end)
+				end
+			end
+		end,
+	})
+	rageTab:CreateToggle({
+		name = "damage boost",
+		description = "applies the damage multiplier to everything this fighter throws. off by default so the panel can sit loaded without changing a normal match.",
+		flag = "mma_rageBoost",
+		value = CFG.rageBoost,
+		callback = function(v) CFG.rageBoost = v end,
+	})
+	rageTab:CreateSlider({
+		name = "damage multiplier",
+		description = "scales the fighter's power, which is the first term in every strike the game resolves. 8x turns a clean head shot from chip damage into a knockout in a couple of touches.",
+		flag = "mma_rageDamage",
+		range = { 1, 50 },
+		increment = 1,
+		value = CFG.rageDamage,
+		suffix = "x",
+		callback = function(v) CFG.rageDamage = v end,
+	})
+	rageTab:CreateToggle({
+		name = "one punch",
+		description = "the first time the opponent's head takes damage they are handed to the game's own knockdown path: one clean head shot drops them and the referee waves it off a moment later.",
+		flag = "mma_rageOnePunch",
+		value = CFG.rageOnePunch,
+		callback = function(v) CFG.rageOnePunch = v end,
+	})
+	rageTab:CreateToggle({
+		name = "super armour",
+		description = "writes head, body and limb health back to full and clears stun every frame. the fight still plays, it just cannot hurt you.",
+		flag = "mma_rageGod",
+		value = CFG.rageGod,
+		callback = function(v) CFG.rageGod = v end,
+	})
+	rageTab:CreateToggle({
+		name = "endless stamina",
+		description = "pins the stamina bar at full every frame, so fatigue never builds and every throw comes off a fresh tank.",
+		flag = "mma_rageStamina",
+		value = CFG.rageStamina,
+		callback = function(v) CFG.rageStamina = v end,
+	})
+	rageTab:CreateToggle({
+		name = "fast hands",
+		description = "scales movement and strike animation speed by the hand speed slider. strikes come out before the opponent's guard reads them.",
+		flag = "mma_rageSpeed",
+		value = CFG.rageSpeed,
+		callback = function(v) CFG.rageSpeed = v end,
+	})
+	rageTab:CreateSlider({
+		name = "hand speed",
+		description = "how much faster the fighter moves and throws while fast hands is on.",
+		flag = "mma_rageSpeedValue",
+		range = { 1, 3 },
+		increment = 0.1,
+		value = CFG.rageSpeedValue,
+		suffix = "x",
+		callback = function(v) CFG.rageSpeedValue = v end,
+	})
+	rageTab:CreateToggle({
+		name = "freeze opponent",
+		description = "drops the opponent's power to zero and slows their movement and strikes. their own AI and animations keep running, they just cannot hurt or catch you.",
+		flag = "mma_rageFreeze",
+		value = CFG.rageFreeze,
+		callback = function(v) CFG.rageFreeze = v end,
+	})
+	rageTab:CreateSection({ name = "INSTANT FINISH" })
+	rageTab:CreateButton({
+		name = "instant knockout",
+		description = "zeros the opponent's head health and hands them to Match:knockdown. the game plays its own fall, TKO call and result screen about two seconds later.",
+		callback = function()
+			local ok, err = instantKO()
+			notify(ok and "instant knockout sent" or ("no knockout: " .. tostring(err)))
+		end,
+	})
+	rageTab:CreateButton({
+		name = "instant win",
+		description = "ends the bout through the match's own stoppage path with you as the winner, so the finish record and result flow are the game's own. the call stays on this client and opens the result screen right away.",
+		callback = function()
+			local ok, err = instantWin()
+			notify(ok and "stoppage sent" or ("no stoppage: " .. tostring(err)))
+		end,
+	})
+	rageTab:CreateButton({
+		name = "restore normal fight",
+		description = "switches every rage layer off, then puts back every fighter value the panel touched. use it when you want the current match to play honestly again.",
+		callback = function()
+			CFG.rageMode = false
+			CFG.rageBoost = false
+			CFG.rageOnePunch = false
+			CFG.rageGod = false
+			CFG.rageStamina = false
+			CFG.rageSpeed = false
+			CFG.rageFreeze = false
+			if ui.window then
+				for _, flag in ipairs({ "mma_rageMode", "mma_rageBoost", "mma_rageOnePunch", "mma_rageGod", "mma_rageStamina", "mma_rageSpeed", "mma_rageFreeze" }) do
+					pcall(function() ui.window:Set(flag, false) end)
+				end
+			end
+			restoreRage()
+			notify("rage off, fighter values restored")
+		end,
 	})
 
 	-- RANKED
@@ -18312,13 +18598,21 @@ local function panic()
 	CFG.autoQueue = false
 	CFG.autoBest = false
 	CFG.autoContinue = false
+	CFG.rageMode = false
+	CFG.rageBoost = false
+	CFG.rageOnePunch = false
+	CFG.rageGod = false
+	CFG.rageStamina = false
+	CFG.rageSpeed = false
+	CFG.rageFreeze = false
+	restoreRage()
 	if match then
 		pcall(function()
 			match.debugMove = nil
 		end)
 	end
 	pcall(function() Touch.block = false end)
-	for _, flag in ipairs({ "mma_autoFight", "mma_autoAim", "mma_autoBlock", "mma_autoCounter", "mma_autoTakedown", "mma_autoGround", "mma_autoSub", "mma_autoSprawl", "mma_autoQueue", "mma_autoBest", "mma_autoContinue" }) do
+	for _, flag in ipairs({ "mma_autoFight", "mma_autoAim", "mma_autoBlock", "mma_autoCounter", "mma_autoTakedown", "mma_autoGround", "mma_autoSub", "mma_autoSprawl", "mma_autoQueue", "mma_autoBest", "mma_autoContinue", "mma_rageMode", "mma_rageBoost", "mma_rageOnePunch", "mma_rageGod", "mma_rageStamina", "mma_rageSpeed", "mma_rageFreeze" }) do
 		if ui.window then pcall(function() ui.window:Set(flag, false) end) end
 	end
 	status = "panic  |  automation off"
@@ -18330,6 +18624,7 @@ local shutdown
 shutdown = function()
 	if dead then return end
 	dead = true
+	restoreRage()
 	if match then
 		pcall(function() match.debugMove = nil end)
 	end
@@ -18378,6 +18673,24 @@ local function syncUI()
 				txt = txt .. "  |  tries " .. queue.tries
 			end
 			ui.queueCard:Set(txt)
+		end)
+	end
+	if ui.rageCard then
+		pcall(function()
+			local bits = {}
+			if CFG.rageMode then bits[#bits + 1] = "MASTER" end
+			if rageOn("rageBoost") then bits[#bits + 1] = tostring(CFG.rageDamage) .. "x power" end
+			if rageOn("rageOnePunch") then bits[#bits + 1] = "one punch" end
+			if rageOn("rageGod") then bits[#bits + 1] = "armour" end
+			if rageOn("rageStamina") then bits[#bits + 1] = "endless stamina" end
+			if rageOn("rageSpeed") then bits[#bits + 1] = tostring(CFG.rageSpeedValue) .. "x hands" end
+			if rageOn("rageFreeze") then bits[#bits + 1] = "opponent frozen" end
+			local txt = #bits > 0 and table.concat(bits, "  |  ") or "no rage layers active"
+			if match and match.opp and match.opp.hp and not match.finish then
+				txt = txt .. string.format("   |   opponent head %d", math.floor(match.opp.hp.head))
+			end
+			ui.rageCard:SetTitle("rage  |  " .. (CFG.rageMode and "MASTER" or (#bits > 0 and "custom" or "off")))
+			ui.rageCard:Set(txt)
 		end)
 	end
 	if ui.sFights then pcall(function() ui.sFights:Set(stats.fights) end) end
@@ -18446,6 +18759,7 @@ local function tick()
 			status = "match  |  " .. tostring(m.state) .. (m.controls and "" or "  |  waiting")
 		end
 		pcall(watch, m)
+		pcall(rageTick, m)
 		if autoOn("autoFight") then pcall(fightTick, m) end
 		pcall(groundTick, m)
 		pcall(driveTick, m)
@@ -18515,6 +18829,12 @@ _G.RagdollMmaPanel = {
 	strike = function(move)
 		if match then return strikeAt(match, move or "jab", CFG.aimZone) end
 		return false
+	end,
+	instantKO = instantKO,
+	instantWin = instantWin,
+	restoreRage = restoreRage,
+	raging = function()
+		return CFG.rageMode
 	end,
 }
 end
