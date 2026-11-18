@@ -17981,6 +17981,7 @@ end
 
 local function styleTick(m)
 	if not CFG.styleForce or not m or not m.player then return end
+	if m.finish or m.state == "ended" then return end
 	local target = resolveFightStyle()
 	if not target then return end
 	if m.player.fstyle == target then return end
