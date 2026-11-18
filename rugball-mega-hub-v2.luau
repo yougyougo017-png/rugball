@@ -8028,6 +8028,7 @@ local DEFAULTS = {
 	defLines = false,
 	hud = true,
 	autoThrow = false,
+	safeCatch = false,
 	autoDelay = 0.55,
 	holdWait = 2.5,
 	autoPlay = false,
@@ -10228,8 +10229,10 @@ local function autoThrowStep(now, force)
 	end
 	-- an open receiver is thrown to as soon as it appears. when auto play is
 	-- forcing the ball, a covered look is still released after holdWait so a
-	-- tight window cannot stall the drive forever.
-	local ready = e.open or (force and now - holdAt >= CFG.holdWait)
+	-- tight window cannot stall the drive forever. safeCatch removes that
+	-- forced release, so auto play waits for separation instead of throwing
+	-- into coverage. it does not change the game's catch roll.
+	local ready = e.open or (not CFG.safeCatch and force and now - holdAt >= CFG.holdWait)
 	if not ready then
 		return
 	end
@@ -10594,6 +10597,18 @@ local function buildUI()
 		Value = CFG.autoThrow,
 		Callback = function(v)
 			CFG.autoThrow = v
+			autoAt = 0
+			saveCfg()
+		end,
+	})
+	reg("qb_safecatch", "safeCatch")
+	autoTab:CreateToggle({
+		Name = "safe catch",
+		Description = "never forces a throw into coverage. auto play waits for separation instead of releasing a covered pass after the hold timer. this avoids the throw, it does not change the game's catch roll.",
+		Flag = "qb_safecatch",
+		Value = CFG.safeCatch,
+		Callback = function(v)
+			CFG.safeCatch = v
 			autoAt = 0
 			saveCfg()
 		end,
@@ -11078,6 +11093,16 @@ local function buildUI()
 		end,
 	})
 	infoTab:CreateButton({
+		Name = "probe catch system",
+		Description = "prints the ball, throw, rig and receiver fields, read-only. paste the console output back to see whether the catch can be hooked on the client.",
+		Callback = function()
+			local api = _G.SlimQbAim
+			if api and api.catchProbe then
+				print("[QBAIM catch]\n" .. api.catchProbe())
+			end
+		end,
+	})
+	infoTab:CreateButton({
 		Name = "reset stats",
 		Callback = function()
 			stats.throws = 0
@@ -11108,6 +11133,54 @@ local function buildUI()
 end
 
 --// status --------------------------------------------------------------------
+
+local function keyDump(tbl, filter, max)
+	if type(tbl) ~= "table" then
+		return "nil"
+	end
+	local rows = {}
+	local f = filter and filter:lower() or nil
+	for k, v in pairs(tbl) do
+		local name = tostring(k)
+		if not f or name:lower():find(f, 1, true) then
+			rows[#rows + 1] = name .. "=" .. typeof(v)
+		end
+	end
+	table.sort(rows)
+	max = max or 120
+	if #rows > max then
+		local kept = {}
+		for i = 1, max do
+			kept[i] = rows[i]
+		end
+		kept[#kept + 1] = "..." .. tostring(#rows - max) .. " more"
+		rows = kept
+	end
+	return table.concat(rows, ", ")
+end
+
+-- read-only dump: no hook, no write. used to find the catch controller before
+-- touching anything. if the catch is resolved on the server there is nothing
+-- here to hook, and that is worth knowing before writing a fake catch path.
+local function catchProbe()
+	local recs = GR and GR.Home and GR.Home.Receivers
+	local r = type(recs) == "table" and recs[1] or nil
+	local rows = {
+		"ballController: " .. keyDump(BC),
+		"throwController: " .. keyDump(TC),
+		"gameRigs: " .. keyDump(GR),
+		"gameRigs.Home: " .. keyDump(GR and GR.Home),
+		"receiver[1]: " .. keyDump(r),
+		"ball catch/drop: " .. keyDump(BC, "catch") .. " | " .. keyDump(BC, "drop"),
+		"throw catch/drop: " .. keyDump(TC, "catch") .. " | " .. keyDump(TC, "drop"),
+		"rigs catch/drop: " .. keyDump(GR, "catch") .. " | " .. keyDump(GR, "drop"),
+		"receiver catch/hand/drop: "
+			.. keyDump(r, "catch") .. " | "
+			.. keyDump(r, "hand") .. " | "
+			.. keyDump(r, "drop"),
+	}
+	return table.concat(rows, "\n")
+end
 
 local function probe()
 	local e = pick
@@ -11242,6 +11315,7 @@ _G.SlimQbAim = {
 		return targetList
 	end,
 	probe = probe,
+	catchProbe = catchProbe,
 	throw = releaseNow,
 	cycle = function(n)
 		clearLock()
