@@ -113,7 +113,7 @@ local function findPlus(statName)
 	local labels = {}
 	local loose = {}
 	for _, d in ipairs(gui:GetDescendants()) do
-		if d:IsA("TextLabel") and visible(d) then
+		if (d:IsA("TextLabel") or d:IsA("TextButton")) and visible(d) then
 			local txt = string.lower((d.Text or ""):gsub("^%s+", ""):gsub("%s+$", ""))
 			if txt == wanted then
 				labels[#labels + 1] = d
@@ -128,7 +128,16 @@ local function findPlus(statName)
 	local buttons = {}
 	for _, d in ipairs(gui:GetDescendants()) do
 		if (d:IsA("TextButton") or d:IsA("ImageButton")) and visible(d) then
-			buttons[#buttons + 1] = d
+			local txt = d:IsA("TextButton") and (d.Text or "") or ""
+			if not string.match(txt, "^%s*[%d,%.]+%s*$") then
+				buttons[#buttons + 1] = d
+			end
+		elseif d:IsA("TextLabel") and visible(d) then
+			local txt = d.Text or ""
+			if string.find(txt, "+", 1, true)
+				and d.AbsoluteSize.X <= 80 and d.AbsoluteSize.Y <= 80 then
+				buttons[#buttons + 1] = d
+			end
 		end
 	end
 
@@ -141,9 +150,15 @@ local function findPlus(statName)
 			local bx, by = center(btn)
 			local dy = math.abs(by - ly)
 			local dx = bx - lx
-			if dx > 0 and dx < 420 and dy <= tolerance then
+			if dx > 0 and dx < 700 and dy <= tolerance then
 				local score = dx
-				if btn:IsA("TextButton") and string.find(btn.Text or "", "+", 1, true) then
+				local plusText = false
+				if btn:IsA("TextLabel") then
+					plusText = true
+				elseif btn:IsA("TextButton") then
+					plusText = string.find(tostring(btn.Text or ""), "+", 1, true) ~= nil
+				end
+				if plusText then
 					score = score - 1000
 				end
 				if not bestScore or score < bestScore then
@@ -157,26 +172,49 @@ local function findPlus(statName)
 end
 
 local function signal(btn)
+	if not btn or not btn:IsA("GuiButton") then return false end
 	if type(firesignal) ~= "function" then return false end
 	return pcall(firesignal, btn.MouseButton1Click)
 end
 
+local function panelCovers(x, y)
+	local s = ownScreen
+	if not s or not s.Enabled then return false end
+	local p = s:FindFirstChild("Main")
+	if not p then return false end
+	local pos = p.AbsolutePosition
+	local size = p.AbsoluteSize
+	return x >= pos.X and x <= pos.X + size.X
+		and y >= pos.Y and y <= pos.Y + size.Y
+end
+
 local function virtualClick(btn)
 	if not VirtualInputManager then return false end
-	return pcall(function()
-		local x, y = center(btn)
+	local x, y = center(btn)
+	local hide = panelCovers(x, y)
+	if hide then
+		ownScreen.Enabled = false
+		task.wait(0.05)
+	end
+	local ok = pcall(function()
 		VirtualInputManager:SendMouseButtonEvent(x, y, 0, true, game, 1)
 		task.wait(0.03)
 		VirtualInputManager:SendMouseButtonEvent(x, y, 0, false, game, 1)
 	end)
+	if hide and ownScreen then
+		ownScreen.Enabled = true
+	end
+	return ok
 end
 
 local function clickButton(btn)
 	if not btn then return false end
 	if CFG.clickMethod == "signal" then return signal(btn) end
 	if CFG.clickMethod == "virtual" then return virtualClick(btn) end
-	if signal(btn) then return true end
-	return virtualClick(btn)
+	-- auto: a real mouse event hits MouseButton1Click, Activated and
+	-- InputBegan alike. signal only works when the game used that event.
+	if virtualClick(btn) then return true end
+	return signal(btn)
 end
 
 local function putOne()
@@ -195,19 +233,33 @@ local function putOne()
 end
 
 local function findRollButton()
-	local best = nil
-	local bestSize = nil
-	for _, btn in ipairs(guiObjects("TextButton")) do
-		local txt = string.lower(btn.Text or "")
-		if string.find(txt, "roll", 1, true) and not string.find(txt, "control", 1, true) then
-			local size = btn.AbsoluteSize.X * btn.AbsoluteSize.Y
-			if not bestSize or size > bestSize then
-				bestSize = size
-				best = btn
+	local function bestIn(class)
+		local best = nil
+		local bestSize = nil
+		for _, btn in ipairs(guiObjects(class)) do
+			local txt
+			if btn:IsA("TextButton") or btn:IsA("TextLabel") then
+				txt = string.lower(btn.Text or "")
+			else
+				txt = string.lower(btn.Name or "")
+			end
+			if string.find(txt, "roll", 1, true) and not string.find(txt, "control", 1, true) then
+				local size = btn.AbsoluteSize.X * btn.AbsoluteSize.Y
+				if not bestSize or size > bestSize then
+					bestSize = size
+					best = btn
+				end
 			end
 		end
+		return best
 	end
-	return best
+	local btn = bestIn("TextButton")
+	if btn then return btn end
+	btn = bestIn("ImageButton")
+	if btn then return btn end
+	-- some menus draw the roll control as a plain row/label with an
+	-- InputBegan handler. clicking its centre still works.
+	return bestIn("TextLabel")
 end
 
 local function readRarity()
@@ -237,6 +289,14 @@ end
 
 --// probe ----------------------------------------------------------------------
 
+local function safeText(obj)
+	if not obj then return "" end
+	if obj:IsA("TextButton") or obj:IsA("TextLabel") then
+		return obj.Text or ""
+	end
+	return ""
+end
+
 local function dumpGui()
 	local lines = {}
 	lines[#lines + 1] = "place=" .. tostring(game.PlaceId) .. "  game=" .. tostring(game.GameId)
@@ -248,14 +308,14 @@ local function dumpGui()
 			if (d:IsA("TextButton") or d:IsA("ImageButton")) and visible(d) then
 				local x, y = center(d)
 				lines[#lines + 1] = string.format("BTN %s  text=%q  pos=%d,%d  size=%dx%d",
-					d:GetFullName(), tostring(d.Text), math.floor(x), math.floor(y),
+					d:GetFullName(), safeText(d), math.floor(x), math.floor(y),
 					math.floor(d.AbsoluteSize.X), math.floor(d.AbsoluteSize.Y))
 			end
 		end
 		for _, stat in ipairs(STATS) do
 			local btn = findPlus(stat)
 			if btn then
-				lines[#lines + 1] = "PLUS " .. stat .. " -> " .. btn:GetFullName() .. "  text=" .. tostring(btn.Text)
+				lines[#lines + 1] = "PLUS " .. stat .. " -> " .. btn:GetFullName() .. "  text=" .. safeText(btn)
 			else
 				lines[#lines + 1] = "PLUS " .. stat .. " -> NOT FOUND"
 			end
@@ -382,7 +442,7 @@ local vp = cam and cam.ViewportSize or Vector2.new(1280, 720)
 local scale = math.clamp(math.min(vp.X / 600, (vp.Y - 40) / 500), 0.68, 1)
 make("UIScale", { Scale = scale }, screen)
 
-local startX = math.max(0, (vp.X / scale - W) * 0.5)
+local startX = math.max(18, vp.X / scale - W - 18)
 local startY = math.max(0, (vp.Y / scale - H) * 0.5)
 
 local main = make("Frame", {
@@ -1124,3 +1184,4 @@ inputConn = UserInputService.InputBegan:Connect(function(input, processed)
 end)
 
 print("[SUPERHERO] loaded  place=" .. tostring(game.PlaceId) .. "  stat=" .. CFG.bestStat)
+print("[SUPERHERO] panel is docked right - drag it by the title bar if it covers the game menu")
