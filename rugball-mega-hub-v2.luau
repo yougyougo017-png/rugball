@@ -22961,7 +22961,9 @@ Hub.SUITE.criminal = function()
 	what it does
 	  loot    : esp with display name, value, weight and distance, value/range filters,
 	            nearest and highest-value teleports, best-effort grab + truck loading.
-	  world   : npc esp (residents / guards / police), prompt sniper for the game's own
+	  world   : npc esp (residents / guards / police) with optional detail tags, a live
+	            npc details window (health, distance, state, gender, outfit, home, spot)
+	            and a full npc attribute dump, prompt sniper for the game's own
 	            "Rob ..." and "Open" proximity prompts, travel buttons for truck, sell box,
 	            chop shop, hideout, shop computer and job board.
 	  players : esp, player list, teleport.
@@ -23019,6 +23021,8 @@ for k, v in pairs({
 	npcDistance = true,
 	npcHealth = true,
 	npcBox = true,
+	npcTags = false,
+	npcDetails = false,
 	autoRob = false,
 	playerEsp = false,
 	playerEspName = true,
@@ -23690,6 +23694,34 @@ local function npcEnabled(group)
 	return false
 end
 
+local function esc(text)
+	return (tostring(text):gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"))
+end
+
+local function hexColor(c)
+	return string.format("#%02X%02X%02X",
+		math.floor(math.clamp(c.R, 0, 1) * 255 + 0.5),
+		math.floor(math.clamp(c.G, 0, 1) * 255 + 0.5),
+		math.floor(math.clamp(c.B, 0, 1) * 255 + 0.5))
+end
+
+local function npcExtra(model)
+	local parts = {}
+	local function add(key, prefix)
+		local v = model:GetAttribute(key)
+		if v ~= nil and tostring(v) ~= "" then
+			parts[#parts + 1] = (prefix and (prefix .. " ") or "") .. tostring(v)
+		end
+	end
+	add("Gender")
+	add("Outfit")
+	add("Home", "home")
+	add("Spot", "spot")
+	add("Pose", "pose")
+	add("Station", "station")
+	return table.concat(parts, " - ")
+end
+
 local function npcEspFor(model)
 	local e = npcPool[model]
 	if e then return e end
@@ -23724,7 +23756,14 @@ local function npcEspTick()
 						local dist = (root.Position - myPos).Magnitude
 						if dist <= 400 then
 							local e = npcEspFor(model)
-							local ok = drawHumanoidEsp(e, cam, vp, hum, root, head, npcColor(group), model.Name, {
+							local label = model.Name
+							if CFG.npcTags then
+								local st = model:GetAttribute("State")
+								if st ~= nil then label = label .. " [" .. tostring(st) .. "]" end
+								local extra = npcExtra(model)
+								if extra ~= "" then label = label .. "  " .. extra end
+							end
+							local ok = drawHumanoidEsp(e, cam, vp, hum, root, head, npcColor(group), label, {
 								box = CFG.npcBox,
 								health = CFG.npcHealth,
 								name = CFG.npcName,
@@ -24277,6 +24316,349 @@ local function scanNpcs()
 	return options
 end
 
+--// npc details window ----------------------------------------------------------
+
+local npcDetailGui = nil
+local npcDetailFrame = nil
+local npcDetailList = nil
+local npcDetailTitle = nil
+local npcDetailStatus = nil
+local npcDetailRows = {}
+local npcDetailConn = nil
+local npcDetailAt = 0
+
+local function npcState(model, hum)
+	local state = model:GetAttribute("State")
+	if state == nil and hum then state = hum:GetState() end
+	local s = state ~= nil and tostring(state) or "?"
+	return (s:gsub("Enum%.HumanoidStateType%.", ""))
+end
+
+local function npcSummary(model, group, index, myPos)
+	local hum = model:FindFirstChildOfClass("Humanoid")
+	local root = model:FindFirstChild("HumanoidRootPart") or (hum and hum.RootPart)
+	local dist = root and math.floor((root.Position - myPos).Magnitude) or -1
+	local hp = hum and math.max(0, math.ceil(hum.Health)) or 0
+	local maxHp = hum and math.max(1, math.ceil(hum.MaxHealth)) or 1
+	return {
+		model = model,
+		group = group,
+		index = index,
+		name = model.Name,
+		dist = dist,
+		hp = hp,
+		maxHp = maxHp,
+		state = npcState(model, hum),
+		tags = npcExtra(model),
+		dead = not hum or hum.Health <= 0,
+	}
+end
+
+local function collectNpcs()
+	local rows = {}
+	local myRoot = charRoot()
+	local myPos = myRoot and myRoot.Position or Vector3.new()
+	for _, group in ipairs({ "Npcs", "Guards", "Police" }) do
+		local folder = workspace:FindFirstChild(group)
+		if folder then
+			local i = 0
+			for _, model in ipairs(folder:GetChildren()) do
+				if model:IsA("Model") and model:FindFirstChildOfClass("Humanoid") then
+					i = i + 1
+					rows[#rows + 1] = npcSummary(model, group, i, myPos)
+				end
+			end
+		end
+	end
+	table.sort(rows, function(a, b)
+		if a.dist ~= b.dist then return a.dist < b.dist end
+		if a.group ~= b.group then return a.group < b.group end
+		return a.index < b.index
+	end)
+	return rows
+end
+
+local function npcRowText(r)
+	local color = hexColor(npcColor(r.group))
+	local hpText = r.dead and "DEAD" or (r.hp .. "/" .. r.maxHp .. " hp")
+	local hpColor = r.dead and "#ff8080" or "#9fe8a8"
+	local line1 = '<font color="' .. color .. '">[' .. r.group .. ']</font> '
+		.. '<b>' .. esc(r.name) .. " #" .. r.index .. "</b>  "
+		.. '<font color="' .. hpColor .. '">' .. hpText .. "</font>  "
+		.. '<font color="#c9c9d4">' .. r.dist .. "m</font>  "
+		.. '<font color="#ffd88a">' .. esc(r.state) .. "</font>"
+	local line2 = '<font color="#9a9aa8">'
+		.. (r.tags ~= "" and esc(r.tags) or "no extra attributes") .. "</font>"
+	return line1 .. "\n" .. line2
+end
+
+local function npcDetailTeardown()
+	if npcDetailConn then pcall(function() npcDetailConn:Disconnect() end) end
+	npcDetailConn = nil
+	if npcDetailGui then pcall(function() npcDetailGui:Destroy() end) end
+	npcDetailGui = nil
+	npcDetailFrame = nil
+	npcDetailList = nil
+	npcDetailTitle = nil
+	npcDetailStatus = nil
+	npcDetailRows = {}
+	npcDetailAt = 0
+end
+
+local function npcDetailBuild()
+	if npcDetailFrame or dead then return end
+	local parent = nil
+	local ok, hui = pcall(function() return gethui and gethui() or nil end)
+	if ok and hui then parent = hui end
+	if not parent then
+		ok, parent = pcall(function() return game:GetService("CoreGui") end)
+	end
+	if not ok or not parent then
+		parent = LP:FindFirstChildOfClass("PlayerGui")
+	end
+	if not parent then return end
+
+	local gui = Instance.new("ScreenGui")
+	gui.Name = "CriminalNpcDetails"
+	gui.ResetOnSpawn = false
+	gui.IgnoreGuiInset = true
+	gui.DisplayOrder = 90
+	gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	if not pcall(function() gui.Parent = parent end) then
+		pcall(function() gui.Parent = LP:FindFirstChildOfClass("PlayerGui") end)
+	end
+
+	local frame = Instance.new("Frame")
+	frame.Name = "Window"
+	frame.AnchorPoint = Vector2.new(1, 0)
+	frame.Position = UDim2.new(1, -18, 0, 92)
+	frame.Size = UDim2.new(0, 560, 0, 430)
+	frame.BackgroundColor3 = Color3.fromRGB(14, 12, 16)
+	frame.BackgroundTransparency = 0.06
+	frame.BorderSizePixel = 0
+	frame.Active = true
+	frame.ClipsDescendants = true
+	frame.Parent = gui
+
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 10)
+	corner.Parent = frame
+
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = Color3.fromRGB(255, 196, 92)
+	stroke.Transparency = 0.65
+	stroke.Thickness = 1
+	stroke.Parent = frame
+
+	local title = Instance.new("TextButton")
+	title.Name = "Title"
+	title.BackgroundColor3 = Color3.fromRGB(24, 20, 18)
+	title.BackgroundTransparency = 0.02
+	title.BorderSizePixel = 0
+	title.AutoButtonColor = false
+	title.Position = UDim2.new(0, 0, 0, 0)
+	title.Size = UDim2.new(1, 0, 0, 30)
+	title.Font = Enum.Font.GothamBold
+	title.Text = "NPC DETAILS"
+	title.TextColor3 = Color3.fromRGB(255, 196, 92)
+	title.TextSize = 13
+	title.TextXAlignment = Enum.TextXAlignment.Left
+	title.Parent = frame
+
+	local titlePad = Instance.new("UIPadding")
+	titlePad.PaddingLeft = UDim.new(0, 10)
+	titlePad.Parent = title
+
+	local close = Instance.new("TextButton")
+	close.Name = "Close"
+	close.AnchorPoint = Vector2.new(1, 0)
+	close.Position = UDim2.new(1, -6, 0, 6)
+	close.Size = UDim2.new(0, 22, 0, 18)
+	close.BackgroundColor3 = Color3.fromRGB(48, 32, 32)
+	close.BorderSizePixel = 0
+	close.Font = Enum.Font.GothamBold
+	close.Text = "X"
+	close.TextColor3 = Color3.fromRGB(255, 170, 170)
+	close.TextSize = 11
+	close.Parent = title
+
+	local closeCorner = Instance.new("UICorner")
+	closeCorner.CornerRadius = UDim.new(0, 5)
+	closeCorner.Parent = close
+
+	local status = Instance.new("TextLabel")
+	status.Name = "Status"
+	status.BackgroundTransparency = 1
+	status.Position = UDim2.new(0, 10, 0, 30)
+	status.Size = UDim2.new(1, -20, 0, 18)
+	status.Font = Enum.Font.Code
+	status.Text = "scanning"
+	status.TextColor3 = Color3.fromRGB(150, 150, 165)
+	status.TextSize = 11
+	status.TextXAlignment = Enum.TextXAlignment.Left
+	status.Parent = frame
+
+	local list = Instance.new("ScrollingFrame")
+	list.Name = "List"
+	list.Position = UDim2.new(0, 8, 0, 50)
+	list.Size = UDim2.new(1, -16, 1, -58)
+	list.BackgroundTransparency = 1
+	list.BorderSizePixel = 0
+	list.ScrollBarThickness = 4
+	list.ScrollBarImageColor3 = Color3.fromRGB(255, 196, 92)
+	list.CanvasSize = UDim2.new(0, 0, 0, 0)
+	list.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	list.ScrollingDirection = Enum.ScrollingDirection.Y
+	list.ClipsDescendants = true
+	list.Parent = frame
+
+	local layout = Instance.new("UIListLayout")
+	layout.Padding = UDim.new(0, 4)
+	layout.SortOrder = Enum.SortOrder.LayoutOrder
+	layout.Parent = list
+
+	npcDetailGui = gui
+	npcDetailFrame = frame
+	npcDetailList = list
+	npcDetailTitle = title
+	npcDetailStatus = status
+	npcDetailRows = {}
+	npcDetailAt = 0
+
+	local dragging = false
+	local dragStart = nil
+	local startPos = nil
+	title.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			dragStart = input.Position
+			startPos = frame.Position
+			input.Changed:Connect(function()
+				if input.UserInputState == Enum.UserInputState.End then
+					dragging = false
+				end
+			end)
+		end
+	end)
+	npcDetailConn = UserInputService.InputChanged:Connect(function(input)
+		if not dragging or not npcDetailFrame then return end
+		if input.UserInputType == Enum.UserInputType.MouseMovement
+			or input.UserInputType == Enum.UserInputType.Touch then
+			local delta = input.Position - dragStart
+			frame.Position = UDim2.new(
+				startPos.X.Scale, startPos.X.Offset + delta.X,
+				startPos.Y.Scale, startPos.Y.Offset + delta.Y
+			)
+		end
+	end)
+
+	close.MouseButton1Click:Connect(function()
+		CFG.npcDetails = false
+		npcDetailTeardown()
+		if ui.window then pcall(function() ui.window:Set("crim_npcdetails", false) end) end
+		pcall(saveCfg)
+	end)
+end
+
+local function npcDetailRow(i)
+	local row = npcDetailRows[i]
+	if row and row.Parent then return row end
+	row = Instance.new("TextLabel")
+	row.Name = "Row" .. i
+	row.BackgroundColor3 = Color3.fromRGB(22, 19, 24)
+	row.BackgroundTransparency = (i % 2 == 0) and 0.35 or 0.6
+	row.BorderSizePixel = 0
+	row.Size = UDim2.new(1, -6, 0, 34)
+	row.Font = Enum.Font.Code
+	row.Text = ""
+	row.TextColor3 = Color3.fromRGB(235, 235, 240)
+	row.TextSize = 12
+	row.TextWrapped = false
+	row.TextTruncate = Enum.TextTruncate.AtEnd
+	row.TextXAlignment = Enum.TextXAlignment.Left
+	row.TextYAlignment = Enum.TextYAlignment.Top
+	row.RichText = true
+	row.LayoutOrder = i
+	local pad = Instance.new("UIPadding")
+	pad.PaddingLeft = UDim.new(0, 6)
+	pad.PaddingTop = UDim.new(0, 1)
+	pad.Parent = row
+	row.Parent = npcDetailList
+	npcDetailRows[i] = row
+	return row
+end
+
+local function npcDetailTick()
+	if dead or not CFG.npcDetails then return end
+	if not npcDetailFrame then npcDetailBuild() end
+	if not npcDetailFrame then return end
+	local t = now()
+	if t - npcDetailAt < 0.75 then return end
+	npcDetailAt = t
+
+	local rows = collectNpcs()
+	local counts = { Npcs = 0, Guards = 0, Police = 0 }
+	local alive = 0
+	for _, r in ipairs(rows) do
+		counts[r.group] = (counts[r.group] or 0) + 1
+		if not r.dead then alive = alive + 1 end
+	end
+	if npcDetailTitle then
+		npcDetailTitle.Text = string.format("NPC DETAILS  -  %d npcs  (%d alive)", #rows, alive)
+	end
+	if npcDetailStatus then
+		npcDetailStatus.Text = string.format(
+			"%d residents  |  %d guards  |  %d police  |  nearest %s",
+			counts.Npcs or 0, counts.Guards or 0, counts.Police or 0,
+			rows[1] and (rows[1].name .. " @ " .. rows[1].dist .. "m") or "-"
+		)
+	end
+	for i, r in ipairs(rows) do
+		local row = npcDetailRow(i)
+		row.Text = npcRowText(r)
+		row.Visible = true
+	end
+	for i = #rows + 1, #npcDetailRows do
+		local row = npcDetailRows[i]
+		if row then row.Visible = false end
+	end
+	return #rows
+end
+
+local function npcDetailDump()
+	local rows = collectNpcs()
+	local lines = {
+		string.format("npc dump  place %d  %s", game.PlaceId, os.date("%Y-%m-%d %H:%M:%S")),
+	}
+	for _, r in ipairs(rows) do
+		local attrs = {}
+		for k, v in pairs(r.model:GetAttributes()) do
+			attrs[#attrs + 1] = tostring(k) .. "=" .. tostring(v)
+		end
+		table.sort(attrs)
+		local root = r.model:FindFirstChild("HumanoidRootPart")
+		local pos = root
+			and string.format("%.0f, %.0f, %.0f", root.Position.X, root.Position.Y, root.Position.Z)
+			or "?"
+		lines[#lines + 1] = string.format(
+			"[%s] %s #%d  %s  %dm  %s  pos %s  { %s }",
+			r.group, r.name, r.index,
+			r.dead and "DEAD" or string.format("%d/%d hp", r.hp, r.maxHp),
+			r.dist, r.state, pos, table.concat(attrs, ", ")
+		)
+	end
+	local text = table.concat(lines, "\n")
+	print("[CRIMINAL] npc dump\n" .. text)
+	local saved = false
+	if writefile then
+		saved = pcall(writefile, "slimhub-npc-details.txt", text)
+	end
+	notify(string.format("dumped %d npcs%s", #rows,
+		saved and " to slimhub-npc-details.txt" or " to console"))
+	return #rows
+end
+
 --// teleport to selected -------------------------------------------------------
 
 local function teleportToPlayer(name)
@@ -24368,6 +24750,7 @@ local function shutdown()
 	restoreNoclip()
 	restoreVisuals()
 	clearDrawings()
+	npcDetailTeardown()
 	lootPool = {}
 	playerPool = {}
 	npcPool = {}
@@ -24383,6 +24766,8 @@ panic = function()
 	CFG.autoLoad = false
 	CFG.autoRob = false
 	CFG.npcEsp = false
+	CFG.npcTags = false
+	CFG.npcDetails = false
 	CFG.playerEsp = false
 	CFG.customSpeed = false
 	CFG.speedNoCap = false
@@ -24400,10 +24785,12 @@ panic = function()
 	restoreNoclip()
 	restoreVisuals()
 	hideEverything()
+	npcDetailTeardown()
 	if ui.window then
 		for _, flag in ipairs({
 			"crim_lootesp", "crim_autograb", "crim_autoload", "crim_autorb",
-			"crim_npcesp", "crim_pesp", "crim_speed", "crim_infstam",
+			"crim_npcesp", "crim_npctags", "crim_npcdetails", "crim_pesp",
+			"crim_speed", "crim_infstam",
 			"crim_speednocap", "crim_jump",
 			"crim_infjump", "crim_noclip", "crim_fullbright", "crim_nofog", "crim_fovon",
 		}) do
@@ -24642,6 +25029,13 @@ local function buildUI()
 		Value = CFG.npcBox,
 		Callback = function(v) CFG.npcBox = v end,
 	})
+	worldTab:CreateToggle({
+		Name = "detail tags",
+		Description = "adds state, gender, outfit, home and spot to each npc label. off by default to keep the screen clean.",
+		Flag = "crim_npctags",
+		Value = CFG.npcTags,
+		Callback = function(v) CFG.npcTags = v end,
+	})
 	ui.npcInfo = worldTab:CreateText({ Name = "npc counts", Text = "-" })
 	ui.npcDrop = worldTab:CreateDropdown({
 		Name = "npc",
@@ -24675,6 +25069,36 @@ local function buildUI()
 				notify("npc has no part")
 			end
 		end,
+	})
+
+	worldTab:CreateSection({ Name = "NPC DETAILS" })
+	worldTab:CreateToggle({
+		Name = "npc details window",
+		Description = "draggable list of every resident, guard and police: health, distance, state, gender, outfit, home and spot. updates live and sorts by nearest.",
+		Flag = "crim_npcdetails",
+		Value = CFG.npcDetails,
+		Callback = function(v)
+			CFG.npcDetails = v
+			if v then
+				pcall(npcDetailBuild)
+				npcDetailAt = 0
+				pcall(npcDetailTick)
+			else
+				npcDetailTeardown()
+			end
+			pcall(saveCfg)
+		end,
+	})
+	worldTab:CreateButton({
+		Name = "dump all npc details",
+		Description = "prints every npc with its full attribute list to the console and slimhub-npc-details.txt in the workspace folder.",
+		Callback = function()
+			pcall(npcDetailDump)
+		end,
+	})
+	worldTab:CreateText({
+		Name = "npc details note",
+		Text = "details come from the model's own attributes and humanoid. state = the game's routine/post value. nothing is invented.",
 	})
 
 	worldTab:CreateSection({ Name = "PROMPT SNIPER" })
@@ -25039,6 +25463,12 @@ local function tick()
 		for _, e in pairs(npcPool) do hideHumanoidEsp(e) end
 	end
 
+	if CFG.npcDetails then
+		pcall(npcDetailTick)
+	elseif npcDetailFrame then
+		npcDetailTeardown()
+	end
+
 	local t = now()
 	if t - lastSync > 0.5 then
 		lastSync = t
@@ -25094,6 +25524,10 @@ local function tick()
 end
 
 buildUI()
+
+if CFG.npcDetails then
+	pcall(npcDetailBuild)
+end
 
 if ui.window then
 	local conn = UserInputService.InputBegan:Connect(function(input, gp)
@@ -25172,9 +25606,11 @@ _G.CriminalPanel = {
 	teleport = stepTeleport,
 	stamina = staminaTick,
 	speedTarget = speedTarget,
+	npcDetails = npcDetailTick,
+	npcDump = npcDetailDump,
 }
 
-print("[CRIMINAL] panel loaded - loot esp, prompt sniper, stamina, speed guard, movement")
+print("[CRIMINAL] panel loaded - loot esp, npc details, prompt sniper, stamina, speed guard, movement")
 end
 
 --// dispatch -------------------------------------------------------------------
