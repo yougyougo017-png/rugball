@@ -1033,7 +1033,7 @@ dropdownRow(sysPage, "click method", { "auto", "signal", "virtual" }, CFG.clickM
 	CFG.clickMethod = tostring(v)
 end)
 local sysNote = label(sysPage,
-	"auto tries firesignal first, then a virtual mouse click. pick virtual if signal does nothing in your executor.",
+	"auto sends a real mouse click first, then falls back to firesignal. pick signal if your executor blocks virtual input, or virtual to force a real click.",
 	UDim2.new(1, 0, 0, 40), COL.dim)
 sysNote.TextSize = 10
 sysNote.TextWrapped = true
