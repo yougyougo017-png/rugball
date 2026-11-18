@@ -7963,6 +7963,10 @@ Hub.SUITE.qb_aimbot = function()
 	    auto target, lead, perfect release and power all keep running. it
 	    follows the current offense and falls back to the auto pick when that
 	    receiver is down or off the field.
+	  * real players are read from Players and GameRigs.All as well as
+	    Home.Receivers, so a human receiver is still throwable and every human
+	    is labeled even when the game's AI receiver list is empty. opponents
+	    stay coverage, and unknown-side players are marked P? and scored lower.
 	  * the lead uses the game's own three-pass leadPoint loop, so a running
 	    receiver is met where he will be, not where he is.
 	  * BallController.Launch is wrapped, not replaced: the controller's state
@@ -7990,9 +7994,9 @@ Hub.SUITE.qb_aimbot = function()
 	  LeftShift   sprint (MOVE: infinite + auto)
 	  P           panic
 
-	_G.SlimQbAim exports cfg, stats, pick, list, probe, catchProbe, throw, cycle,
-	lock, unlock, next, locked, panic, stop, play, rebirth, farm, sprint,
-	autoSprint.
+	_G.SlimQbAim exports cfg, stats, pick, list, probe, catchProbe, playerProbe,
+	throw, cycle, lock, unlock, next, locked, panic, stop, play, rebirth, farm,
+	sprint, autoSprint.
 --]]
 
 if game.PlaceId ~= 125942529011157 then
@@ -8039,6 +8043,9 @@ local DEFAULTS = {
 	labels = true,
 	arc = true,
 	defLines = false,
+	playerEsp = true,
+	playerTargets = true,
+	playerCoverage = true,
 	hud = true,
 	autoThrow = false,
 	safeCatch = false,
@@ -9315,6 +9322,223 @@ local function leadPoint(from, point, vel)
 	return p
 end
 
+-- real players are not guaranteed to be in GameRigs.Home.Receivers. the game
+-- keeps its AI route runners there, while a human receiver can exist only as a
+-- character in Workspace and as an entry in GameRigs.All. these helpers build a
+-- throwable record for the real character and use the rig Side / Player.Team
+-- only to keep opponents out of the receiver list.
+local playerRigs = setmetatable({}, { __mode = "k" })
+local playerSlotSeq = 0
+
+local function rootOfRig(r)
+	if type(r) ~= "table" then
+		return nil
+	end
+	local root = r.Root
+	if typeof(root) == "Instance" then
+		if root:IsA("BasePart") then
+			return root
+		end
+		if root:IsA("Model") and root.PrimaryPart then
+			return root.PrimaryPart
+		end
+		local part = root:FindFirstChild("HumanoidRootPart") or root:FindFirstChildWhichIsA("BasePart")
+		if part then
+			return part
+		end
+	end
+	return nil
+end
+
+local function descendantOf(inst, parent)
+	if typeof(inst) ~= "Instance" or typeof(parent) ~= "Instance" then
+		return false
+	end
+	local ok, res = pcall(function()
+		return inst:IsDescendantOf(parent)
+	end)
+	return ok and res
+end
+
+local function rootMatchesList(root, list)
+	if typeof(root) ~= "Instance" or type(list) ~= "table" then
+		return false
+	end
+	for _, r in ipairs(list) do
+		if type(r) == "table" then
+			local rr = rootOfRig(r)
+			if rr and (rr == root or descendantOf(root, rr.Parent) or descendantOf(rr, root.Parent)) then
+				return true
+			end
+		end
+	end
+	return false
+end
+
+local function rigSideOfRoot(root)
+	if typeof(root) ~= "Instance" then
+		return nil
+	end
+	local all = GR and GR.All
+	if type(all) ~= "table" then
+		return nil
+	end
+	for _, r in ipairs(all) do
+		if type(r) == "table" then
+			local rr = rootOfRig(r)
+			if rr and (rr == root or descendantOf(root, rr.Parent) or descendantOf(rr, root.Parent)) then
+				local side = tostring(r.Side or "")
+				if side ~= "" then
+					return side
+				end
+			end
+		end
+	end
+	return nil
+end
+
+local function localSide()
+	local ch = LP.Character
+	local root = ch and ch:FindFirstChild("HumanoidRootPart")
+	local side = root and rigSideOfRoot(root) or nil
+	if side then
+		return side
+	end
+	local all = GR and GR.All
+	if type(all) == "table" then
+		for _, r in ipairs(all) do
+			if type(r) == "table" then
+				local nm = tostring(r.Name or "")
+				if nm ~= "" and (nm == LP.Name or nm == LP.DisplayName) then
+					local s = tostring(r.Side or "")
+					if s ~= "" then
+						return s
+					end
+				end
+			end
+		end
+	end
+	return nil
+end
+
+-- true = same side, false = other side, nil = the game gives us no side for
+-- this player. nil is treated as a possible receiver so a human route runner
+-- is still selectable, but it is scored below a known receiver.
+local function playerOnSide(player, side)
+	if player.Team and LP.Team then
+		return player.Team == LP.Team
+	end
+	local ch = player.Character
+	local root = ch and ch:FindFirstChild("HumanoidRootPart")
+	local ps = root and rigSideOfRoot(root) or nil
+	if ps and side then
+		return ps == side
+	end
+	-- last resort: the game's own unit lists. a character that is one of your
+	-- Home receivers is on your side; a character in Away.Covers is not.
+	local recs = GR and GR.Home and GR.Home.Receivers
+	if root and rootMatchesList(root, recs) then
+		return true
+	end
+	local covers = GR and GR.Away and GR.Away.Covers
+	if root and rootMatchesList(root, covers) then
+		return false
+	end
+	return nil
+end
+
+local function playerRig(player, index)
+	local ch = player.Character
+	local root = ch and ch:FindFirstChild("HumanoidRootPart")
+	if not root then
+		playerRigs[player] = nil
+		return nil
+	end
+	local rec = playerRigs[player]
+	if not rec then
+		playerSlotSeq = playerSlotSeq + 1
+		rec = {
+			Slot = -1000 - playerSlotSeq,
+			Job = "Catch",
+			Scale = 1,
+			Player = player,
+		}
+		playerRigs[player] = rec
+	end
+	local v = root.AssemblyLinearVelocity
+	-- Pos on a GameRigs record is the feet/base point, and catchOf adds the
+	-- body height on top of it. keep the synthetic record in the same space.
+	rec.Root = root
+	rec.Pos = root.Position - Vector3.new(0, 3, 0)
+	rec.Vel = Vector3.new(v.X, 0, v.Z)
+	rec.Name = player.DisplayName or player.Name
+	rec.Slot = rec.Slot or (-1000 - index)
+	return rec
+end
+
+local function receiverRigs(side)
+	local out = {}
+	local seen = {}
+	local function add(r)
+		if type(r) ~= "table" then
+			return
+		end
+		local root = rootOfRig(r)
+		local name = tostring(r.Name or "")
+		if root and descendantOf(root, LP.Character) then
+			return
+		end
+		if name ~= "" and (name == LP.Name or name == LP.DisplayName) then
+			return
+		end
+		local key = root or r
+		if seen[key] then
+			return
+		end
+		seen[key] = true
+		out[#out + 1] = r
+	end
+
+	local recs = GR and GR.Home and GR.Home.Receivers
+	if type(recs) == "table" then
+		for i = 1, #recs do
+			add(recs[i])
+		end
+	end
+
+	-- a human receiver can be in GameRigs.All without being in Home.Receivers.
+	-- PassSpot is what makes a rig an eligible target; only use it as a fallback
+	-- when the local side is known, so the old Side mix-up cannot return.
+	if side and type(GR and GR.All) == "table" then
+		for _, r in ipairs(GR.All) do
+			if type(r) == "table" and tostring(r.Side or "") == side then
+				local job = tostring(r.Job or "")
+				if typeof(r.PassSpot) == "Vector3" or job == "Catch" then
+					add(r)
+				end
+			end
+		end
+	end
+
+	if CFG.playerTargets then
+		local index = 0
+		for _, p in ipairs(Players:GetPlayers()) do
+			if p ~= LP then
+				index = index + 1
+				local rec = playerRig(p, index)
+				if rec then
+					local same = playerOnSide(p, side)
+					if same ~= false then
+						rec.__unknown = same == nil
+						add(rec)
+					end
+				end
+			end
+		end
+	end
+	return out
+end
+
 local function currentPower()
 	if CFG.powerBoost then
 		return 99
@@ -9323,26 +9547,42 @@ local function currentPower()
 	return tonumber(up and up.Power) or 0
 end
 
-local function defenderPositions()
+local function defenderPositions(side)
 	local out = {}
 	-- GameRigs separates the two units explicitly: Home is your offense,
 	-- Away.Covers is the secondary that actually covers your receivers.
-	-- All[].Side is labelled from the other team's point of view, so filtering
-	-- by Side picked up your own receivers and every catch looked covered.
+	-- All[].Side is labelled from the other team's point of view, so the old
+	-- filter by Side ~= "Home" picked up your own receivers. real players are
+	-- checked against the local side instead, not against the string "Home".
 	local away = GR and GR.Away
 	local covers = type(away) == "table" and away.Covers or nil
-	if type(covers) ~= "table" then
-		return out
-	end
-	for _, r in ipairs(covers) do
-		if type(r) == "table" then
-			local job = tostring(r.Job or "")
-			local p = baseOf(r)
-			if p and job ~= "Down" and job ~= "Dive" then
-				out[#out + 1] = p
+	if type(covers) == "table" then
+		for _, r in ipairs(covers) do
+			if type(r) == "table" then
+				local job = tostring(r.Job or "")
+				local p = baseOf(r)
+				if p and job ~= "Down" and job ~= "Dive" then
+					out[#out + 1] = p
+				end
 			end
 		end
 	end
+
+	-- a human defender is not guaranteed to be in Away.Covers. add any real
+	-- player the game clearly marks as the other side; unknown players are
+	-- left out so they cannot make every receiver look covered.
+	if CFG.playerCoverage then
+		for _, p in ipairs(Players:GetPlayers()) do
+			if p ~= LP and playerOnSide(p, side) == false then
+				local ch = p.Character
+				local root = ch and ch:FindFirstChild("HumanoidRootPart")
+				if root then
+					out[#out + 1] = root.Position
+				end
+			end
+		end
+	end
+
 	return out
 end
 
@@ -9404,10 +9644,7 @@ local AUTO_LABEL = "auto (best open)"
 
 local function receiverRecords()
 	local out = {}
-	local recs = GR and GR.Home and GR.Home.Receivers
-	if type(recs) ~= "table" then
-		return out
-	end
+	local recs = receiverRigs(localSide())
 	for i = 1, #recs do
 		local r = recs[i]
 		if type(r) == "table" then
@@ -9415,6 +9652,8 @@ local function receiverRecords()
 				rig = r,
 				slot = tonumber(r.Slot) or i,
 				name = tostring(r.Name or ("R" .. i)),
+				real = r.Player ~= nil,
+				unknown = r.__unknown == true,
 			}
 		end
 	end
@@ -9478,9 +9717,13 @@ local function receiverOptions()
 	local map = {}
 	local used = { [AUTO_LABEL] = true }
 	for _, rec in ipairs(recs) do
-		local label = rec.name
+		local baseName = rec.name
+		if rec.real then
+			baseName = rec.unknown and ("P? " .. rec.name) or ("P: " .. rec.name)
+		end
+		local label = baseName
 		if (counts[rec.name] or 0) > 1 then
-			label = string.format("%s #%d", rec.name, rec.slot)
+			label = string.format("%s #%d", baseName, rec.slot)
 		end
 		local base = label
 		local n = 2
@@ -9594,6 +9837,14 @@ local function autoPick(list, origin)
 		return list[((cycle - 1) % #list) + 1]
 	end
 	if CFG.autoTarget then
+		-- unknown-side humans stay selectable by lock, F and the crosshair, but
+		-- a known receiver wins the automatic pick. otherwise a 1v1 opponent
+		-- with no side data could become the default target.
+		for i = 1, #list do
+			if not list[i].unknown then
+				return list[i]
+			end
+		end
 		return list[1]
 	end
 	return crosshairPick(list, origin)
@@ -9607,11 +9858,12 @@ local function build(now)
 		pick = nil
 		return
 	end
-	local defs = defenderPositions()
+	local side = localSide()
+	local defs = defenderPositions(side)
 	local power = currentPower()
 	local maxs = TCfg.maxSpeed(power)
 	local list = {}
-	local recs = GR and GR.Home and GR.Home.Receivers
+	local recs = receiverRigs(side)
 
 	if type(recs) == "table" then
 		for i = 1, #recs do
@@ -9639,6 +9891,7 @@ local function build(now)
 							+ (job == "Catch" and 3 or 0)
 							+ (open and 10 or 0)
 							+ (reachable and 5 or -5)
+							- (r.__unknown and 8 or 0)
 						list[#list + 1] = {
 							rig = r,
 							index = i,
@@ -9657,6 +9910,8 @@ local function build(now)
 							reachable = reachable,
 							slot = tonumber(r.Slot) or i,
 							name = tostring(r.Name or ("R" .. i)),
+							real = r.Player ~= nil,
+							unknown = r.__unknown == true,
 							slider = slider and math.clamp(slider, 0, 1) or 0,
 							score = score,
 						}
@@ -9700,6 +9955,7 @@ fxFolder.Name = FX_NAME
 fxFolder.Parent = Workspace
 
 local esp = {}
+local realEsp = {}
 
 local function ensureEsp(rig, root)
 	local item = esp[rig]
@@ -9822,6 +10078,11 @@ local function clearVisuals()
 			item.billboard.Enabled = false
 		end
 	end
+	for _, item in pairs(realEsp) do
+		if item.billboard and item.billboard.Parent then
+			item.billboard.Enabled = false
+		end
+	end
 	for _, p in ipairs(arcPool) do
 		p.Transparency = 1
 	end
@@ -9867,7 +10128,8 @@ local function drawVisuals()
 			item.label.Visible = CFG.labels
 			item.label.TextColor3 = col
 			item.label.Text = string.format(
-				"%s  %.0f st  %s  sep %.0f  pwr %d%%",
+				"%s%s  %.0f st  %s  sep %.0f  pwr %d%%",
+				e.real and (e.unknown and "P? " or "P: ") or "",
 				e.name, e.dist, e.open and "open" or "cut", e.sep, math.floor(e.slider * 100)
 			)
 			seen[e.rig] = true
@@ -9875,6 +10137,94 @@ local function drawVisuals()
 	end
 	for rig, item in pairs(esp) do
 		if not seen[rig] and item.billboard and item.billboard.Parent then
+			item.billboard.Enabled = false
+		end
+	end
+end
+
+local function ensureRealEsp(player, root)
+	local item = realEsp[player]
+	if item and item.billboard and item.billboard.Parent then
+		return item
+	end
+	local bb = Instance.new("BillboardGui")
+	bb.Name = "qbaim_player"
+	bb.Size = UDim2.fromOffset(190, 24)
+	bb.AlwaysOnTop = true
+	bb.LightInfluence = 0
+	bb.MaxDistance = 500
+	bb.StudsOffset = Vector3.new(0, 3.4, 0)
+	bb.Adornee = root
+	bb.Parent = fxFolder
+
+	local label = Instance.new("TextLabel")
+	label.BackgroundTransparency = 1
+	label.Size = UDim2.fromScale(1, 1)
+	label.Font = Enum.Font.GothamBold
+	label.TextSize = 13
+	label.TextStrokeTransparency = 0.35
+	label.Text = ""
+	label.Parent = bb
+
+	local stroke = Instance.new("UIStroke")
+	stroke.Thickness = 1.4
+	stroke.Parent = label
+
+	item = { billboard = bb, label = label, stroke = stroke }
+	realEsp[player] = item
+	return item
+end
+
+-- every other real player in the match, independent of whether they are in the
+-- game's target registry. this is the part that answers "does it see the human
+-- players": green = same side, red = other side, white = the game gave no side.
+local function drawRealEsp()
+	if not CFG.enabled or not CFG.playerEsp then
+		for _, item in pairs(realEsp) do
+			if item.billboard and item.billboard.Parent then
+				item.billboard.Enabled = false
+			end
+		end
+		return
+	end
+	local me = LP.Character and LP.Character:FindFirstChild("HumanoidRootPart")
+	local origin = me and me.Position or Vector3.zero
+	local side = localSide()
+	local inTargets = {}
+	if CFG.esp then
+		for _, e in ipairs(targetList) do
+			if e.real and e.rig.Player then
+				inTargets[e.rig.Player] = true
+			end
+		end
+	end
+	local seen = {}
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p ~= LP and not inTargets[p] then
+			local ch = p.Character
+			local root = ch and ch:FindFirstChild("HumanoidRootPart")
+			if root then
+				local item = ensureRealEsp(p, root)
+				item.billboard.Adornee = root
+				item.billboard.Enabled = true
+				local same = playerOnSide(p, side)
+				local col = same == true and OPEN_COLOR
+					or (same == false and CUT_COLOR or Color3.fromRGB(235, 235, 245))
+				local tag = same == true and "" or (same == false and "OP " or "? ")
+				item.stroke.Color = col
+				item.label.TextColor3 = col
+				item.label.Text = string.format(
+					"%s%s  %.0f st",
+					tag,
+					p.DisplayName,
+					(root.Position - origin).Magnitude
+				)
+				seen[p] = true
+			end
+		end
+	end
+	for p, item in pairs(realEsp) do
+		if not seen[p] and item.billboard and item.billboard.Parent then
 			item.billboard.Enabled = false
 		end
 	end
@@ -10586,6 +10936,45 @@ local function buildUI()
 
 	-- TARGETS
 	local visTab = w:CreateTab({ Name = "TARGETS" })
+	visTab:CreateSection({ Name = "REAL PLAYERS" })
+	visTab:CreateText({
+		Name = "real player note",
+		Text = "Home.Receivers is the game's AI receiver list. human players can exist only in GameRigs.All or as characters, so these options read them directly. known opponents are coverage, not targets.",
+	})
+	reg("qb_playeresp", "playerEsp")
+	visTab:CreateToggle({
+		Name = "real player esp",
+		Description = "labels every other real player in the match. green same side, red other side, white unknown side.",
+		Flag = "qb_playeresp",
+		Value = CFG.playerEsp,
+		Callback = function(v)
+			CFG.playerEsp = v
+			saveCfg()
+		end,
+	})
+	reg("qb_playertargets", "playerTargets")
+	visTab:CreateToggle({
+		Name = "real player targets",
+		Description = "adds real players to the throw list and lock dropdown. known opponents are excluded and counted as coverage.",
+		Flag = "qb_playertargets",
+		Value = CFG.playerTargets,
+		Callback = function(v)
+			CFG.playerTargets = v
+			saveCfg()
+		end,
+	})
+	reg("qb_playercover", "playerCoverage")
+	visTab:CreateToggle({
+		Name = "real player coverage",
+		Description = "counts real players marked as the other side as coverage. turn off if the game's side labels are inverted and every receiver looks covered.",
+		Flag = "qb_playercover",
+		Value = CFG.playerCoverage,
+		Callback = function(v)
+			CFG.playerCoverage = v
+			saveCfg()
+		end,
+	})
+
 	visTab:CreateSection({ Name = "OVERLAY" })
 	reg("qb_esp", "esp")
 	visTab:CreateToggle({
@@ -11218,6 +11607,16 @@ local function buildUI()
 		end,
 	})
 	infoTab:CreateButton({
+		Name = "probe real players",
+		Description = "prints the live Players, GameRigs.All, Home.Receivers, Away.Covers and the throwable list. read-only. paste the console output if a real player still does not appear.",
+		Callback = function()
+			local api = _G.SlimQbAim
+			if api and api.playerProbe then
+				print("[QBAIM players]\n" .. api.playerProbe())
+			end
+		end,
+	})
+	infoTab:CreateButton({
 		Name = "reset stats",
 		Callback = function()
 			stats.throws = 0
@@ -11294,6 +11693,100 @@ local function catchProbe()
 			.. keyDump(r, "hand") .. " | "
 			.. keyDump(r, "drop"),
 	}
+	return table.concat(rows, "\n")
+end
+
+local function playerProbe()
+	local side = localSide()
+	local rows = {
+		"place=" .. tostring(game.PlaceId),
+		"localSide=" .. tostring(side),
+		"players=" .. tostring(#Players:GetPlayers()),
+	}
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p ~= LP then
+			local ch = p.Character
+			local root = ch and ch:FindFirstChild("HumanoidRootPart")
+			rows[#rows + 1] = string.format(
+				"player %s | display %s | team %s | char %s | root %s | side %s | pos %s",
+				p.Name,
+				p.DisplayName,
+				p.Team and p.Team.Name or "nil",
+				ch and ch.Name or "nil",
+				root and root.Name or "nil",
+				root and (rigSideOfRoot(root) or "nil") or "nil",
+				root and string.format("%.0f,%.0f,%.0f", root.Position.X, root.Position.Y, root.Position.Z)
+					or "nil"
+			)
+		end
+	end
+	local all = GR and GR.All
+	if type(all) == "table" then
+		local n = 0
+		for _ in pairs(all) do
+			n = n + 1
+		end
+		rows[#rows + 1] = "GR.All entries=" .. tostring(n)
+		for i, r in ipairs(all) do
+			if i > 20 then
+				rows[#rows + 1] = "..."
+				break
+			end
+			if type(r) == "table" then
+				local root = rootOfRig(r)
+				rows[#rows + 1] = string.format(
+					"all[%d] name=%s side=%s slot=%s job=%s root=%s pass=%s pos=%s",
+					i,
+					tostring(r.Name),
+					tostring(r.Side),
+					tostring(r.Slot),
+					tostring(r.Job),
+					root and tostring(root.Parent and root.Parent.Name) or "nil",
+					typeof(r.PassSpot) == "Vector3" and "yes" or "no",
+					root and string.format("%.0f,%.0f,%.0f", root.Position.X, root.Position.Y, root.Position.Z)
+						or tostring(r.Pos)
+				)
+			end
+		end
+	else
+		rows[#rows + 1] = "GR.All=nil"
+	end
+	local recs = GR and GR.Home and GR.Home.Receivers
+	if type(recs) == "table" then
+		rows[#rows + 1] = "Home.Receivers=" .. tostring(#recs)
+		for i = 1, math.min(#recs, 12) do
+			local r = recs[i]
+			if type(r) == "table" then
+				rows[#rows + 1] = string.format(
+					"home[%d] name=%s slot=%s job=%s root=%s pass=%s",
+					i,
+					tostring(r.Name),
+					tostring(r.Slot),
+					tostring(r.Job),
+					rootOfRig(r) and "yes" or "no",
+					typeof(r.PassSpot) == "Vector3" and "yes" or "no"
+				)
+			end
+		end
+	else
+		rows[#rows + 1] = "Home.Receivers=nil"
+	end
+	local covers = GR and GR.Away and GR.Away.Covers
+	rows[#rows + 1] = "Away.Covers=" .. tostring(type(covers) == "table" and #covers or 0)
+	local pool = receiverRigs(side)
+	rows[#rows + 1] = "throwable records=" .. tostring(#pool)
+	for i = 1, math.min(#pool, 16) do
+		local r = pool[i]
+		rows[#rows + 1] = string.format(
+			"pool[%d] name=%s slot=%s job=%s real=%s unknown=%s",
+			i,
+			tostring(r.Name),
+			tostring(r.Slot),
+			tostring(r.Job),
+			tostring(r.Player ~= nil),
+			tostring(r.__unknown == true)
+		)
+	end
 	return table.concat(rows, "\n")
 end
 
@@ -11433,6 +11926,7 @@ _G.SlimQbAim = {
 	end,
 	probe = probe,
 	catchProbe = catchProbe,
+	playerProbe = playerProbe,
 	throw = releaseNow,
 	cycle = function(n)
 		clearLock()
@@ -11533,6 +12027,7 @@ RunService:BindToRenderStep(TAG, Enum.RenderPriority.Camera.Value + 2, function(
 	end
 	if CFG.enabled then
 		drawVisuals()
+		drawRealEsp()
 		drawArc()
 		drawDefLine()
 		autoFarmStep(now)
@@ -11546,9 +12041,10 @@ RunService:BindToRenderStep(TAG, Enum.RenderPriority.Camera.Value + 2, function(
 		lastStatus = now
 		pcall(function()
 			ui.status:Set(string.format(
-				"%s\nreceivers %d\n%s",
+				"%s\nreceivers %d  |  humans %d\n%s",
 				statusLine,
 				#targetList,
+				math.max(0, #Players:GetPlayers() - 1),
 				pick and (pick.name .. (manualPick and "  locked" or "") .. "  " .. string.format("%.0f st", pick.dist)) or "no target"
 			))
 		end)
