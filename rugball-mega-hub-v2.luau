@@ -8222,7 +8222,11 @@ local ac = {
 	prunes = 0,
 }
 
-local acEvents = {}
+-- the anti-cheat internals run inside this block so their locals are freed at
+-- the end of it; only the small exported surface below stays on the suite's
+-- top-level local stack (Luau allows 200 locals per function).
+do
+ac.events = {}
 local acLastEvent = 0
 local acLastRemote = 0
 local acLastGuard = 0
@@ -8230,11 +8234,11 @@ local acLastApply = 0
 local acLastSync = 0
 local acDefensePending = false
 
-local acRemote = nil
+ac.remote = nil
 local acGuard = nil
 local acGuardSource = nil
 local acGuardOriginal = nil
-local acClosure = false
+ac.closure = false
 local acIndexTarget = nil
 
 local acWhitelist = nil
@@ -8268,9 +8272,9 @@ local function acLog(text)
 	local now = os.clock()
 	if now - acLastEvent < 0.05 then return end
 	acLastEvent = now
-	table.insert(acEvents, 1, os.date("%H:%M:%S") .. "  " .. tostring(text))
-	while #acEvents > 12 do
-		table.remove(acEvents)
+	table.insert(ac.events, 1, os.date("%H:%M:%S") .. "  " .. tostring(text))
+	while #ac.events > 12 do
+		table.remove(ac.events)
 	end
 end
 
@@ -8292,9 +8296,9 @@ end
 local function refreshAcRemote()
 	local candidate = ReplicatedStorage:FindFirstChild("AntiCheatGuard")
 	if candidate and candidate:IsA("BaseRemoteEvent") then
-		acRemote = candidate
+		ac.remote = candidate
 	else
-		acRemote = nil
+		ac.remote = nil
 	end
 end
 
@@ -8337,7 +8341,7 @@ local function findGuard()
 end
 
 local function installClosure()
-	if dead or acClosure then return acClosure end
+	if dead or ac.closure then return ac.closure end
 	startAcTick()
 	if (not acGuard or type(acGuard._check) ~= "function") and not findGuard() then
 		return false
@@ -8347,7 +8351,7 @@ local function installClosure()
 	end)
 	if ok and original then
 		acGuardOriginal = original
-		acClosure = true
+		ac.closure = true
 		acLog("closure attached via " .. tostring(acGuardSource))
 		return true
 	end
@@ -8355,12 +8359,12 @@ local function installClosure()
 end
 
 local function removeClosure()
-	if not acClosure then return end
+	if not ac.closure then return end
 	if acGuard and type(acGuard._check) == "function" and acGuardOriginal then
 		pcall(hookfunction, acGuard._check, acGuardOriginal)
 	end
 	acGuardOriginal = nil
-	acClosure = false
+	ac.closure = false
 end
 
 local mt = nil
@@ -8450,7 +8454,7 @@ local function removeIndex()
 end
 
 local acNamecallOld = nil
-local acNamecallHook = nil
+ac.namecallHook = nil
 
 local function previewArgs(...)
 	local count = select("#", ...)
@@ -8486,15 +8490,15 @@ local function handleReport(...)
 end
 
 local function installNamecall()
-	if not mt or acNamecallHook then return acNamecallHook ~= nil end
+	if not mt or ac.namecallHook then return ac.namecallHook ~= nil end
 	startAcTick()
 	acNamecallOld = mt.__namecall
 	if not acNamecallOld then return false end
-	acNamecallHook = newcclosure(function(self, ...)
+	ac.namecallHook = newcclosure(function(self, ...)
 		if not dead and not checkcaller() then
 			local ok, method = pcall(getnamecallmethod)
 			if ok and (method == "FireServer" or method == "InvokeServer") then
-				local isGuard = self == acRemote
+				local isGuard = self == ac.remote
 				if not isGuard and typeof(self) == "Instance" and self.Name == "AntiCheatGuard" then
 					isGuard = self:IsA("BaseRemoteEvent")
 				end
@@ -8506,23 +8510,23 @@ local function installNamecall()
 		return acNamecallOld(self, ...)
 	end, "qb_ac_namecall")
 	local ok = writeMetatable(function()
-		mt.__namecall = acNamecallHook
+		mt.__namecall = ac.namecallHook
 	end)
 	if not ok then
-		acNamecallHook = nil
+		ac.namecallHook = nil
 		acNamecallOld = nil
 	end
 	return ok
 end
 
 local function removeNamecall()
-	if not mt or not acNamecallHook then return end
+	if not mt or not ac.namecallHook then return end
 	writeMetatable(function()
-		if mt.__namecall == acNamecallHook then
+		if mt.__namecall == ac.namecallHook then
 			mt.__namecall = acNamecallOld
 		end
 	end)
-	acNamecallHook = nil
+	ac.namecallHook = nil
 	acNamecallOld = nil
 end
 
@@ -8808,7 +8812,7 @@ local function stepTick(dt)
 	root.CFrame = root.CFrame + direction.Unit * (CFG.stepExtra * math.min(dt, 0.1))
 end
 
-local acJumpConn = UserInputService.JumpRequest:Connect(function()
+ac.jumpConn = UserInputService.JumpRequest:Connect(function()
 	if dead or not CFG.infJump then return end
 	local humanoid = currentHumanoid()
 	if humanoid and humanoid.Health > 0 then
@@ -8819,15 +8823,15 @@ end)
 local function acStateText()
 	return string.format(
 		"closure %s  |  block %s  |  index %s  |  anim %s",
-		acClosure and "ON" or "off",
-		acNamecallHook and (CFG.block and "ON" or "watch") or "off",
+		ac.closure and "ON" or "off",
+		ac.namecallHook and (CFG.block and "ON" or "watch") or "off",
 		acIndexHook and (CFG.index and "ON" or "watch") or "off",
 		acWhitelistOn and "ON" or "off"
 	)
 end
 
 local function acCoverageText()
-	if acClosure then
+	if ac.closure then
 		return "guard coverage: closure"
 	end
 	if CFG.admin then
@@ -8852,7 +8856,7 @@ local function bypassTick(dt)
 
 	if now - acLastGuard > 2 then
 		acLastGuard = now
-		if CFG.closure and not acClosure then installClosure() end
+		if CFG.closure and not ac.closure then installClosure() end
 		if CFG.anim and not acWhitelistOn then installAnim() end
 		if CFG.animTracks and not acTrackOn then installTrackGuard() end
 		if CFG.walkSpeed and not acWalkBound then applyWalkSpeed(true) end
@@ -8923,7 +8927,7 @@ local function bypassTick(dt)
 		end
 		if ui.acLogText then
 			pcall(function()
-				ui.acLogText:Set(#acEvents > 0 and table.concat(acEvents, "\n") or "-")
+				ui.acLogText:Set(#ac.events > 0 and table.concat(ac.events, "\n") or "-")
 			end)
 		end
 	end
@@ -8994,9 +8998,37 @@ end
 local function acProbe()
 	return string.format(
 		"ac closure=%s namecall=%s index=%s anim=%s reports=%d blocked=%d reads=%d guard=%s",
-		tostring(acClosure), tostring(acNamecallHook ~= nil), tostring(acIndexHook ~= nil),
+		tostring(ac.closure), tostring(ac.namecallHook ~= nil), tostring(acIndexHook ~= nil),
 		tostring(acWhitelistOn), ac.reports, ac.blocked, ac.reads, tostring(acGuardSource)
 	)
+end
+
+-- exported surface: the UI, panic and public API only need these handles
+ac.notify = acNotify
+ac.refreshRemote = refreshAcRemote
+ac.findGuard = findGuard
+ac.installClosure = installClosure
+ac.removeClosure = removeClosure
+ac.installIndex = installIndex
+ac.removeIndex = removeIndex
+ac.installNamecall = installNamecall
+ac.applyAdmin = applyAdmin
+ac.applyInflate = applyInflate
+ac.applyJump = applyJump
+ac.applyGravity = applyGravity
+ac.installAnim = installAnim
+ac.removeAnim = removeAnim
+ac.installTrackGuard = installTrackGuard
+ac.removeTrackGuard = removeTrackGuard
+ac.applyWalkSpeed = applyWalkSpeed
+ac.sprintEnabled = sprintEnabled
+ac.applySprint = applySprint
+ac.stateText = acStateText
+ac.coverageText = acCoverageText
+ac.installBypass = installBypass
+ac.applyBypassAll = applyBypassAll
+ac.stopBypass = stopBypass
+ac.probe = acProbe
 end
 
 --// modules -------------------------------------------------------------------
@@ -9053,11 +9085,11 @@ if not (TC and BC and TCfg) then
 end
 
 if not (TC and BC and TCfg) then
-	if acJumpConn then
+	if ac.jumpConn then
 		pcall(function()
-			acJumpConn:Disconnect()
+			ac.jumpConn:Disconnect()
 		end)
-		acJumpConn = nil
+		ac.jumpConn = nil
 	end
 	warn("[QBAIM] game modules are not ready yet (throw/ball controller or throw config missing); run the suite again once the match has loaded")
 	return
@@ -11237,8 +11269,8 @@ local function buildUI()
 	-- BYPASS
 	local acTab = w:CreateTab({ Name = "BYPASS" })
 	acTab:CreateSection({ Name = "MOVE GUARD" })
-	ui.acState = acTab:CreateText({ Name = "layers", Text = acStateText() })
-	ui.acCover = acTab:CreateText({ Name = "coverage", Text = acCoverageText() })
+	ui.acState = acTab:CreateText({ Name = "layers", Text = ac.stateText() })
+	ui.acCover = acTab:CreateText({ Name = "coverage", Text = ac.coverageText() })
 	reg("qb_ac_closure", "closure")
 	acTab:CreateToggle({
 		Name = "closure hook",
@@ -11248,11 +11280,11 @@ local function buildUI()
 		Callback = function(v)
 			CFG.closure = v
 			if v then
-				if not installClosure() then
-					acNotify("closure layer unavailable - guard table not found")
+				if not ac.installClosure() then
+					ac.notify("closure layer unavailable - guard table not found")
 				end
 			else
-				removeClosure()
+				ac.removeClosure()
 			end
 			saveCfg()
 		end,
@@ -11266,7 +11298,7 @@ local function buildUI()
 		Callback = function(v)
 			CFG.block = v
 			if v then
-				installNamecall()
+				ac.installNamecall()
 			end
 			saveCfg()
 		end,
@@ -11280,9 +11312,9 @@ local function buildUI()
 		Callback = function(v)
 			CFG.index = v
 			if v then
-				installIndex()
+				ac.installIndex()
 			else
-				removeIndex()
+				ac.removeIndex()
 			end
 			saveCfg()
 		end,
@@ -11298,11 +11330,11 @@ local function buildUI()
 		Callback = function(v)
 			CFG.anim = v
 			if v then
-				if not installAnim() then
-					acNotify("AnimWhitelist not found - animation layer unavailable")
+				if not ac.installAnim() then
+					ac.notify("AnimWhitelist not found - animation layer unavailable")
 				end
 			else
-				removeAnim()
+				ac.removeAnim()
 			end
 			saveCfg()
 		end,
@@ -11316,11 +11348,11 @@ local function buildUI()
 		Callback = function(v)
 			CFG.animTracks = v
 			if v then
-				if not installTrackGuard() then
-					acNotify("AnimTrackGuard not found - track layer unavailable")
+				if not ac.installTrackGuard() then
+					ac.notify("AnimTrackGuard not found - track layer unavailable")
 				end
 			else
-				removeTrackGuard()
+				ac.removeTrackGuard()
 			end
 			saveCfg()
 		end,
@@ -11339,7 +11371,7 @@ local function buildUI()
 		Value = CFG.admin,
 		Callback = function(v)
 			CFG.admin = v
-			applyAdmin(v)
+			ac.applyAdmin(v)
 			saveCfg()
 		end,
 	})
@@ -11351,7 +11383,7 @@ local function buildUI()
 		Value = CFG.inflate,
 		Callback = function(v)
 			CFG.inflate = v
-			applyInflate(v)
+			ac.applyInflate(v)
 			saveCfg()
 		end,
 	})
@@ -11365,30 +11397,30 @@ local function buildUI()
 			CFG.block = true
 			CFG.index = true
 			CFG.anim = true
-			installClosure()
-			installNamecall()
-			installIndex()
-			installAnim()
+			ac.installClosure()
+			ac.installNamecall()
+			ac.installIndex()
+			ac.installAnim()
 			for _, flag in ipairs({ "qb_ac_closure", "qb_ac_block", "qb_ac_index", "qb_ac_anim" }) do
 				pcall(function()
 					w:Set(flag, true)
 				end)
 			end
 			saveCfg()
-			acNotify("client-side layers armed: closure + block + index + AnimGuard")
+			ac.notify("client-side layers armed: closure + block + index + AnimGuard")
 		end,
 	})
 	acTab:CreateButton({
 		Name = "probe guard",
 		Description = "re-finds MoveGuard and reports which layers are attached.",
 		Callback = function()
-			refreshAcRemote()
-			local source = findGuard()
-			acNotify(string.format(
+			ac.refreshRemote()
+			local source = ac.findGuard()
+			ac.notify(string.format(
 				"guard %s | closure %s | remote %s | namecall %s",
-				tostring(source), acClosure and "attached" or "detached",
-				acRemote and "found" or "missing",
-				acNamecallHook and "hooked" or "none"
+				tostring(source), ac.closure and "attached" or "detached",
+				ac.remote and "found" or "missing",
+				ac.namecallHook and "hooked" or "none"
 			))
 		end,
 	})
@@ -11408,7 +11440,7 @@ local function buildUI()
 	acTab:CreateButton({
 		Name = "clear log",
 		Callback = function()
-			acEvents = {}
+			ac.events = {}
 		end,
 	})
 	acTab:CreateText({
@@ -11472,7 +11504,7 @@ local function buildUI()
 		Value = CFG.infSprint,
 		Callback = function(v)
 			CFG.infSprint = v
-			applySprint(sprintEnabled())
+			ac.applySprint(ac.sprintEnabled())
 			saveCfg()
 		end,
 	})
@@ -11484,7 +11516,7 @@ local function buildUI()
 		Value = CFG.autoSprint,
 		Callback = function(v)
 			CFG.autoSprint = v
-			applySprint(sprintEnabled())
+			ac.applySprint(ac.sprintEnabled())
 			saveCfg()
 		end,
 	})
@@ -11515,7 +11547,7 @@ local function buildUI()
 		Value = CFG.walkSpeed,
 		Callback = function(v)
 			CFG.walkSpeed = v
-			applyWalkSpeed(v)
+			ac.applyWalkSpeed(v)
 			saveCfg()
 		end,
 	})
@@ -11552,7 +11584,7 @@ local function buildUI()
 		Value = CFG.customJump,
 		Callback = function(v)
 			CFG.customJump = v
-			applyJump(v)
+			ac.applyJump(v)
 			saveCfg()
 		end,
 	})
@@ -11567,7 +11599,7 @@ local function buildUI()
 		Callback = function(v)
 			CFG.jumpHeight = v
 			if CFG.customJump then
-				applyJump(true)
+				ac.applyJump(true)
 			end
 			saveCfg()
 		end,
@@ -11582,7 +11614,7 @@ local function buildUI()
 		Value = CFG.lowGravity,
 		Callback = function(v)
 			CFG.lowGravity = v
-			applyGravity(v)
+			ac.applyGravity(v)
 			saveCfg()
 		end,
 	})
@@ -11597,7 +11629,7 @@ local function buildUI()
 		Callback = function(v)
 			CFG.gravity = v
 			if CFG.lowGravity then
-				applyGravity(true)
+				ac.applyGravity(true)
 			end
 			saveCfg()
 		end,
@@ -11832,7 +11864,7 @@ local function probe()
 		"farm=" .. farmText(),
 		"skipped=" .. tostring(stats.missed),
 		"last=" .. (stats.lastName and (stats.lastName .. " |v| " .. string.format("%.1f", stats.lastVel and stats.lastVel.Magnitude or 0)) or "nil"),
-		acProbe(),
+		ac.probe(),
 	}
 	return table.concat(rows, "\n")
 end
@@ -11858,8 +11890,8 @@ for k, v in pairs(bootCfg) do
 end
 syncUi()
 setEnabled(CFG.enabled)
-installBypass()
-applyBypassAll()
+ac.installBypass()
+ac.applyBypassAll()
 
 local function panic()
 	CFG.enabled = false
@@ -11885,7 +11917,7 @@ local function panic()
 	CFG.infSprint = false
 	CFG.autoSprint = false
 	restoreAll()
-	stopBypass()
+	ac.stopBypass()
 	clearVisuals()
 	syncUi()
 	saveCfg()
@@ -11897,12 +11929,12 @@ local function shutdown()
 		return
 	end
 	dead = true
-	stopBypass()
-	if acJumpConn then
+	ac.stopBypass()
+	if ac.jumpConn then
 		pcall(function()
-			acJumpConn:Disconnect()
+			ac.jumpConn:Disconnect()
 		end)
-		acJumpConn = nil
+		ac.jumpConn = nil
 	end
 	pcall(function()
 		RunService:UnbindFromRenderStep("SlimQbAcWalkSpeed")
@@ -11975,22 +12007,22 @@ _G.SlimQbAim = {
 	farm = farmText,
 	sprint = function(on)
 		CFG.infSprint = on ~= false
-		applySprint(sprintEnabled())
+		ac.applySprint(ac.sprintEnabled())
 		syncUi()
 		saveCfg()
 	end,
 	autoSprint = function(on)
 		CFG.autoSprint = on ~= false
-		applySprint(sprintEnabled())
+		ac.applySprint(ac.sprintEnabled())
 		syncUi()
 		saveCfg()
 	end,
 	ac = {
-		state = acStateText,
-		probe = acProbe,
-		start = installBypass,
-		stop = stopBypass,
-		arm = applyBypassAll,
+		state = ac.stateText,
+		probe = ac.probe,
+		start = ac.installBypass,
+		stop = ac.stopBypass,
+		arm = ac.applyBypassAll,
 	},
 }
 
