@@ -22960,7 +22960,9 @@ Hub.SUITE.criminal = function()
 
 	what it does
 	  loot    : esp with display name, value, weight and distance, value/range filters,
-	            nearest and highest-value teleports, best-effort grab + truck loading.
+	            nearest and highest-value teleports, best-effort grab + truck loading,
+	            and a one-shot haul that grabs every matching item in range and releases
+	            it at the nearest truck cargo zone.
 	  world   : npc esp (residents / guards / police) with optional detail tags, a live
 	            npc details window (health, distance, state, gender, outfit, home, spot)
 	            and a full npc attribute dump, prompt sniper for the game's own
@@ -23013,6 +23015,7 @@ for k, v in pairs({
 	autoGrab = false,
 	autoLoad = false,
 	grabRadius = 500,
+	haulRadius = 250,
 	npcEsp = false,
 	npcResidents = true,
 	npcGuards = true,
@@ -23119,6 +23122,8 @@ local promptCooldown = setmetatable({}, { __mode = "k" })
 local failedGrabAt = setmetatable({}, { __mode = "k" })
 local grabbing = false
 local lastGrabNotice = 0
+local hauling = false
+local haulStop = false
 
 local function now()
 	return os.clock()
@@ -23549,6 +23554,169 @@ local function dropHeld()
 	if Remotes then Remotes.LootRelease:FireServer() end
 	task.wait(0.4)
 	return held:GetAttribute("HeldBy") == nil, "release did not clear HeldBy"
+end
+
+--// haul to truck --------------------------------------------------------------
+
+local function haulTargets(radius)
+	local rows = {}
+	local loot = workspace:FindFirstChild("Loot")
+	local root = charRoot()
+	if not loot or not root then return rows end
+	local myPos = root.Position
+	local minValue = math.max(1, tonumber(CFG.lootMinValue) or 0)
+	radius = math.clamp(tonumber(radius) or tonumber(CFG.haulRadius) or 250, 25, 2000)
+	for _, m in ipairs(loot:GetChildren()) do
+		if m:IsA("Model") and m:GetAttribute("HeldBy") == nil then
+			local value = tonumber(m:GetAttribute("Value"))
+			local part = m.PrimaryPart or m:FindFirstChildWhichIsA("BasePart")
+			if value and value >= minValue and part and part.Parent and liftable(m) then
+				local d = (part.Position - myPos).Magnitude
+				if d <= radius then
+					rows[#rows + 1] = {
+						model = m,
+						name = tostring(m:GetAttribute("DisplayName") or m.Name),
+						value = value,
+						dist = d,
+					}
+				end
+			end
+		end
+	end
+	table.sort(rows, function(a, b) return a.dist < b.dist end)
+	return rows
+end
+
+local function refreshHaulInfo()
+	if not ui.haulInfo then return end
+	local radius = math.clamp(tonumber(CFG.haulRadius) or 250, 25, 2000)
+	local count = #haulTargets(radius)
+	pcall(function()
+		ui.haulInfo:Set(string.format("idle  |  %d items within %dm", count, math.floor(radius)))
+	end)
+end
+
+local function haulAll(limit)
+	if dead then return end
+	if hauling then notify("a haul is already running - use stop haul") return end
+	if grabbing then notify("a grab is already running - try again in a moment") return end
+	local radius = math.clamp(tonumber(CFG.haulRadius) or 250, 25, 2000)
+	local targets = haulTargets(radius)
+	if limit and limit > 0 then
+		while #targets > limit do table.remove(targets) end
+	end
+	if #targets == 0 then
+		notify(string.format("no unheld liftable loot within %dm", math.floor(radius)))
+		refreshHaulInfo()
+		return
+	end
+
+	hauling = true
+	haulStop = false
+	local total = #targets
+	local released, failed, skipped = 0, 0, 0
+	local lastErr = nil
+
+	local function status(prefix)
+		if not ui.haulInfo then return end
+		local done = math.min(released + failed + skipped, total)
+		pcall(function()
+			ui.haulInfo:Set(string.format(
+				"%s  |  %d/%d  |  released %d  |  failed %d  |  skipped %d",
+				prefix, done, total, released, failed, skipped
+			))
+		end)
+	end
+
+	notify(string.format("haul: %d items within %dm - starting", total, math.floor(radius)))
+	status("hauling")
+
+	-- clear anything already in hand before the run
+	local held = findHeldLoot()
+	if held then
+		local ok, err = deliverHeld()
+		if not ok then
+			dropHeld()
+			if findHeldLoot() then
+				hauling = false
+				notify("haul aborted: still holding " .. tostring(held:GetAttribute("DisplayName") or held.Name) .. " (" .. tostring(err) .. ")")
+				status("idle")
+				return
+			end
+		end
+	end
+
+	for i, item in ipairs(targets) do
+		if haulStop or dead then break end
+		local hum = charHumanoid()
+		if not hum or hum.Health <= 0 then
+			haulStop = true
+			lastErr = "character died"
+			break
+		end
+		if item.model.Parent and item.model:GetAttribute("HeldBy") == nil then
+			local callOk, grabbed, grabErr = pcall(faceAndGrab, item.model)
+			if not callOk then
+				grabbed, grabErr = false, tostring(grabbed)
+			end
+			if grabbed then
+				local dOk, delivered, deliverErr = pcall(deliverHeld)
+				if not dOk then
+					delivered, deliverErr = false, tostring(delivered)
+				end
+				if not delivered then
+					task.wait(0.3)
+					local rOk, retried, retryErr = pcall(deliverHeld)
+					if not rOk then
+						retried, retryErr = false, tostring(retried)
+					end
+					if not retried then deliverErr = retryErr or deliverErr end
+					delivered = retried and true or false
+				end
+				if delivered then
+					released = released + 1
+				else
+					failed = failed + 1
+					lastErr = string.format("%s: %s", item.name, tostring(deliverErr))
+					if findHeldLoot() then
+						dropHeld()
+						if findHeldLoot() then
+							haulStop = true
+							lastErr = "still holding " .. item.name .. " - haul stopped"
+						else
+							released = released + 1
+							failed = failed - 1
+						end
+					end
+				end
+			else
+				failed = failed + 1
+				lastErr = string.format("%s: %s", item.name, tostring(grabErr))
+			end
+		else
+			skipped = skipped + 1
+		end
+		status(haulStop and "stopping" or "hauling")
+		if i % 10 == 0 then
+			notify(string.format("haul %d/%d - %d released, %d failed", i, total, released, failed))
+		end
+		task.wait(0.12)
+	end
+
+	hauling = false
+	local prefix = haulStop and "stopped" or "done"
+	local msg = string.format("haul %s: %d released, %d failed, %d skipped", prefix, released, failed, skipped)
+	if lastErr then msg = msg .. " - " .. lastErr end
+	if not dead then notify(msg) end
+	if ui.haulInfo then
+		pcall(function()
+			ui.haulInfo:Set(string.format(
+				"%s  |  released %d  |  failed %d  |  skipped %d",
+				prefix, released, failed, skipped
+			))
+		end)
+	end
+	return released, failed, skipped
 end
 
 --// humanoid esp ---------------------------------------------------------------
@@ -24675,6 +24843,7 @@ end
 
 local function autoGrabStep()
 	if grabbing or dead or not CFG.autoGrab then return end
+	if hauling then return end
 
 	local held = findHeldLoot()
 	if held then
@@ -24738,6 +24907,7 @@ local panic
 local function shutdown()
 	if dead then return end
 	dead = true
+	haulStop = true
 	stopSpeed()
 	stopJump()
 	restoreMovement()
@@ -24761,6 +24931,7 @@ end
 
 panic = function()
 	if dead then return end
+	haulStop = true
 	CFG.lootEsp = false
 	CFG.autoGrab = false
 	CFG.autoLoad = false
@@ -24899,6 +25070,7 @@ local function buildUI()
 		Name = "grab nearest loot",
 		Description = "steps to the item, faces it, then fires the game's own LootGrab remote.",
 		Callback = function()
+			if hauling then notify("stop the haul first") return end
 			local target = bestLoot("nearest", tonumber(CFG.grabRadius) or 0)
 			if not target then
 				notify("no matching loot in range")
@@ -24916,6 +25088,7 @@ local function buildUI()
 		Name = "grab highest value",
 		Description = "same as grab nearest, but picks the most valuable matching item.",
 		Callback = function()
+			if hauling then notify("stop the haul first") return end
 			local target = bestLoot("value", tonumber(CFG.grabRadius) or 0)
 			if not target then
 				notify("no matching loot in range")
@@ -24955,6 +25128,7 @@ local function buildUI()
 	lootTab:CreateButton({
 		Name = "drop held item",
 		Callback = function()
+			if hauling then notify("stop the haul first") return end
 			local ok, err = dropHeld()
 			notify(ok and "dropped held item" or ("drop failed: " .. tostring(err)))
 		end,
@@ -24963,10 +25137,54 @@ local function buildUI()
 		Name = "load held item into truck",
 		Description = "steps to the cargo zone and releases. the game decides whether it counts toward the quota.",
 		Callback = function()
+			if hauling then notify("stop the haul first") return end
 			local ok, err = deliverHeld()
 			notify(ok and "released at the truck cargo zone" or ("load failed: " .. tostring(err)))
 		end,
 	})
+
+	lootTab:CreateSection({ Name = "HAUL TO TRUCK" })
+	lootTab:CreateText({
+		Name = "haul note",
+		Text = "one-shot run: steps to each unheld liftable item within the haul radius, grabs it with the game's LootGrab, then releases at the nearest truck cargo zone. it uses the min value filter. room-locked loot and police can still stop it; the game decides whether each release counts toward quota.",
+	})
+	lootTab:CreateSlider({
+		Name = "haul radius",
+		Description = "how far from you the haul will look. 250 m covers most of one town block.",
+		Range = { 25, 2000 },
+		Increment = 25,
+		Value = CFG.haulRadius,
+		Suffix = " m",
+		Flag = "crim_haulradius",
+		Callback = function(v)
+			CFG.haulRadius = v
+			refreshHaulInfo()
+		end,
+	})
+	lootTab:CreateButton({
+		Name = "haul all items to truck",
+		Description = "teleports to each matching item, grabs it, teleports to the nearest truck and releases. stop haul aborts after the current item.",
+		Callback = function()
+			task.spawn(function()
+				local ok, err = pcall(haulAll)
+				if not ok then notify("haul error: " .. tostring(err)) end
+			end)
+		end,
+	})
+	lootTab:CreateButton({
+		Name = "stop haul",
+		Callback = function()
+			if not hauling then
+				notify("no haul running")
+				return
+			end
+			haulStop = true
+			notify("stopping haul after the current item")
+		end,
+	})
+	ui.haulInfo = lootTab:CreateText({ Name = "haul status", Text = "idle" })
+	refreshHaulInfo()
+
 	lootTab:CreateText({
 		Name = "note",
 		Text = "grab works by stepping next to the loot and facing it. hidden containers and locked rooms are server-side; failures are reported.",
@@ -25440,6 +25658,7 @@ end
 
 local lastSync = 0
 local lastSave = 0
+local lastHaulSync = 0
 
 local function tick()
 	if dead then return end
@@ -25521,6 +25740,10 @@ local function tick()
 		lastSave = t
 		pcall(saveCfg)
 	end
+	if not hauling and t - lastHaulSync > 5 then
+		lastHaulSync = t
+		pcall(refreshHaulInfo)
+	end
 end
 
 buildUI()
@@ -25558,6 +25781,7 @@ ui.charConn = LP.CharacterAdded:Connect(function()
 	if CFG.customSpeed then startSpeed() end
 	if CFG.customJump then startJump() end
 	if CFG.infiniteStamina then staminaTick() end
+	if not hauling then pcall(refreshHaulInfo) end
 end)
 
 ui.removeConn = Players.PlayerRemoving:Connect(function(plr)
@@ -25601,6 +25825,8 @@ _G.CriminalPanel = {
 	grab = faceAndGrab,
 	deliver = deliverHeld,
 	drop = dropHeld,
+	haul = haulAll,
+	haulCount = function() return #haulTargets(tonumber(CFG.haulRadius) or 250) end,
 	stop = shutdown,
 	panic = panic,
 	teleport = stepTeleport,
@@ -25610,7 +25836,7 @@ _G.CriminalPanel = {
 	npcDump = npcDetailDump,
 }
 
-print("[CRIMINAL] panel loaded - loot esp, npc details, prompt sniper, stamina, speed guard, movement")
+print("[CRIMINAL] panel loaded - loot esp, haul to truck, npc details, prompt sniper, stamina, speed guard, movement")
 end
 
 --// dispatch -------------------------------------------------------------------
