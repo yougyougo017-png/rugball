@@ -24,6 +24,8 @@
 		101880234193261  Car Soccer              carsoccer
 		131576717722076  FD6 - Skyview           skyview
 		108228062074817  Superhero Duels         superhero
+		83048653078891   Criminal Simulator      criminal
+		73251213967624   Criminal Simulator      criminal (live sub-place)
 
 	the taf bypass suite is standalone now. Throw A Football's Drive Duels and 7s
 	modes both run qb_aimbot, which carries the same MoveGuard/AnimGuard layers,
@@ -61,6 +63,8 @@ Hub.ORDER = {
 	{ place = 101880234193261, label = "CAR SOCCER",       suites = { "carsoccer" } },
 	{ place = 131576717722076, label = "FD6 - THE SKYVIEW EXPERIENCE", suites = { "skyview" } },
 	{ place = 108228062074817, label = "SUPERHERO DUELS", suites = { "superhero" } },
+	{ place = 83048653078891,  label = "CRIMINAL SIMULATOR", suites = { "criminal" } },
+	{ place = 73251213967624,  label = "CRIMINAL SIMULATOR", suites = { "criminal" } },
 }
 
 Hub.GAMES = {}
@@ -75,9 +79,10 @@ end
 Hub.UNIVERSE = {
 	[10768235926] = { "qb_aimbot" },
 	[10774293033] = { "superhero" },
+	[10769851460] = { "criminal" },
 }
 
-Hub.SUITE_ORDER = { "football", "anime", "nba", "swish", "duels", "qb_aimbot", "taf_bypass", "physbox", "tps", "track", "rss", "mma", "carsoccer", "skyview", "superhero" }
+Hub.SUITE_ORDER = { "football", "anime", "nba", "swish", "duels", "qb_aimbot", "taf_bypass", "physbox", "tps", "track", "rss", "mma", "carsoccer", "skyview", "superhero", "criminal" }
 
 Hub.SUITE_NAMES = {
 	football   = "football panel    |  aim / tackle / block",
@@ -95,6 +100,7 @@ Hub.SUITE_NAMES = {
 	carsoccer  = "car soccer        |  autopilot / boost / ball path",
 	skyview    = "skyview panel     |  esp / teleport / movement",
 	superhero  = "superhero duels    |  auto put best stat / auto roll / probe",
+	criminal   = "criminal simulator |  loot esp / prompt sniper / grab / movement",
 }
 
 Hub.SUITE = {}
@@ -22943,6 +22949,2074 @@ end)
 
 print("[SUPERHERO] loaded  place=" .. tostring(game.PlaceId) .. "  stat=" .. CFG.bestStat)
 print("[SUPERHERO] panel is docked right - drag it by the title bar if it covers the game menu")
+end
+
+--// embedded suite: criminal  (from criminal.luau) =========================
+Hub.SUITE.criminal = function()
+--[[
+	CRIMINAL SIMULATOR -- heist panel
+	place 83048653078891 (root) / universe 10769851460 / live sub-place 73251213967624
+	Rayfield Gen2 | replace-not-stack via _G.CriminalPanel
+
+	what it does
+	  loot    : esp with display name, value, weight and distance, value/range filters,
+	            nearest and highest-value teleports, best-effort grab + truck loading.
+	  world   : npc esp (residents / guards / police), prompt sniper for the game's own
+	            "Rob ..." and "Open" proximity prompts, travel buttons for truck, sell box,
+	            chop shop, hideout, shop computer and job board.
+	  players : esp, player list, teleport.
+	  movement: walk speed, jump power, infinite jump, noclip.
+	  visuals : fullbright, no fog, fov.
+	  status  : cash, level, objective, quota, day/night, debt, difficulty, carried loot.
+	  misc    : rejoin, panic (P), unload.
+
+	what is verified live
+	  - loot attributes (Value / Weight / DisplayName / HeldBy) and the game's LootGrab
+	    remote work when the character is next to the loot and facing it.
+	  - enabled proximity prompts can be fired from any distance (a mailbox at 94 m
+	    spawned a loot cluster). disabled prompts stay inert.
+	  - walk speed sticks when the game's own write is immediately overwritten with a
+	    property-changed hook.
+	  - long direct cframe jumps can be pulled back by the server; stepTeleport moves in
+	    small steps to make the trip survivable. still best-effort.
+
+	what is not promised
+	  - no cash/quota grant. the server owns the economy; this panel only uses the
+	    game's own interaction paths.
+	  - grabbing hidden/room loot, selling, and truck delivery depend on the game's
+	    current container state. failures are reported, not hidden.
+
+	_G exports
+	  _G.CriminalPanel.cfg      live config table
+	  _G.CriminalPanel.stop     unload
+	  _G.CriminalPanel.panic    turn every feature off
+	  _G.CriminalPanel.teleport step teleport helper
+--]]
+
+local prev = _G.CriminalPanel
+local CFG = (prev and prev.cfg) or {}
+for k, v in pairs({
+	lootEsp = false,
+	lootMinValue = 0,
+	lootRadius = 0,
+	lootMaxLabels = 90,
+	lootHideHeld = true,
+	lootOnlyLiftable = true,
+	autoGrab = false,
+	autoLoad = false,
+	grabRadius = 500,
+	npcEsp = false,
+	npcResidents = true,
+	npcGuards = true,
+	npcPolice = true,
+	npcName = true,
+	npcDistance = true,
+	npcHealth = true,
+	npcBox = true,
+	autoRob = false,
+	playerEsp = false,
+	playerEspName = true,
+	playerEspDistance = true,
+	playerEspHealth = true,
+	playerEspBox = true,
+	playerEspTracer = true,
+	customSpeed = false,
+	walkSpeed = 60,
+	customJump = false,
+	jumpPower = 120,
+	infiniteJump = false,
+	noclip = false,
+	fullbright = false,
+	noFog = false,
+	fovOn = false,
+	fov = 70,
+}) do
+	if CFG[k] == nil then CFG[k] = v end
+end
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Lighting = game:GetService("Lighting")
+local CollectionService = game:GetService("CollectionService")
+local TeleportService = game:GetService("TeleportService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local LP = Players.LocalPlayer
+local Remotes = ReplicatedStorage:WaitForChild("Remotes", 20)
+
+-- replace-not-stack: a re-run takes the previous copy down first
+if prev and prev.stop then
+	pcall(prev.stop)
+end
+
+--// cfg file --------------------------------------------------------------------
+
+local CFG_FILE = "slimhub-criminal.cfg"
+
+local function loadCfg()
+	if not (isfile and readfile and isfile(CFG_FILE)) then return end
+	local ok, data = pcall(readfile, CFG_FILE)
+	if not ok or type(data) ~= "string" then return end
+	for line in string.gmatch(data, "[^\r\n]+") do
+		local k, v = string.match(line, "^([%w_]+)=(.*)$")
+		if k and CFG[k] ~= nil then
+			if v == "true" then
+				CFG[k] = true
+			elseif v == "false" then
+				CFG[k] = false
+			elseif tonumber(v) then
+				CFG[k] = tonumber(v)
+			end
+		end
+	end
+end
+
+local savedCfg = ""
+local function saveCfg()
+	if not writefile then return end
+	local parts = {}
+	for k, v in pairs(CFG) do
+		local t = type(v)
+		if t == "boolean" or t == "number" then
+			table.insert(parts, k .. "=" .. tostring(v))
+		end
+	end
+	table.sort(parts)
+	local blob = table.concat(parts, "\n")
+	if blob == savedCfg then return end
+	savedCfg = blob
+	pcall(writefile, CFG_FILE, blob)
+end
+
+if not prev then
+	pcall(loadCfg)
+end
+
+--// state -----------------------------------------------------------------------
+
+local dead = false
+local ui = {}
+local log = {}
+local selectedPlayer = nil
+local selectedNpc = nil
+local npcOptions = {}
+local originalFov = workspace.CurrentCamera and workspace.CurrentCamera.FieldOfView or 70
+local promptCooldown = setmetatable({}, { __mode = "k" })
+local failedGrabAt = setmetatable({}, { __mode = "k" })
+local grabbing = false
+local lastGrabNotice = 0
+
+local function now()
+	return os.clock()
+end
+
+local function comma(n)
+	local s = tostring(math.floor(tonumber(n) or 0))
+	local out = s:reverse():gsub("(%d%d%d)", "%1,"):reverse()
+	if out:sub(1, 1) == "," then out = out:sub(2) end
+	return out
+end
+
+local function money(n)
+	return "$" .. comma(n)
+end
+
+local function pushLog(text)
+	table.insert(log, 1, os.date("%H:%M:%S") .. "  " .. tostring(text))
+	while #log > 8 do
+		table.remove(log)
+	end
+end
+
+local function notify(text)
+	print("[CRIMINAL] " .. tostring(text))
+	if ui.window and ui.window.Notify then
+		pcall(function()
+			ui.window:Notify({ title = "CRIMINAL", content = tostring(text), duration = 3 })
+		end)
+	end
+	pushLog(text)
+end
+
+local function charRoot()
+	local char = LP.Character
+	return char and char:FindFirstChild("HumanoidRootPart")
+end
+
+local function charHumanoid()
+	local char = LP.Character
+	return char and char:FindFirstChildOfClass("Humanoid")
+end
+
+local function partOf(inst)
+	if not inst then return nil end
+	if inst:IsA("BasePart") then return inst end
+	if inst:IsA("Model") then
+		return inst.PrimaryPart or inst:FindFirstChildWhichIsA("BasePart", true)
+	end
+	return inst:FindFirstChildWhichIsA("BasePart", true)
+end
+
+--// drawing pool ----------------------------------------------------------------
+
+local drawings = {}
+local drawingBroken = false
+
+local function newDrawing(cls)
+	if drawingBroken then return nil end
+	local ok, d = pcall(function()
+		return Drawing.new(cls)
+	end)
+	if ok and d then
+		table.insert(drawings, d)
+		return d
+	end
+	drawingBroken = true
+	warn("[CRIMINAL] Drawing API unavailable")
+	return nil
+end
+
+local function removeDrawing(d)
+	if not d then return end
+	pcall(function()
+		d.Visible = false
+		d:Remove()
+	end)
+end
+
+local function clearDrawings()
+	for _, d in ipairs(drawings) do
+		pcall(function()
+			d.Visible = false
+			d:Remove()
+		end)
+	end
+	drawings = {}
+end
+
+local function newSquare(filled, color, transparency, thickness)
+	local d = newDrawing("Square")
+	if not d then return nil end
+	d.Filled = filled and true or false
+	d.Color = color or Color3.fromRGB(255, 255, 255)
+	d.Transparency = transparency or 0.4
+	d.Thickness = thickness or 1
+	return d
+end
+
+local function newText(size, center, outline)
+	local d = newDrawing("Text")
+	if not d then return nil end
+	d.Size = size or 13
+	d.Center = center and true or false
+	d.Outline = outline ~= false
+	d.OutlineColor = Color3.fromRGB(0, 0, 0)
+	d.Font = 2
+	d.Color = Color3.fromRGB(255, 255, 255)
+	return d
+end
+
+local function newLine(color, transparency, thickness)
+	local d = newDrawing("Line")
+	if not d then return nil end
+	d.Color = color or Color3.fromRGB(120, 215, 255)
+	d.Transparency = transparency or 0.5
+	d.Thickness = thickness or 1
+	return d
+end
+
+--// loot -----------------------------------------------------------------------
+
+local lootPool = {}
+local lootList = {}
+local lootScanAt = 0
+local lootFrame = 0
+
+local function lootColor(value)
+	if value >= 600 then return Color3.fromRGB(255, 205, 90) end
+	if value >= 300 then return Color3.fromRGB(120, 215, 255) end
+	if value >= 100 then return Color3.fromRGB(120, 240, 140) end
+	return Color3.fromRGB(210, 210, 220)
+end
+
+local function newLootEsp(model)
+	local e = { model = model }
+	e.dot = newSquare(true, Color3.fromRGB(210, 210, 220), 0.05, 1)
+	e.label = newText(12, false, true)
+	if e.label then
+		e.label.Font = 2
+	end
+	return e
+end
+
+local function hideLootEsp(e)
+	if not e then return end
+	if e.dot then e.dot.Visible = false end
+	if e.label then e.label.Visible = false end
+end
+
+local function dropLootEsp(model)
+	local e = lootPool[model]
+	if not e then return end
+	removeDrawing(e.dot)
+	removeDrawing(e.label)
+	lootPool[model] = nil
+end
+
+local function heldByMe(item)
+	local h = item:GetAttribute("HeldBy")
+	return h ~= nil and tostring(h) == tostring(LP.UserId)
+end
+
+local function liftable(item)
+	local w = tonumber(item:GetAttribute("Weight")) or 1
+	if item:GetAttribute("AnyoneLifts") == true then return true end
+	if w < 2 then return true end
+	local lifter = tonumber(LP:GetAttribute("Shop_Lifter")) or 0
+	return lifter >= (w - 1)
+end
+
+local function refreshLoot(force)
+	local t = now()
+	if not force and t - lootScanAt < 0.15 then return lootList end
+	lootScanAt = t
+
+	lootList = {}
+	local loot = workspace:FindFirstChild("Loot")
+	local root = charRoot()
+	if not loot or not root then return lootList end
+
+	local myPos = root.Position
+	local minValue = tonumber(CFG.lootMinValue) or 0
+	local radius = tonumber(CFG.lootRadius) or 0
+
+	for _, m in ipairs(loot:GetChildren()) do
+		if m:IsA("Model") then
+			local value = tonumber(m:GetAttribute("Value"))
+			if value and value >= minValue then
+				local part = m.PrimaryPart or m:FindFirstChildWhichIsA("BasePart")
+				if part and part.Parent then
+					local held = m:GetAttribute("HeldBy")
+					local heldMe = held ~= nil and tostring(held) == tostring(LP.UserId)
+					local keep = true
+					if CFG.lootHideHeld and held ~= nil and not heldMe then keep = false end
+					if keep and CFG.lootOnlyLiftable and not liftable(m) then keep = false end
+					if keep then
+						local d = (part.Position - myPos).Magnitude
+						if radius <= 0 or d <= radius then
+							lootList[#lootList + 1] = {
+								model = m,
+								part = part,
+								name = tostring(m:GetAttribute("DisplayName") or m.Name),
+								value = value,
+								weight = tonumber(m:GetAttribute("Weight")) or 1,
+								held = held,
+								heldMe = heldMe,
+								dist = d,
+							}
+						end
+					end
+				end
+			end
+		end
+	end
+
+	table.sort(lootList, function(a, b)
+		return a.dist < b.dist
+	end)
+	return lootList
+end
+
+local function renderLoot()
+	lootFrame = lootFrame + 1
+	local frame = lootFrame
+	local cam = workspace.CurrentCamera
+	local root = charRoot()
+	if not cam or not root then
+		for _, e in pairs(lootPool) do hideLootEsp(e) end
+		return
+	end
+
+	local list = refreshLoot(false)
+	local maxLabels = math.clamp(tonumber(CFG.lootMaxLabels) or 90, 1, 300)
+	local vp = cam.ViewportSize
+
+	for i = 1, math.min(#list, maxLabels) do
+		local item = list[i]
+		if item.part.Parent then
+			local sp, on = cam:WorldToViewportPoint(item.part.Position + Vector3.new(0, 0.8, 0))
+			if on and sp.Z > 0 and sp.X > -20 and sp.X < vp.X - 10 and sp.Y > -20 and sp.Y < vp.Y + 20 then
+				local e = lootPool[item.model]
+				if not e then
+					e = newLootEsp(item.model)
+					lootPool[item.model] = e
+				end
+				if e.dot and e.label then
+					local color = lootColor(item.value)
+					if item.heldMe then color = Color3.fromRGB(120, 240, 140) end
+					if item.held and not item.heldMe then color = Color3.fromRGB(150, 150, 150) end
+
+					e.dot.Visible = true
+					e.dot.Size = Vector2.new(7, 7)
+					e.dot.Position = Vector2.new(sp.X - 3, sp.Y - 3)
+					e.dot.Color = color
+					e.dot.Transparency = item.held and not item.heldMe and 0.55 or 0.05
+
+					local prefix = ""
+					if item.heldMe then prefix = "[held] " elseif item.held then prefix = "[taken] " end
+					e.label.Visible = true
+					e.label.Text = string.format("%s%s  %s  %dw  %dm", prefix, item.name, money(item.value), item.weight, math.floor(item.dist))
+					e.label.Position = Vector2.new(sp.X + 9, sp.Y - 7)
+					e.label.Color = color
+					e.label.Transparency = item.held and not item.heldMe and 0.5 or 0
+				end
+				e.usedFrame = frame
+			end
+		end
+	end
+
+	for model, e in pairs(lootPool) do
+		if not model.Parent then
+			dropLootEsp(model)
+		elseif e.usedFrame ~= frame then
+			hideLootEsp(e)
+		end
+	end
+	lootFrame = frame
+end
+
+local function bestLoot(mode, maxDist)
+	local list = refreshLoot(true)
+	local best, bestScore = nil, nil
+	for _, item in ipairs(list) do
+		if not item.held and item.model.Parent then
+			if maxDist <= 0 or item.dist <= maxDist then
+				local score = (mode == "value") and item.value or -item.dist
+				if best == nil or score > bestScore then
+					best = item
+					bestScore = score
+				end
+			end
+		end
+	end
+	return best
+end
+
+local function findHeldLoot()
+	local loot = workspace:FindFirstChild("Loot")
+	if not loot then return nil end
+	for _, m in ipairs(loot:GetChildren()) do
+		if m:IsA("Model") and heldByMe(m) then return m end
+	end
+	return nil
+end
+
+--// step teleport --------------------------------------------------------------
+
+local function stepTeleport(target)
+	local root = charRoot()
+	if not root then return false, "no character" end
+	local from = root.Position
+	local delta = target - from
+	local dist = delta.Magnitude
+	if dist < 9 then
+		root.CFrame = CFrame.new(target + Vector3.new(0, 2, 0))
+		return true
+	end
+
+	local steps = math.clamp(math.ceil(dist / 24), 1, 90)
+	local step = delta / steps
+	for _ = 1, steps do
+		local r = charRoot()
+		if not r then return false, "character lost" end
+		r.CFrame = CFrame.new(r.Position + step)
+		task.wait(0.03)
+	end
+	local r = charRoot()
+	if r then r.CFrame = CFrame.new(target + Vector3.new(0, 2, 0)) end
+	return true
+end
+
+local function faceAndGrab(item)
+	if grabbing then return false, "grab already running" end
+	if not item or not item.Parent then return false, "loot gone" end
+	if item:GetAttribute("HeldBy") then return false, "already held" end
+	if not Remotes then return false, "remotes not found" end
+
+	grabbing = true
+	local part = partOf(item)
+	local root = charRoot()
+	if not part or not root then
+		grabbing = false
+		return false, "no loot part / character"
+	end
+
+	local pos = part.Position
+	local away = root.Position - pos
+	away = Vector3.new(away.X, 0, away.Z)
+	if away.Magnitude < 0.1 then away = Vector3.new(0, 0, 1) end
+	away = away.Unit
+	local stand = pos + away * 3
+
+	local ok, err = stepTeleport(stand)
+	if not ok then
+		grabbing = false
+		return false, tostring(err)
+	end
+
+	root = charRoot()
+	if not root then
+		grabbing = false
+		return false, "character lost"
+	end
+	root.CFrame = CFrame.lookAt(root.Position, pos)
+
+	local cam = workspace.CurrentCamera
+	local oldType, oldCF = nil, nil
+	if cam then
+		oldType, oldCF = cam.CameraType, cam.CFrame
+		cam.CameraType = Enum.CameraType.Scriptable
+		cam.CFrame = CFrame.lookAt(cam.CFrame.Position, pos)
+	end
+	task.wait(0.1)
+	Remotes.LootGrab:FireServer(item)
+	task.wait(0.4)
+	local held = item:GetAttribute("HeldBy")
+	if cam then
+		cam.CameraType = oldType
+		cam.CFrame = oldCF
+	end
+	grabbing = false
+	if held ~= nil and tostring(held) == tostring(LP.UserId) then
+		return true
+	end
+	return false, "server rejected the grab (hidden / room / line of sight)"
+end
+
+local function findCargoZone()
+	local root = charRoot()
+	local myPos = root and root.Position or Vector3.zero
+	local best, bestDist = nil, 1e9
+	for _, truck in ipairs(CollectionService:GetTagged("TravelTruck")) do
+		local zone = truck:FindFirstChild("CargoZone", true)
+		local part = partOf(zone)
+		if part then
+			local d = (part.Position - myPos).Magnitude
+			if d < bestDist then
+				best, bestDist = part, d
+			end
+		end
+	end
+	if best then return best end
+	local town = workspace:FindFirstChild("Town")
+	local truck = town and town:FindFirstChild("Truck")
+	local zone = truck and truck:FindFirstChild("CargoZone", true)
+	return partOf(zone)
+end
+
+local function deliverHeld()
+	local held = findHeldLoot()
+	if not held then return false, "not carrying anything" end
+	local cargo = findCargoZone()
+	if not cargo then return false, "no truck cargo zone" end
+	local ok, err = stepTeleport(cargo.Position)
+	if not ok then return false, tostring(err) end
+	task.wait(0.35)
+	if Remotes then Remotes.LootRelease:FireServer() end
+	task.wait(0.55)
+	local h = held:GetAttribute("HeldBy")
+	if h == nil then return true end
+	return false, "release did not clear HeldBy"
+end
+
+local function dropHeld()
+	local held = findHeldLoot()
+	if not held then return false, "not carrying anything" end
+	if Remotes then Remotes.LootRelease:FireServer() end
+	task.wait(0.4)
+	return held:GetAttribute("HeldBy") == nil, "release did not clear HeldBy"
+end
+
+--// humanoid esp ---------------------------------------------------------------
+
+local function drawHumanoidEsp(e, cam, vp, hum, root, head, color, nameText, opts)
+	if not (e.box and e.hpBg and e.hpFill and e.name and e.dist) then return false end
+	opts = opts or {}
+	local headScreen, headOn = cam:WorldToViewportPoint(head.Position + Vector3.new(0, 0.75, 0))
+	local feetScreen, feetOn = cam:WorldToViewportPoint(root.Position - Vector3.new(0, 2.7, 0))
+	local visible = headOn and feetOn and headScreen.Z > 0 and feetScreen.Z > 0
+	if visible then
+		if headScreen.X < -120 or headScreen.X > vp.X + 120 or headScreen.Y < -120 or headScreen.Y > vp.Y + 120 then
+			visible = false
+		end
+	end
+	if not visible then return false end
+
+	local height = math.clamp(math.abs(feetScreen.Y - headScreen.Y), 26, 420)
+	local width = math.clamp(height * 0.42, 18, 220)
+	local left = headScreen.X - width / 2
+	local top = headScreen.Y
+	local bottom = top + height
+
+	e.box.Visible = opts.box ~= false
+	e.box.Size = Vector2.new(width, height)
+	e.box.Position = Vector2.new(left, top)
+	e.box.Color = color
+
+	local frac = math.clamp(hum.Health / math.max(hum.MaxHealth, 1), 0, 1)
+	e.hpBg.Visible = opts.health ~= false
+	e.hpBg.Size = Vector2.new(3, height)
+	e.hpBg.Position = Vector2.new(left - 8, top)
+	e.hpFill.Visible = opts.health ~= false and frac > 0
+	e.hpFill.Size = Vector2.new(3, height * frac)
+	e.hpFill.Position = Vector2.new(left - 8, bottom - height * frac)
+	e.hpFill.Color = frac > 0.6 and Color3.fromRGB(90, 230, 120) or (frac > 0.3 and Color3.fromRGB(250, 210, 80) or Color3.fromRGB(240, 80, 80))
+
+	e.name.Visible = opts.name ~= false
+	e.name.Text = nameText or ""
+	e.name.Position = Vector2.new(headScreen.X, top - 20)
+	e.name.Color = color
+
+	e.dist.Visible = opts.distance ~= false
+	e.dist.Text = opts.distanceText or ""
+	e.dist.Position = Vector2.new(headScreen.X, top - 7)
+
+	if e.tracer then
+		e.tracer.Visible = opts.tracer == true
+		e.tracer.From = Vector2.new(vp.X / 2, vp.Y)
+		e.tracer.To = Vector2.new(headScreen.X, top + height * 0.5)
+		e.tracer.Color = color
+	end
+	return true
+end
+
+local function newHumanoidEsp(includeTracer)
+	local e = {}
+	e.box = newSquare(false, Color3.fromRGB(255, 255, 255), 0.45, 1)
+	e.hpBg = newSquare(true, Color3.fromRGB(15, 15, 18), 0.35, 1)
+	e.hpFill = newSquare(true, Color3.fromRGB(90, 230, 120), 0, 1)
+	e.name = newText(13, true, true)
+	e.dist = newText(11, true, true)
+	if includeTracer then e.tracer = newLine(Color3.fromRGB(255, 196, 92), 0.55, 1) end
+	return e
+end
+
+local function hideHumanoidEsp(e)
+	if not e then return end
+	for _, key in ipairs({ "box", "hpBg", "hpFill", "name", "dist", "tracer" }) do
+		local d = e[key]
+		if d then d.Visible = false end
+	end
+end
+
+local function dropHumanoidEsp(pool, key)
+	local e = pool[key]
+	if not e then return end
+	for _, name in ipairs({ "box", "hpBg", "hpFill", "name", "dist", "tracer" }) do
+		removeDrawing(e[name])
+	end
+	pool[key] = nil
+end
+
+--// player esp -----------------------------------------------------------------
+
+local playerPool = {}
+local playerFrame = 0
+
+local function playerEspFor(plr)
+	local e = playerPool[plr]
+	if e then return e end
+	e = newHumanoidEsp(true)
+	playerPool[plr] = e
+	return e
+end
+
+local function playerEspTick()
+	playerFrame = playerFrame + 1
+	local frame = playerFrame
+	local cam = workspace.CurrentCamera
+	local myRoot = charRoot()
+	if not cam or not myRoot then return end
+	local vp = cam.ViewportSize
+	local myPos = myRoot.Position
+
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr == LP then continue end
+		local e = playerEspFor(plr)
+		local char = plr.Character
+		local hum = char and char:FindFirstChildOfClass("Humanoid")
+		local root = char and char:FindFirstChild("HumanoidRootPart")
+		local head = char and char:FindFirstChild("Head")
+		if CFG.playerEsp and hum and root and head and hum.Health > 0 then
+			local ok = drawHumanoidEsp(e, cam, vp, hum, root, head, Color3.fromRGB(120, 215, 255), plr.Name, {
+				box = CFG.playerEspBox,
+				health = CFG.playerEspHealth,
+				name = CFG.playerEspName,
+				distance = CFG.playerEspDistance,
+				distanceText = string.format("%d studs", math.floor((root.Position - myPos).Magnitude)),
+				tracer = CFG.playerEspTracer,
+			})
+			if ok then e.lastFrame = frame end
+		end
+		if not e.lastFrame or e.lastFrame ~= frame then hideHumanoidEsp(e) end
+	end
+end
+
+--// npc esp --------------------------------------------------------------------
+
+local npcPool = {}
+local npcFrame = 0
+
+local function npcColor(group)
+	if group == "Guards" then return Color3.fromRGB(255, 170, 70) end
+	if group == "Police" then return Color3.fromRGB(90, 160, 255) end
+	return Color3.fromRGB(215, 215, 225)
+end
+
+local function npcEnabled(group)
+	if group == "Npcs" then return CFG.npcResidents end
+	if group == "Guards" then return CFG.npcGuards end
+	if group == "Police" then return CFG.npcPolice end
+	return false
+end
+
+local function npcEspFor(model)
+	local e = npcPool[model]
+	if e then return e end
+	e = newHumanoidEsp(false)
+	npcPool[model] = e
+	return e
+end
+
+local function npcEspTick()
+	npcFrame = npcFrame + 1
+	local frame = npcFrame
+	local cam = workspace.CurrentCamera
+	local myRoot = charRoot()
+	if not cam or not myRoot then return end
+	if not CFG.npcEsp then
+		for _, e in pairs(npcPool) do hideHumanoidEsp(e) end
+		return
+	end
+
+	local vp = cam.ViewportSize
+	local myPos = myRoot.Position
+
+	for _, group in ipairs({ "Npcs", "Guards", "Police" }) do
+		local folder = workspace:FindFirstChild(group)
+		if folder and npcEnabled(group) then
+			for _, model in ipairs(folder:GetChildren()) do
+				if model:IsA("Model") then
+					local hum = model:FindFirstChildOfClass("Humanoid")
+					local root = model:FindFirstChild("HumanoidRootPart") or (hum and hum.RootPart)
+					local head = model:FindFirstChild("Head") or root
+					if hum and root and head and hum.Health > 0 then
+						local dist = (root.Position - myPos).Magnitude
+						if dist <= 400 then
+							local e = npcEspFor(model)
+							local ok = drawHumanoidEsp(e, cam, vp, hum, root, head, npcColor(group), model.Name, {
+								box = CFG.npcBox,
+								health = CFG.npcHealth,
+								name = CFG.npcName,
+								distance = CFG.npcDistance,
+								distanceText = string.format("%d studs", math.floor(dist)),
+							})
+							if ok then e.lastFrame = frame end
+						end
+					end
+				end
+			end
+		end
+	end
+
+	for model, e in pairs(npcPool) do
+		if not model.Parent then
+			dropHumanoidEsp(npcPool, model)
+		elseif not e.lastFrame or e.lastFrame ~= frame then
+			hideHumanoidEsp(e)
+		end
+	end
+end
+
+--// movement -------------------------------------------------------------------
+
+local noclipSaved = {}
+local speedConn = nil
+local jumpConn = nil
+local baseWalk = nil
+local baseJump = nil
+local baseUseJumpPower = nil
+
+local function stopSpeed()
+	if speedConn then
+		pcall(function() speedConn:Disconnect() end)
+		speedConn = nil
+	end
+end
+
+local function startSpeed()
+	stopSpeed()
+	local hum = charHumanoid()
+	if not hum then return end
+	if baseWalk == nil then baseWalk = hum.WalkSpeed end
+	hum.WalkSpeed = CFG.walkSpeed
+	speedConn = hum:GetPropertyChangedSignal("WalkSpeed"):Connect(function()
+		if dead or not CFG.customSpeed then return end
+		if math.abs(hum.WalkSpeed - CFG.walkSpeed) > 0.1 then
+			hum.WalkSpeed = CFG.walkSpeed
+		end
+	end)
+end
+
+local function stopJump()
+	if jumpConn then
+		pcall(function() jumpConn:Disconnect() end)
+		jumpConn = nil
+	end
+end
+
+local function startJump()
+	stopJump()
+	local hum = charHumanoid()
+	if not hum then return end
+	if baseJump == nil then baseJump = hum.JumpPower end
+	if baseUseJumpPower == nil then baseUseJumpPower = hum.UseJumpPower end
+	hum.UseJumpPower = true
+	hum.JumpPower = CFG.jumpPower
+	jumpConn = hum:GetPropertyChangedSignal("JumpPower"):Connect(function()
+		if dead or not CFG.customJump then return end
+		if math.abs(hum.JumpPower - CFG.jumpPower) > 0.5 then
+			hum.JumpPower = CFG.jumpPower
+		end
+		if not hum.UseJumpPower then hum.UseJumpPower = true end
+	end)
+end
+
+local function saveNoclipParts(char)
+	for _, part in ipairs(char:GetDescendants()) do
+		if part:IsA("BasePart") and noclipSaved[part] == nil then
+			noclipSaved[part] = part.CanCollide
+		end
+	end
+end
+
+local function restoreNoclip()
+	for part, value in pairs(noclipSaved) do
+		if part.Parent then
+			pcall(function() part.CanCollide = value end)
+		end
+	end
+	noclipSaved = {}
+end
+
+local function restoreMovement()
+	local hum = charHumanoid()
+	if not hum then return end
+	if baseWalk then hum.WalkSpeed = baseWalk end
+	if baseJump then
+		hum.UseJumpPower = true
+		hum.JumpPower = baseJump
+	end
+	if baseUseJumpPower ~= nil then hum.UseJumpPower = baseUseJumpPower end
+	baseWalk = nil
+	baseJump = nil
+	baseUseJumpPower = nil
+end
+
+local function movementTick()
+	local char = LP.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if not hum then return end
+
+	if CFG.customSpeed and not speedConn then startSpeed() end
+	if CFG.customJump then
+		if not jumpConn then startJump() end
+		if not hum.UseJumpPower then hum.UseJumpPower = true end
+	end
+
+	if CFG.noclip then
+		saveNoclipParts(char)
+		for part in pairs(noclipSaved) do
+			if part.Parent and part.CanCollide then
+				part.CanCollide = false
+			end
+		end
+	elseif next(noclipSaved) ~= nil then
+		restoreNoclip()
+	end
+
+	if CFG.fovOn then
+		local cam = workspace.CurrentCamera
+		if cam and cam.FieldOfView ~= CFG.fov then
+			cam.FieldOfView = CFG.fov
+		end
+	end
+end
+
+local jumpRequestConn = UserInputService.JumpRequest:Connect(function()
+	if dead or not CFG.infiniteJump then return end
+	local hum = charHumanoid()
+	if not hum then return end
+	local state = hum:GetState()
+	if state ~= Enum.HumanoidStateType.Jumping and state ~= Enum.HumanoidStateType.Freefall then
+		hum:ChangeState(Enum.HumanoidStateType.Jumping)
+	end
+end)
+
+--// visuals --------------------------------------------------------------------
+
+local lightSaved = nil
+
+local function applyFullbright()
+	if lightSaved then return end
+	lightSaved = {
+		Brightness = Lighting.Brightness,
+		ClockTime = Lighting.ClockTime,
+		Ambient = Lighting.Ambient,
+		OutdoorAmbient = Lighting.OutdoorAmbient,
+		GlobalShadows = Lighting.GlobalShadows,
+		EnvironmentDiffuseScale = Lighting.EnvironmentDiffuseScale,
+		EnvironmentSpecularScale = Lighting.EnvironmentSpecularScale,
+	}
+	Lighting.Brightness = 3
+	Lighting.ClockTime = 14
+	Lighting.Ambient = Color3.fromRGB(170, 170, 170)
+	Lighting.OutdoorAmbient = Color3.fromRGB(170, 170, 170)
+	Lighting.GlobalShadows = false
+	Lighting.EnvironmentDiffuseScale = 1
+	Lighting.EnvironmentSpecularScale = 1
+end
+
+local function restoreFullbright()
+	if not lightSaved then return end
+	for k, v in pairs(lightSaved) do
+		pcall(function() Lighting[k] = v end)
+	end
+	lightSaved = nil
+end
+
+local fogSaved = nil
+
+local function applyNoFog()
+	if fogSaved then return end
+	fogSaved = {
+		FogEnd = Lighting.FogEnd,
+		FogStart = Lighting.FogStart,
+	}
+	Lighting.FogEnd = 100000
+	Lighting.FogStart = 100000
+end
+
+local function restoreNoFog()
+	if not fogSaved then return end
+	for k, v in pairs(fogSaved) do
+		pcall(function() Lighting[k] = v end)
+	end
+	fogSaved = nil
+end
+
+local function restoreVisuals()
+	restoreFullbright()
+	restoreNoFog()
+	if workspace.CurrentCamera then
+		workspace.CurrentCamera.FieldOfView = originalFov
+	end
+end
+
+--// prompts --------------------------------------------------------------------
+
+local promptCache = {}
+local promptScanAt = 0
+
+local function allPrompts()
+	local t = now()
+	if #promptCache > 0 and t - promptScanAt < 8 then return promptCache end
+	promptScanAt = t
+	promptCache = {}
+	for _, d in ipairs(workspace:GetDescendants()) do
+		if d:IsA("ProximityPrompt") then
+			promptCache[#promptCache + 1] = d
+		end
+	end
+	return promptCache
+end
+
+local function promptPart(prompt)
+	local part = prompt.Parent
+	while part and not part:IsA("BasePart") do
+		part = part.Parent
+	end
+	return part
+end
+
+local function isRobPrompt(p)
+	local a = p.ActionText:lower()
+	return a:find("rob") ~= nil or a:find("steal") ~= nil or a == "pickpocket"
+end
+
+local function isOpenPrompt(p)
+	local a = p.ActionText
+	return a == "Open" or a == "Climb Through"
+end
+
+local function isHomePrompt(p)
+	return p.ActionText == "Head Home"
+end
+
+local function isSellPrompt(p)
+	return p.ActionText:lower():find("sell") ~= nil
+end
+
+local function fireMatching(matchFn, cooldown, label)
+	if not fireproximityprompt then return 0, 0, "executor has no fireproximityprompt" end
+	local fired, skipped = 0, 0
+	local t = now()
+	for _, prompt in ipairs(allPrompts()) do
+		if prompt.Parent and prompt.Enabled and matchFn(prompt) then
+			local last = promptCooldown[prompt] or 0
+			if cooldown <= 0 or (t - last) >= cooldown then
+				promptCooldown[prompt] = t
+				local ok = pcall(function() fireproximityprompt(prompt) end)
+				if ok then fired = fired + 1 else skipped = skipped + 1 end
+				task.wait(0.04)
+			else
+				skipped = skipped + 1
+			end
+		end
+	end
+	if fired > 0 then pushLog(string.format("%s: %d fired", label or "prompts", fired)) end
+	return fired, skipped, nil
+end
+
+local function fireNearest(matchFn, label)
+	if not fireproximityprompt then return false, "executor has no fireproximityprompt" end
+	local root = charRoot()
+	if not root then return false, "no character" end
+	local best, bestDist = nil, 1e9
+	for _, prompt in ipairs(allPrompts()) do
+		if prompt.Parent and prompt.Enabled and matchFn(prompt) then
+			local part = promptPart(prompt)
+			if part then
+				local d = (part.Position - root.Position).Magnitude
+				if d < bestDist then
+					best, bestDist = prompt, d
+				end
+			end
+		end
+	end
+	if not best then return false, "no matching enabled prompt" end
+	local ok = pcall(function() fireproximityprompt(best) end)
+	if ok then
+		pushLog(string.format("%s: %s", label or "prompt", best:GetFullName()))
+		return true
+	end
+	return false, "fire failed"
+end
+
+--// world targets --------------------------------------------------------------
+
+local function nearestTagPart(tag, childName)
+	local root = charRoot()
+	local myPos = root and root.Position or Vector3.zero
+	local best, bestDist = nil, 1e9
+	for _, inst in ipairs(CollectionService:GetTagged(tag)) do
+		local part
+		if childName then
+			part = partOf(inst:FindFirstChild(childName, true))
+		else
+			part = partOf(inst)
+		end
+		if part then
+			local d = (part.Position - myPos).Magnitude
+			if d < bestDist then
+				best, bestDist = part, d
+			end
+		end
+	end
+	return best, bestDist
+end
+
+local function findSellBox()
+	local hideout = workspace:FindFirstChild("Hideout")
+	return partOf(hideout and hideout:FindFirstChild("SellBox", true))
+end
+
+local function findSellLever()
+	local hideout = workspace:FindFirstChild("Hideout")
+	return partOf(hideout and hideout:FindFirstChild("SellLever", true))
+end
+
+local function findHideout()
+	local hideout = workspace:FindFirstChild("Hideout")
+	if not hideout then return nil end
+	local truck = hideout:FindFirstChild("Truck")
+	local zone = truck and truck:FindFirstChild("CargoZone", true)
+	local part = partOf(zone)
+	if part then return part end
+	return partOf(hideout:FindFirstChild("SellBox", true))
+end
+
+local function findJobBoard()
+	local town = workspace:FindFirstChild("Town")
+	local truck = town and town:FindFirstChild("Truck")
+	local board = truck and truck:FindFirstChild("JobBoard", true)
+	local part = partOf(board)
+	if part then return part end
+	for _, prompt in ipairs(allPrompts()) do
+		if prompt.Enabled and (prompt.ActionText == "Read" or prompt.ActionText == "Head Home") then
+			local p = promptPart(prompt)
+			if p then return p end
+		end
+	end
+	return nil
+end
+
+local function findShopComputer()
+	local part = nearestTagPart("ShopComputer")
+	return part
+end
+
+local function teleportTo(part, label, offset)
+	if not part then
+		notify(label .. ": not found in this map")
+		return false
+	end
+	local target = part.Position
+	if offset then target = target + offset end
+	local ok, err = stepTeleport(target)
+	if ok then
+		notify("teleported to " .. label)
+	else
+		notify("teleport failed: " .. tostring(err))
+	end
+	return ok
+end
+
+--// status --------------------------------------------------------------------
+
+local objectives = nil
+pcall(function()
+	local shared = ReplicatedStorage:FindFirstChild("Shared")
+	local mod = shared and shared:FindFirstChild("Objectives")
+	if mod then objectives = require(mod) end
+end)
+
+local function objectiveTitle(id)
+	if objectives and objectives[id] then
+		return tostring(objectives[id].title or ("Objective " .. tostring(id)))
+	end
+	return "Objective " .. tostring(id)
+end
+
+local function statusText()
+	local cash = LP:GetAttribute("Cash") or 0
+	local level = LP:GetAttribute("Level") or 0
+	local xp = LP:GetAttribute("XP") or 0
+	local objId = LP:GetAttribute("Objective")
+	local quota = ReplicatedStorage:GetAttribute("QuotaProgress") or 0
+	local target = ReplicatedStorage:GetAttribute("QuotaTarget") or 0
+	local day = ReplicatedStorage:GetAttribute("Day") or 0
+	local night = ReplicatedStorage:GetAttribute("NightActive")
+	local debt = ReplicatedStorage:GetAttribute("DebtLeft") or 0
+	local diff = ReplicatedStorage:GetAttribute("Difficulty") or "?"
+	local mode = ReplicatedStorage:GetAttribute("Mode") or "?"
+	local held = findHeldLoot()
+	local cargo = findCargoZone()
+	local root = charRoot()
+	local heldText = "nothing"
+	if held then
+		heldText = string.format("%s (%s)", tostring(held:GetAttribute("DisplayName") or held.Name), money(held:GetAttribute("Value") or 0))
+	end
+	local cargoText = "not found"
+	if cargo and root then
+		cargoText = string.format("%dm", math.floor((cargo.Position - root.Position).Magnitude))
+	end
+	return table.concat({
+		"cash        " .. money(cash),
+		"level       " .. tostring(level) .. "   xp " .. comma(xp),
+		"objective   " .. objectiveTitle(objId) .. "  [" .. tostring(objId) .. "]",
+		"quota       " .. tostring(quota) .. " / " .. tostring(target),
+		"day         " .. tostring(day) .. "   " .. (night and "night" or "day"),
+		"debt        " .. money(debt),
+		"difficulty  " .. tostring(diff) .. "   " .. tostring(mode),
+		"carrying    " .. heldText,
+		"truck       " .. cargoText,
+	}, "\n")
+end
+
+--// player / npc lists ---------------------------------------------------------
+
+local function playerNames()
+	local names = {}
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p ~= LP then table.insert(names, p.Name) end
+	end
+	table.sort(names)
+	return names
+end
+
+local function scanNpcs()
+	local options = {}
+	local map = {}
+	for _, group in ipairs({ "Npcs", "Guards", "Police" }) do
+		local folder = workspace:FindFirstChild(group)
+		if folder then
+			local i = 0
+			for _, model in ipairs(folder:GetChildren()) do
+				if model:IsA("Model") and model:FindFirstChildOfClass("Humanoid") then
+					i = i + 1
+					local label = string.format("%s / %s [%d]", group, model.Name, i)
+					options[#options + 1] = label
+					map[label] = model
+				end
+			end
+		end
+	end
+	table.sort(options)
+	npcOptions = map
+	return options
+end
+
+--// teleport to selected -------------------------------------------------------
+
+local function teleportToPlayer(name)
+	local target = name and Players:FindFirstChild(name)
+	local char = target and target.Character
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	if not hrp then return false, "no target" end
+	local ok, err = stepTeleport(hrp.Position)
+	if ok then notify("teleported to " .. name) else notify("teleport failed: " .. tostring(err)) end
+	return ok
+end
+
+--// auto loops -----------------------------------------------------------------
+
+local function autoGrabStep()
+	if grabbing or dead or not CFG.autoGrab then return end
+
+	local held = findHeldLoot()
+	if held then
+		if CFG.autoLoad then
+			local ok, err = deliverHeld()
+			if ok then
+				notify("loaded " .. tostring(held:GetAttribute("DisplayName") or held.Name) .. " into the truck")
+			elseif now() - lastGrabNotice > 8 then
+				lastGrabNotice = now()
+				notify("auto load: " .. tostring(err))
+			end
+		elseif now() - lastGrabNotice > 8 then
+			lastGrabNotice = now()
+			notify("auto grab is holding an item; turn on auto load or drop it")
+		end
+		return
+	end
+
+	local target = bestLoot("nearest", tonumber(CFG.grabRadius) or 0)
+	if not target then return end
+	if failedGrabAt[target.model] and now() - failedGrabAt[target.model] < 25 then return end
+
+	local ok, err = faceAndGrab(target.model)
+	if ok then
+		notify(string.format("grabbed %s (%s)", target.name, money(target.value)))
+		if CFG.autoLoad then
+			local delivered, derr = deliverHeld()
+			if delivered then
+				notify("loaded " .. target.name .. " into the truck")
+			elseif now() - lastGrabNotice > 8 then
+				lastGrabNotice = now()
+				notify("auto load: " .. tostring(derr))
+			end
+		end
+	else
+		failedGrabAt[target.model] = now()
+		if now() - lastGrabNotice > 8 then
+			lastGrabNotice = now()
+			notify(string.format("grab failed on %s: %s", target.name, tostring(err)))
+		end
+	end
+end
+
+local function rejoin()
+	notify("rejoining")
+	pcall(function()
+		TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LP)
+	end)
+end
+
+--// panic / shutdown ------------------------------------------------------------
+
+local function hideEverything()
+	for _, e in pairs(lootPool) do hideLootEsp(e) end
+	for _, e in pairs(playerPool) do hideHumanoidEsp(e) end
+	for _, e in pairs(npcPool) do hideHumanoidEsp(e) end
+end
+
+local panic
+
+local function shutdown()
+	if dead then return end
+	dead = true
+	stopSpeed()
+	stopJump()
+	restoreMovement()
+	if jumpRequestConn then pcall(function() jumpRequestConn:Disconnect() end) end
+	if ui.loopConn then pcall(function() ui.loopConn:Disconnect() end) end
+	if ui.keyConn then pcall(function() ui.keyConn:Disconnect() end) end
+	if ui.charConn then pcall(function() ui.charConn:Disconnect() end) end
+	if ui.removeConn then pcall(function() ui.removeConn:Disconnect() end) end
+	restoreNoclip()
+	restoreVisuals()
+	clearDrawings()
+	lootPool = {}
+	playerPool = {}
+	npcPool = {}
+	if ui.window then pcall(function() ui.window:Unload() end) end
+	_G.CriminalPanel = { cfg = CFG }
+	print("[CRIMINAL] unloaded")
+end
+
+panic = function()
+	if dead then return end
+	CFG.lootEsp = false
+	CFG.autoGrab = false
+	CFG.autoLoad = false
+	CFG.autoRob = false
+	CFG.npcEsp = false
+	CFG.playerEsp = false
+	CFG.customSpeed = false
+	CFG.customJump = false
+	CFG.infiniteJump = false
+	CFG.noclip = false
+	CFG.fullbright = false
+	CFG.noFog = false
+	CFG.fovOn = false
+	stopSpeed()
+	stopJump()
+	restoreMovement()
+	restoreNoclip()
+	restoreVisuals()
+	hideEverything()
+	if ui.window then
+		for _, flag in ipairs({
+			"crim_lootesp", "crim_autograb", "crim_autoload", "crim_autorb",
+			"crim_npcesp", "crim_pesp", "crim_speed", "crim_jump",
+			"crim_infjump", "crim_noclip", "crim_fullbright", "crim_nofog", "crim_fovon",
+		}) do
+			pcall(function() ui.window:Set(flag, false) end)
+		end
+	end
+	pushLog("panic")
+	print("[CRIMINAL] panic")
+end
+
+--// UI --------------------------------------------------------------------------
+
+local Rayfield
+pcall(function()
+	Rayfield = loadstring(game:HttpGet("https://sirius.menu/gen2"))()
+end)
+
+local function buildUI()
+	if not Rayfield then
+		warn("[CRIMINAL] Rayfield failed to load")
+		return
+	end
+
+	local w = Rayfield:CreateWindow({
+		Name = "CRIMINAL // SIMULATOR",
+		LoadingTitle = "CRIMINAL SIMULATOR // HEIST PANEL",
+		LoadingSubtitle = "loot esp  -  prompt sniper  -  movement",
+		KeySystem = false,
+	})
+	ui.window = w
+
+	pcall(function()
+		w:ChangeTheme({
+			WindowColor = ColorSequence.new({
+				ColorSequenceKeypoint.new(0, Color3.fromRGB(12, 10, 14)),
+				ColorSequenceKeypoint.new(1, Color3.fromRGB(24, 20, 18)),
+			}),
+			ShadowColor = Color3.fromRGB(6, 5, 4),
+			CornerRoundness = UDim.new(0, 16),
+			ElementCornerRadius = UDim.new(0, 10),
+			PillCornerRadius = UDim.new(1, 0),
+			AccentColor = Color3.fromRGB(255, 196, 92),
+		})
+	end)
+
+	-- LOOT
+	local lootTab = w:CreateTab({ Name = "LOOT" })
+	lootTab:CreateSection({ Name = "LOOT ESP" })
+	lootTab:CreateToggle({
+		Name = "loot esp",
+		Description = "draws stealable loot through walls with display name, value, weight and distance.",
+		Flag = "crim_lootesp",
+		Value = CFG.lootEsp,
+		Callback = function(v)
+			CFG.lootEsp = v
+			if not v then
+				for _, e in pairs(lootPool) do hideLootEsp(e) end
+			end
+		end,
+	})
+	lootTab:CreateSlider({
+		Name = "minimum value",
+		Range = { 0, 1000 },
+		Increment = 25,
+		Value = CFG.lootMinValue,
+		Suffix = " $",
+		Flag = "crim_lootmin",
+		Callback = function(v) CFG.lootMinValue = v end,
+	})
+	lootTab:CreateSlider({
+		Name = "range",
+		Description = "0 = no limit.",
+		Range = { 0, 600 },
+		Increment = 25,
+		Value = CFG.lootRadius,
+		Suffix = " m",
+		Flag = "crim_lootradius",
+		Callback = function(v) CFG.lootRadius = v end,
+	})
+	lootTab:CreateSlider({
+		Name = "max labels",
+		Range = { 20, 300 },
+		Increment = 10,
+		Value = CFG.lootMaxLabels,
+		Flag = "crim_lootmax",
+		Callback = function(v) CFG.lootMaxLabels = v end,
+	})
+	lootTab:CreateToggle({
+		Name = "hide held loot",
+		Description = "hides loot carried by other players. your own held item stays visible.",
+		Flag = "crim_loothide",
+		Value = CFG.lootHideHeld,
+		Callback = function(v) CFG.lootHideHeld = v end,
+	})
+	lootTab:CreateToggle({
+		Name = "only liftable",
+		Description = "hides weight-2+ loot until your Shop_Lifter is high enough.",
+		Flag = "crim_lootlift",
+		Value = CFG.lootOnlyLiftable,
+		Callback = function(v) CFG.lootOnlyLiftable = v end,
+	})
+
+	lootTab:CreateSection({ Name = "GRAB  (BEST EFFORT)" })
+	ui.lootInfo = lootTab:CreateText({ Name = "loot", Text = "scanning" })
+	lootTab:CreateButton({
+		Name = "grab nearest loot",
+		Description = "steps to the item, faces it, then fires the game's own LootGrab remote.",
+		Callback = function()
+			local target = bestLoot("nearest", tonumber(CFG.grabRadius) or 0)
+			if not target then
+				notify("no matching loot in range")
+				return
+			end
+			local ok, err = faceAndGrab(target.model)
+			if ok then
+				notify(string.format("grabbed %s (%s)", target.name, money(target.value)))
+			else
+				notify("grab failed: " .. tostring(err))
+			end
+		end,
+	})
+	lootTab:CreateButton({
+		Name = "grab highest value",
+		Description = "same as grab nearest, but picks the most valuable matching item.",
+		Callback = function()
+			local target = bestLoot("value", tonumber(CFG.grabRadius) or 0)
+			if not target then
+				notify("no matching loot in range")
+				return
+			end
+			local ok, err = faceAndGrab(target.model)
+			if ok then
+				notify(string.format("grabbed %s (%s)", target.name, money(target.value)))
+			else
+				notify("grab failed: " .. tostring(err))
+			end
+		end,
+	})
+	lootTab:CreateToggle({
+		Name = "auto grab",
+		Description = "repeats grab nearest inside the search radius. hidden or room-locked loot can still be rejected by the server.",
+		Flag = "crim_autograb",
+		Value = CFG.autoGrab,
+		Callback = function(v) CFG.autoGrab = v end,
+	})
+	lootTab:CreateToggle({
+		Name = "auto load truck",
+		Description = "after each grab, steps to the nearest truck cargo zone and fires LootRelease.",
+		Flag = "crim_autoload",
+		Value = CFG.autoLoad,
+		Callback = function(v) CFG.autoLoad = v end,
+	})
+	lootTab:CreateSlider({
+		Name = "auto-grab search radius",
+		Range = { 25, 500 },
+		Increment = 25,
+		Value = CFG.grabRadius,
+		Suffix = " m",
+		Flag = "crim_grabradius",
+		Callback = function(v) CFG.grabRadius = v end,
+	})
+	lootTab:CreateButton({
+		Name = "drop held item",
+		Callback = function()
+			local ok, err = dropHeld()
+			notify(ok and "dropped held item" or ("drop failed: " .. tostring(err)))
+		end,
+	})
+	lootTab:CreateButton({
+		Name = "load held item into truck",
+		Description = "steps to the cargo zone and releases. the game decides whether it counts toward the quota.",
+		Callback = function()
+			local ok, err = deliverHeld()
+			notify(ok and "released at the truck cargo zone" or ("load failed: " .. tostring(err)))
+		end,
+	})
+	lootTab:CreateText({
+		Name = "note",
+		Text = "grab works by stepping next to the loot and facing it. hidden containers and locked rooms are server-side; failures are reported.",
+	})
+
+	-- WORLD
+	local worldTab = w:CreateTab({ Name = "WORLD" })
+	worldTab:CreateSection({ Name = "NPC ESP" })
+	worldTab:CreateToggle({
+		Name = "npc esp",
+		Description = "residents, guards and police with box, name, distance and health.",
+		Flag = "crim_npcesp",
+		Value = CFG.npcEsp,
+		Callback = function(v)
+			CFG.npcEsp = v
+			if not v then
+				for _, e in pairs(npcPool) do hideHumanoidEsp(e) end
+			end
+		end,
+	})
+	worldTab:CreateToggle({
+		Name = "residents  [Npcs]",
+		Flag = "crim_npcres",
+		Value = CFG.npcResidents,
+		Callback = function(v) CFG.npcResidents = v end,
+	})
+	worldTab:CreateToggle({
+		Name = "guards  [Guards]",
+		Flag = "crim_npcguard",
+		Value = CFG.npcGuards,
+		Callback = function(v) CFG.npcGuards = v end,
+	})
+	worldTab:CreateToggle({
+		Name = "police  [Police]",
+		Flag = "crim_npcpol",
+		Value = CFG.npcPolice,
+		Callback = function(v) CFG.npcPolice = v end,
+	})
+	worldTab:CreateToggle({
+		Name = "names",
+		Flag = "crim_npcname",
+		Value = CFG.npcName,
+		Callback = function(v) CFG.npcName = v end,
+	})
+	worldTab:CreateToggle({
+		Name = "distance",
+		Flag = "crim_npcdist",
+		Value = CFG.npcDistance,
+		Callback = function(v) CFG.npcDistance = v end,
+	})
+	worldTab:CreateToggle({
+		Name = "health bar",
+		Flag = "crim_npchp",
+		Value = CFG.npcHealth,
+		Callback = function(v) CFG.npcHealth = v end,
+	})
+	worldTab:CreateToggle({
+		Name = "box",
+		Flag = "crim_npcbox",
+		Value = CFG.npcBox,
+		Callback = function(v) CFG.npcBox = v end,
+	})
+	ui.npcInfo = worldTab:CreateText({ Name = "npc counts", Text = "-" })
+	ui.npcDrop = worldTab:CreateDropdown({
+		Name = "npc",
+		Description = "pick an npc to stand next to.",
+		Options = scanNpcs(),
+		Placeholder = "nobody picked",
+		Flag = "crim_npc",
+		Callback = function(v)
+			selectedNpc = npcOptions[v]
+		end,
+	})
+	worldTab:CreateButton({
+		Name = "refresh npc list",
+		Callback = function()
+			local options = scanNpcs()
+			if ui.npcDrop then pcall(function() ui.npcDrop:Refresh(options) end) end
+			notify("npc list refreshed")
+		end,
+	})
+	worldTab:CreateButton({
+		Name = "teleport to npc",
+		Callback = function()
+			if not selectedNpc or not selectedNpc.Parent then
+				notify("pick a live npc first")
+				return
+			end
+			local part = partOf(selectedNpc)
+			if part then
+				teleportTo(part, selectedNpc.Name, Vector3.new(0, 0, 4))
+			else
+				notify("npc has no part")
+			end
+		end,
+	})
+
+	worldTab:CreateSection({ Name = "PROMPT SNIPER" })
+	worldTab:CreateText({
+		Name = "how it works",
+		Text = "enabled proximity prompts can be fired from any distance. this uses the game's own prompts, not remotes.",
+	})
+	worldTab:CreateButton({
+		Name = "rob all containers now",
+		Description = "fires every enabled Rob Items / Rob Mailbox / Steal prompt once.",
+		Callback = function()
+			local fired, skipped, err = fireMatching(isRobPrompt, 0, "rob sweep")
+			if err then notify(err) else notify(string.format("rob sweep: %d fired, %d skipped", fired, skipped)) end
+		end,
+	})
+	worldTab:CreateButton({
+		Name = "open doors now",
+		Description = "fires every enabled Open / Climb Through prompt once.",
+		Callback = function()
+			local fired, skipped, err = fireMatching(isOpenPrompt, 0, "door sweep")
+			if err then notify(err) else notify(string.format("door sweep: %d fired, %d skipped", fired, skipped)) end
+		end,
+	})
+	worldTab:CreateButton({
+		Name = "send truck home",
+		Description = "fires the nearest enabled Head Home prompt.",
+		Callback = function()
+			local ok, err = fireNearest(isHomePrompt, "head home")
+			notify(ok and "fired Head Home" or ("head home failed: " .. tostring(err)))
+		end,
+	})
+	worldTab:CreateButton({
+		Name = "fire nearest sell prompt",
+		Description = "fires the nearest enabled prompt with Sell in the action text.",
+		Callback = function()
+			local ok, err = fireNearest(isSellPrompt, "sell")
+			notify(ok and "fired sell prompt" or ("sell failed: " .. tostring(err)))
+		end,
+	})
+	worldTab:CreateToggle({
+		Name = "auto rob containers",
+		Description = "sweeps enabled Rob prompts every few seconds with a per-prompt cooldown.",
+		Flag = "crim_autorb",
+		Value = CFG.autoRob,
+		Callback = function(v) CFG.autoRob = v end,
+	})
+	ui.promptInfo = worldTab:CreateText({ Name = "last sweep", Text = "-" })
+
+	worldTab:CreateSection({ Name = "TRAVEL" })
+	worldTab:CreateButton({
+		Name = "truck cargo zone",
+		Callback = function() teleportTo(findCargoZone(), "truck cargo") end,
+	})
+	worldTab:CreateButton({
+		Name = "sell box  (truck must be home)",
+		Callback = function() teleportTo(findSellBox(), "sell box", Vector3.new(0, 3, 0)) end,
+	})
+	worldTab:CreateButton({
+		Name = "sell lever  (truck must be home)",
+		Callback = function() teleportTo(findSellLever(), "sell lever", Vector3.new(0, 3, 0)) end,
+	})
+	worldTab:CreateButton({
+		Name = "chop shop",
+		Callback = function() teleportTo((nearestTagPart("ChopShop")), "chop shop") end,
+	})
+	worldTab:CreateButton({
+		Name = "hideout",
+		Callback = function() teleportTo(findHideout(), "hideout") end,
+	})
+	worldTab:CreateButton({
+		Name = "shop computer",
+		Callback = function() teleportTo(findShopComputer(), "shop computer", Vector3.new(0, 2, 4)) end,
+	})
+	worldTab:CreateButton({
+		Name = "job board",
+		Callback = function() teleportTo(findJobBoard(), "job board", Vector3.new(0, 2, 4)) end,
+	})
+
+	-- PLAYERS
+	local playersTab = w:CreateTab({ Name = "PLAYERS" })
+	playersTab:CreateSection({ Name = "ESP" })
+	playersTab:CreateToggle({
+		Name = "player esp",
+		Description = "box, name, distance, health and tracer for every other player.",
+		Flag = "crim_pesp",
+		Value = CFG.playerEsp,
+		Callback = function(v)
+			CFG.playerEsp = v
+			if not v then
+				for _, e in pairs(playerPool) do hideHumanoidEsp(e) end
+			end
+		end,
+	})
+	playersTab:CreateToggle({
+		Name = "names",
+		Flag = "crim_pname",
+		Value = CFG.playerEspName,
+		Callback = function(v) CFG.playerEspName = v end,
+	})
+	playersTab:CreateToggle({
+		Name = "distance",
+		Flag = "crim_pdist",
+		Value = CFG.playerEspDistance,
+		Callback = function(v) CFG.playerEspDistance = v end,
+	})
+	playersTab:CreateToggle({
+		Name = "health bar",
+		Flag = "crim_php",
+		Value = CFG.playerEspHealth,
+		Callback = function(v) CFG.playerEspHealth = v end,
+	})
+	playersTab:CreateToggle({
+		Name = "box",
+		Flag = "crim_pbox",
+		Value = CFG.playerEspBox,
+		Callback = function(v) CFG.playerEspBox = v end,
+	})
+	playersTab:CreateToggle({
+		Name = "tracer",
+		Flag = "crim_ptracer",
+		Value = CFG.playerEspTracer,
+		Callback = function(v) CFG.playerEspTracer = v end,
+	})
+	playersTab:CreateSection({ Name = "TELEPORT" })
+	ui.playerDrop = playersTab:CreateDropdown({
+		Name = "player",
+		Options = playerNames(),
+		Placeholder = "nobody picked",
+		Flag = "crim_target",
+		Callback = function(v) selectedPlayer = v end,
+	})
+	playersTab:CreateButton({
+		Name = "refresh player list",
+		Callback = function()
+			if ui.playerDrop then pcall(function() ui.playerDrop:Refresh(playerNames()) end) end
+			notify("player list refreshed")
+		end,
+	})
+	playersTab:CreateButton({
+		Name = "teleport to player",
+		Callback = function()
+			if not selectedPlayer then
+				notify("pick a player first")
+				return
+			end
+			teleportToPlayer(selectedPlayer)
+		end,
+	})
+
+	-- MOVEMENT
+	local moveTab = w:CreateTab({ Name = "MOVEMENT" })
+	moveTab:CreateSection({ Name = "SPEED" })
+	moveTab:CreateToggle({
+		Name = "custom walk speed",
+		Description = "holds your walk speed against the game's own writes.",
+		Flag = "crim_speed",
+		Value = CFG.customSpeed,
+		Callback = function(v)
+			CFG.customSpeed = v
+			if v then
+				startSpeed()
+			else
+				stopSpeed()
+				local hum = charHumanoid()
+				if hum and baseWalk then hum.WalkSpeed = baseWalk end
+				baseWalk = nil
+			end
+		end,
+	})
+	moveTab:CreateSlider({
+		Name = "walk speed",
+		Range = { 16, 120 },
+		Increment = 1,
+		Value = CFG.walkSpeed,
+		Suffix = " ws",
+		Flag = "crim_ws",
+		Callback = function(v)
+			CFG.walkSpeed = v
+			local hum = charHumanoid()
+			if CFG.customSpeed and hum then hum.WalkSpeed = v end
+		end,
+	})
+	moveTab:CreateSection({ Name = "JUMP" })
+	moveTab:CreateToggle({
+		Name = "custom jump power",
+		Flag = "crim_jump",
+		Value = CFG.customJump,
+		Callback = function(v)
+			CFG.customJump = v
+			if v then
+				startJump()
+			else
+				stopJump()
+				local hum = charHumanoid()
+				if hum and baseJump then hum.JumpPower = baseJump end
+				baseJump = nil
+			end
+		end,
+	})
+	moveTab:CreateSlider({
+		Name = "jump power",
+		Range = { 50, 250 },
+		Increment = 5,
+		Value = CFG.jumpPower,
+		Suffix = " jp",
+		Flag = "crim_jp",
+		Callback = function(v)
+			CFG.jumpPower = v
+			local hum = charHumanoid()
+			if CFG.customJump and hum then hum.JumpPower = v end
+		end,
+	})
+	moveTab:CreateToggle({
+		Name = "infinite jump",
+		Description = "every jump request re-enters the jumping state.",
+		Flag = "crim_infjump",
+		Value = CFG.infiniteJump,
+		Callback = function(v) CFG.infiniteJump = v end,
+	})
+	moveTab:CreateSection({ Name = "COLLISION" })
+	moveTab:CreateToggle({
+		Name = "noclip",
+		Description = "turns collision off on your own character parts only.",
+		Flag = "crim_noclip",
+		Value = CFG.noclip,
+		Callback = function(v)
+			CFG.noclip = v
+			if not v then restoreNoclip() end
+		end,
+	})
+
+	-- VISUALS (kept inside MOVEMENT so the tab bar stays five wide)
+	local visTab = moveTab
+	moveTab:CreateSection({ Name = "VISUALS" })
+	visTab:CreateToggle({
+		Name = "fullbright",
+		Description = "max brightness, no shadows, daylight clock. restores the original values on off.",
+		Flag = "crim_fullbright",
+		Value = CFG.fullbright,
+		Callback = function(v)
+			CFG.fullbright = v
+			if v then applyFullbright() else restoreFullbright() end
+		end,
+	})
+	visTab:CreateToggle({
+		Name = "no fog",
+		Flag = "crim_nofog",
+		Value = CFG.noFog,
+		Callback = function(v)
+			CFG.noFog = v
+			if v then applyNoFog() else restoreNoFog() end
+		end,
+	})
+	visTab:CreateToggle({
+		Name = "custom fov",
+		Flag = "crim_fovon",
+		Value = CFG.fovOn,
+		Callback = function(v) CFG.fovOn = v end,
+	})
+	visTab:CreateSlider({
+		Name = "field of view",
+		Range = { 70, 120 },
+		Increment = 1,
+		Value = CFG.fov,
+		Suffix = " fov",
+		Flag = "crim_fov",
+		Callback = function(v) CFG.fov = v end,
+	})
+
+	-- STATUS
+	local statusTab = w:CreateTab({ Name = "STATUS" })
+	statusTab:CreateSection({ Name = "LIVE" })
+	ui.status = statusTab:CreateText({ Name = "state", Text = "starting" })
+	statusTab:CreateButton({
+		Name = "refresh",
+		Callback = function()
+			if ui.status then pcall(function() ui.status:Set(statusText()) end) end
+			notify("status refreshed")
+		end,
+	})
+	statusTab:CreateSection({ Name = "SESSION" })
+	statusTab:CreateButton({
+		Name = "rejoin server",
+		Callback = function() rejoin() end,
+	})
+	statusTab:CreateButton({
+		Name = "panic  (P)",
+		Description = "turns every feature off, restores lighting, collision and fov.",
+		Callback = function() panic() end,
+	})
+	statusTab:CreateButton({
+		Name = "unload",
+		Callback = function() shutdown() end,
+	})
+	statusTab:CreateText({
+		Name = "keys",
+		Text = "P = panic   |   the panel replaces itself instead of stacking.",
+	})
+	ui.logText = statusTab:CreateText({ Name = "log", Text = "-" })
+end
+
+--// loop ------------------------------------------------------------------------
+
+local lastSync = 0
+local lastSave = 0
+
+local function tick()
+	if dead then return end
+	movementTick()
+
+	if CFG.lootEsp then
+		pcall(renderLoot)
+	else
+		for _, e in pairs(lootPool) do hideLootEsp(e) end
+	end
+
+	if CFG.playerEsp then
+		pcall(playerEspTick)
+	else
+		for _, e in pairs(playerPool) do hideHumanoidEsp(e) end
+	end
+
+	if CFG.npcEsp then
+		pcall(npcEspTick)
+	else
+		for _, e in pairs(npcPool) do hideHumanoidEsp(e) end
+	end
+
+	local t = now()
+	if t - lastSync > 0.5 then
+		lastSync = t
+		local text = statusText()
+		if ui.status then pcall(function() ui.status:Set(text) end) end
+		if ui.lootInfo then
+			local carried = findHeldLoot()
+			local near = lootList[1]
+			pcall(function()
+				ui.lootInfo:Set(string.format(
+					"%d loot shown  |  nearest %s  |  holding %s",
+					#lootList,
+					near and (near.name .. " " .. money(near.value) .. " @ " .. math.floor(near.dist) .. "m") or "-",
+					carried and (tostring(carried:GetAttribute("DisplayName") or carried.Name)) or "nothing"
+				))
+			end)
+		end
+		if ui.npcInfo then
+			local counts = {}
+			for _, group in ipairs({ "Npcs", "Guards", "Police" }) do
+				local folder = workspace:FindFirstChild(group)
+				local alive = 0
+				if folder then
+					for _, model in ipairs(folder:GetChildren()) do
+						local hum = model:FindFirstChildOfClass("Humanoid")
+						if hum and hum.Health > 0 then alive = alive + 1 end
+					end
+				end
+				counts[#counts + 1] = string.format("%s %d", group, alive)
+			end
+			pcall(function() ui.npcInfo:Set(table.concat(counts, "  |  ")) end)
+		end
+		if ui.logText then pcall(function() ui.logText:Set(#log > 0 and table.concat(log, "\n") or "-") end) end
+	end
+	if t - lastSave > 4 then
+		lastSave = t
+		pcall(saveCfg)
+	end
+end
+
+buildUI()
+
+if ui.window then
+	local conn = UserInputService.InputBegan:Connect(function(input, gp)
+		if gp then return end
+		if UserInputService:GetFocusedTextBox() then return end
+		if input.KeyCode == Enum.KeyCode.P then
+			panic()
+		end
+	end)
+	ui.keyConn = conn
+end
+
+ui.loopConn = RunService.Heartbeat:Connect(function()
+	local ok, err = pcall(tick)
+	if not ok then
+		warn("[CRIMINAL] tick error: " .. tostring(err))
+	end
+end)
+
+ui.charConn = LP.CharacterAdded:Connect(function()
+	speedConn = nil
+	jumpConn = nil
+	baseWalk = nil
+	baseJump = nil
+	baseUseJumpPower = nil
+	noclipSaved = {}
+	task.wait(0.5)
+	if CFG.customSpeed then startSpeed() end
+	if CFG.customJump then startJump() end
+end)
+
+ui.removeConn = Players.PlayerRemoving:Connect(function(plr)
+	dropHumanoidEsp(playerPool, plr)
+end)
+
+task.spawn(function()
+	while not dead do
+		if CFG.autoRob then
+			local fired, skipped = fireMatching(isRobPrompt, 22, "auto rob")
+			if fired > 0 and ui.promptInfo then
+				pcall(function() ui.promptInfo:Set(string.format("auto rob: %d fired, %d cooling down", fired, skipped)) end)
+			end
+		end
+		task.wait(3)
+	end
+end)
+
+task.spawn(function()
+	while not dead do
+		if CFG.autoGrab then
+			local ok, err = pcall(autoGrabStep)
+			if not ok then warn("[CRIMINAL] auto grab error: " .. tostring(err)) end
+		end
+		task.wait(1.2)
+	end
+end)
+
+pushLog("panel loaded")
+pcall(saveCfg)
+
+_G.CriminalPanel = {
+	cfg = CFG,
+	window = ui.window,
+	loot = lootPool,
+	players = playerPool,
+	npcs = npcPool,
+	lootList = function() return lootList end,
+	status = statusText,
+	prompts = allPrompts,
+	grab = faceAndGrab,
+	deliver = deliverHeld,
+	drop = dropHeld,
+	stop = shutdown,
+	panic = panic,
+	teleport = stepTeleport,
+}
+
+print("[CRIMINAL] panel loaded - loot esp, prompt sniper, movement")
 end
 
 --// dispatch -------------------------------------------------------------------
