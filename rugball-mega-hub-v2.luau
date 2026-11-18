@@ -8,7 +8,7 @@
 	place map
 		81469298413354   Rugball                  football
 		77844202849858   Rugball (place v2)       football
-		80119315919763   Drive Duels              taf bypass, then football
+		80119315919763   Throw A Football (Drive Duels)  qb aimbot
 		124617195142196  Build An Anime Character anime
 		126424052816775  NBA: Heroes              nba, then swish
 		122283827051026  NBA: Heroes (place v144) nba
@@ -24,9 +24,10 @@
 		101880234193261  Car Soccer              carsoccer
 		131576717722076  FD6 - Skyview           skyview
 
-	the taf bypass suite still runs before football on Drive Duels. Throw A
-	Football now carries the same bypass inside qb_aimbot, so loading both there
-	would install the same hooks twice.
+	the taf bypass suite is standalone now. Throw A Football's Drive Duels and 7s
+	modes both run qb_aimbot, which carries the same MoveGuard/AnimGuard layers,
+	so loading taf_bypass there would install the same hooks twice. The football
+	panel is still used by the Rugball places.
 
 	every suite keeps its own replace-not-stack teardown, its own _G key and
 	its own Rayfield window, so suites sharing a place (nba + swish on
@@ -43,7 +44,7 @@ local Hub = {}
 Hub.ORDER = {
 	{ place = 81469298413354,  label = "RUGBALL",          suites = { "football" } },
 	{ place = 77844202849858,  label = "RUGBALL V2",       suites = { "football" } },
-	{ place = 80119315919763,  label = "DRIVE DUELS",      suites = { "taf_bypass", "football" } },
+	{ place = 80119315919763, label = "THROW A FOOTBALL DRIVE DUELS", suites = { "qb_aimbot" } },
 	{ place = 124617195142196, label = "BUILD AN ANIME",   suites = { "anime" } },
 	{ place = 126424052816775, label = "NBA HEROES",       suites = { "nba", "swish" } },
 	{ place = 122283827051026, label = "NBA HEROES V144",  suites = { "nba" } },
@@ -81,7 +82,7 @@ Hub.SUITE_NAMES = {
 	nba        = "nba panel         |  court suite",
 	swish      = "swish             |  auto perfect shot",
 	duels      = "duels panel       |  court panel",
-	qb_aimbot  = "qb aimbot         |  ballistic solver / auto play / rebirth",
+	qb_aimbot  = "qb aimbot         |  ballistic solver / target lock / auto play / rebirth",
 	taf_bypass = "taf bypass        |  moveguard / animguard / speed",
 	physbox    = "physbox corner    |  autopilot / full power / inf stamina",
 	tps        = "tps street         |  auto shot / tackle / GK / esp",
