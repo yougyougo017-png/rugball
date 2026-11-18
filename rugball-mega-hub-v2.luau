@@ -9450,7 +9450,8 @@ end
 local function playerRig(player, index)
 	local ch = player.Character
 	local root = ch and ch:FindFirstChild("HumanoidRootPart")
-	if not root then
+	local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+	if not root or not hum or hum.Health <= 0 then
 		playerRigs[player] = nil
 		return nil
 	end
@@ -9466,11 +9467,15 @@ local function playerRig(player, index)
 		playerRigs[player] = rec
 	end
 	local v = root.AssemblyLinearVelocity
+	local flat = Vector3.new(v.X, 0, v.Z)
+	if flat.Magnitude > 60 then
+		flat = Vector3.zero
+	end
 	-- Pos on a GameRigs record is the feet/base point, and catchOf adds the
 	-- body height on top of it. keep the synthetic record in the same space.
 	rec.Root = root
 	rec.Pos = root.Position - Vector3.new(0, 3, 0)
-	rec.Vel = Vector3.new(v.X, 0, v.Z)
+	rec.Vel = flat
 	rec.Name = player.DisplayName or player.Name
 	rec.Slot = rec.Slot or (-1000 - index)
 	return rec
@@ -9572,12 +9577,25 @@ local function defenderPositions(side)
 	-- player the game clearly marks as the other side; unknown players are
 	-- left out so they cannot make every receiver look covered.
 	if CFG.playerCoverage then
+		local ch = LP.Character
+		local myRoot = ch and ch:FindFirstChild("HumanoidRootPart")
+		local origin = myRoot and myRoot.Position or nil
 		for _, p in ipairs(Players:GetPlayers()) do
 			if p ~= LP and playerOnSide(p, side) == false then
-				local ch = p.Character
-				local root = ch and ch:FindFirstChild("HumanoidRootPart")
+				local pch = p.Character
+				local root = pch and pch:FindFirstChild("HumanoidRootPart")
 				if root then
-					out[#out + 1] = root.Position
+					-- do not let a pass rusher standing on the QB count as
+					-- coverage for every route. 10 studs is inside the pocket.
+					local near = false
+					if origin then
+						local dx = root.Position.X - origin.X
+						local dz = root.Position.Z - origin.Z
+						near = dx * dx + dz * dz < 100
+					end
+					if not near then
+						out[#out + 1] = root.Position
+					end
 				end
 			end
 		end
@@ -10203,7 +10221,8 @@ local function drawRealEsp()
 		if p ~= LP and not inTargets[p] then
 			local ch = p.Character
 			local root = ch and ch:FindFirstChild("HumanoidRootPart")
-			if root then
+			local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+			if root and hum and hum.Health > 0 then
 				local item = ensureRealEsp(p, root)
 				item.billboard.Adornee = root
 				item.billboard.Enabled = true
@@ -10966,7 +10985,7 @@ local function buildUI()
 	reg("qb_playercover", "playerCoverage")
 	visTab:CreateToggle({
 		Name = "real player coverage",
-		Description = "counts real players marked as the other side as coverage. turn off if the game's side labels are inverted and every receiver looks covered.",
+		Description = "counts real players marked as the other side as coverage (pass rushers within 10 studs of you are ignored). turn off if the game's side labels are inverted and every receiver looks covered.",
 		Flag = "qb_playercover",
 		Value = CFG.playerCoverage,
 		Callback = function(v)
