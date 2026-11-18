@@ -7948,6 +7948,10 @@ Hub.SUITE.qb_aimbot = function()
 	    GameRigs.Away.Covers unit, and separation is measured to the catch point
 	    and to the throw line, so a defender sitting under the route still counts
 	    as coverage.
+	  * the target lock pins the solver on one receiver of your choice while
+	    auto target, lead, perfect release and power all keep running. it
+	    follows the current offense and falls back to the auto pick when that
+	    receiver is down or off the field.
 	  * the lead uses the game's own three-pass leadPoint loop, so a running
 	    receiver is met where he will be, not where he is.
 	  * BallController.Launch is wrapped, not replaced: the controller's state
@@ -7969,13 +7973,13 @@ Hub.SUITE.qb_aimbot = function()
 	    level, so the server still validates every reset.
 
 	keys
-	  RightShift  master toggle        F  cycle target
+	  RightShift  master toggle        F  cycle locked receiver
 	  G           auto target          H  visuals
 	  T           auto throw           E  release now
 	  P           panic
 
-	_G.SlimQbAim exports cfg, stats, pick, list, probe, throw, cycle, panic, stop,
-	play, rebirth, farm.
+	_G.SlimQbAim exports cfg, stats, pick, list, probe, throw, cycle, lock, unlock,
+	next, locked, panic, stop, play, rebirth, farm.
 --]]
 
 if game.PlaceId ~= 125942529011157 then
@@ -8152,12 +8156,20 @@ local LOCK_COLOR = Color3.fromRGB(255, 221, 35)
 
 local dead = false
 local inputConn = nil
-local ui = { flags = {}, window = nil, status = nil, acState = nil, acCover = nil, acCounters = nil, acLogText = nil, farm = nil }
+local ui = { flags = {}, window = nil, status = nil, acState = nil, acCover = nil, acCounters = nil, acLogText = nil, farm = nil, lockDrop = nil, lockText = nil }
 local hooks = { launch = false, snap = false, powerSaved = false, rankSaved = false }
 local stats = { throws = 0, aimed = 0, auto = 0, plays = 0, rebirths = 0, lastSpeed = 0, missed = 0 }
 local pick = nil
 local targetList = {}
 local cycle = 0
+local lockSlot = nil
+local lockName = nil
+local lockMissingAt = nil
+local lockSig = nil
+local lockShown = nil
+local lockOptions = {}
+local lockSyncing = false
+local manualPick = false
 local lastBuild = 0
 local lastHud = 0
 local lastStatus = 0
@@ -9313,7 +9325,209 @@ local function throwOrigin()
 	return nil
 end
 
+--// target lock ----------------------------------------------------------------
+
+local AUTO_LABEL = "auto (best open)"
+
+local function receiverRecords()
+	local out = {}
+	local recs = GR and GR.Home and GR.Home.Receivers
+	if type(recs) ~= "table" then
+		return out
+	end
+	for i = 1, #recs do
+		local r = recs[i]
+		if type(r) == "table" then
+			out[#out + 1] = {
+				rig = r,
+				slot = tonumber(r.Slot) or i,
+				name = tostring(r.Name or ("R" .. i)),
+			}
+		end
+	end
+	return out
+end
+
+local function lockMatches(rec)
+	if lockName == nil then
+		return lockSlot ~= nil and rec.slot == lockSlot
+	end
+	if rec.name ~= lockName then
+		return false
+	end
+	return lockSlot == nil or rec.slot == lockSlot
+end
+
+local function clearLock()
+	lockSlot = nil
+	lockName = nil
+	lockMissingAt = nil
+	manualPick = false
+	cycle = 0
+end
+
+local function setLock(rec)
+	if not rec then
+		clearLock()
+		return
+	end
+	lockSlot = rec.slot
+	lockName = rec.name
+	lockMissingAt = nil
+	manualPick = false
+	cycle = 0
+end
+
+local function nextLock()
+	local recs = receiverRecords()
+	if #recs == 0 then
+		clearLock()
+		return false
+	end
+	local idx = 0
+	for i = 1, #recs do
+		if lockMatches(recs[i]) then
+			idx = i
+			break
+		end
+	end
+	setLock(recs[(idx % #recs) + 1])
+	return true
+end
+
+local function receiverOptions()
+	local recs = receiverRecords()
+	local counts = {}
+	for _, rec in ipairs(recs) do
+		counts[rec.name] = (counts[rec.name] or 0) + 1
+	end
+	local opts = { AUTO_LABEL }
+	local map = {}
+	local used = { [AUTO_LABEL] = true }
+	for _, rec in ipairs(recs) do
+		local label = rec.name
+		if (counts[rec.name] or 0) > 1 then
+			label = string.format("%s #%d", rec.name, rec.slot)
+		end
+		local base = label
+		local n = 2
+		while used[label] do
+			label = string.format("%s (%d)", base, n)
+			n = n + 1
+		end
+		used[label] = true
+		map[label] = rec
+		opts[#opts + 1] = label
+	end
+	return recs, opts, map
+end
+
+-- keeps the dropdown in step with the live offense. a receiver that leaves the
+-- field stays locked for three seconds before the pick falls back to auto, so a
+-- short substitution or a play reset does not drop your choice.
+local function syncReceiverOptions(now)
+	local recs, opts, map = receiverOptions()
+	lockOptions = map
+	local sig = table.concat(opts, "\31")
+	if sig ~= lockSig then
+		lockSig = sig
+		lockShown = nil
+		if ui.lockDrop then
+			lockSyncing = true
+			pcall(function()
+				ui.lockDrop:Refresh(opts)
+			end)
+			lockSyncing = false
+		end
+	end
+
+	local found = nil
+	for _, rec in ipairs(recs) do
+		if lockMatches(rec) then
+			found = rec
+			break
+		end
+	end
+	if lockSlot ~= nil or lockName ~= nil then
+		if found then
+			lockMissingAt = nil
+			lockSlot = found.slot
+			lockName = found.name
+		else
+			lockMissingAt = lockMissingAt or now
+			if now - lockMissingAt > 3 then
+				clearLock()
+			end
+		end
+	end
+
+	local label = AUTO_LABEL
+	if found then
+		for text, rec in pairs(map) do
+			if rec.slot == found.slot and rec.name == found.name then
+				label = text
+				break
+			end
+		end
+	end
+	if label ~= lockShown then
+		lockShown = label
+		if ui.lockDrop then
+			lockSyncing = true
+			pcall(function()
+				ui.lockDrop:Set(label, true)
+			end)
+			lockSyncing = false
+		end
+	end
+end
+
+local function findLocked(list)
+	for i = 1, #list do
+		if lockMatches(list[i]) then
+			return list[i]
+		end
+	end
+	return nil
+end
+
+local function crosshairPick(list, origin)
+	local cam = Workspace.CurrentCamera
+	if not cam then
+		return nil
+	end
+	local look = cam.CFrame.LookVector
+	local bestDot = math.cos(math.rad(math.clamp(CFG.assistAngle, 10, 80)))
+	local best = nil
+	for i = 1, #list do
+		local e = list[i]
+		local d = e.point - origin
+		if d.Magnitude > 0.1 then
+			local dot = look:Dot(d.Unit)
+			if dot > bestDot then
+				bestDot = dot
+				best = e
+			end
+		end
+	end
+	return best
+end
+
+local function autoPick(list, origin)
+	if #list == 0 then
+		return nil
+	end
+	if cycle > 0 then
+		return list[((cycle - 1) % #list) + 1]
+	end
+	if CFG.autoTarget then
+		return list[1]
+	end
+	return crosshairPick(list, origin)
+end
+
 local function build(now)
+	syncReceiverOptions(now)
 	local origin = throwOrigin()
 	if not origin then
 		targetList = {}
@@ -9390,31 +9604,18 @@ local function build(now)
 	end)
 	targetList = list
 
+	manualPick = false
 	if #list == 0 then
 		pick = nil
-	elseif cycle > 0 then
-		pick = list[((cycle - 1) % #list) + 1]
-	elseif CFG.autoTarget then
-		pick = list[1]
 	else
-		-- crosshair mode: the receiver closest to where the camera is looking,
-		-- inside the same cone that the assist slider widens.
-		local cam = Workspace.CurrentCamera
-		pick = nil
-		if cam then
-			local look = cam.CFrame.LookVector
-			local bestDot = math.cos(math.rad(math.clamp(CFG.assistAngle, 10, 80)))
-			for i = 1, #list do
-				local e = list[i]
-				local d = e.point - origin
-				if d.Magnitude > 0.1 then
-					local dot = look:Dot(d.Unit)
-					if dot > bestDot then
-						bestDot = dot
-						pick = e
-					end
-				end
-			end
+		local locked = (lockSlot ~= nil or lockName ~= nil) and findLocked(list) or nil
+		if locked then
+			pick = locked
+			manualPick = true
+		else
+			-- no lock, or the locked receiver is not throwable this frame:
+			-- the normal auto / cycle / crosshair pick takes over.
+			pick = autoPick(list, origin)
 		end
 	end
 end
@@ -9760,7 +9961,7 @@ local function updateHud(now)
 		"aim %s   auto %s   %s",
 		CFG.enabled and "ON" or "OFF",
 		CFG.autoTarget and "ON" or "OFF",
-		e and ("LOCK " .. e.name) or "no target"
+		e and ("LOCK " .. e.name .. (manualPick and "  (locked)" or "")) or "no target"
 	)
 	if e then
 		lines[#lines + 1] = string.format(
@@ -10121,7 +10322,7 @@ local function buildUI()
 	reg("qb_auto", "autoTarget")
 	aimTab:CreateToggle({
 		Name = "auto target",
-		Description = "picks the most open receiver automatically. off means the receiver nearest your camera crosshair.",
+		Description = "when no receiver is manually selected, picks the most open receiver automatically. off means the receiver nearest your camera crosshair. a manual target below overrides this.",
 		Flag = "qb_auto",
 		Value = CFG.autoTarget,
 		Callback = function(v)
@@ -10131,6 +10332,41 @@ local function buildUI()
 			end
 			saveCfg()
 		end,
+	})
+
+	aimTab:CreateSection({ Name = "AIMBOT TARGET" })
+	ui.lockDrop = aimTab:CreateDropdown({
+		Name = "aimbot throws to",
+		Description = "only changes which receiver the aimbot solves onto. the aimbot itself stays on: perfect release, exact speed, lead, power assist and auto throw all keep running for the receiver you pick.",
+		Options = { AUTO_LABEL },
+		Placeholder = AUTO_LABEL,
+		Callback = function(v)
+			if lockSyncing then
+				return
+			end
+			local chosen = type(v) == "table" and v[1] or v
+			if not chosen or chosen == AUTO_LABEL then
+				clearLock()
+				return
+			end
+			local rec = lockOptions[chosen]
+			if not rec then
+				local _, _, fresh = receiverOptions()
+				rec = fresh[chosen]
+			end
+			if rec then
+				setLock(rec)
+			end
+		end,
+	})
+	ui.lockText = aimTab:CreateText({
+		Name = "lock state",
+		Text = "aimbot auto target",
+	})
+	lockShown = nil
+	aimTab:CreateText({
+		Name = "target lock note",
+		Text = "the aimbot stays on the whole time. this dropdown only decides who it throws to. leave it on 'auto' and the aimbot picks the most open receiver itself. F cycles the receiver while you play.",
 	})
 	reg("qb_perfect", "perfect")
 	aimTab:CreateToggle({
@@ -10408,18 +10644,22 @@ local function buildUI()
 			releaseNow()
 		end,
 	})
+	autoTab:CreateText({
+		Name = "target pick note",
+		Text = "the aimbot stays on. pick a receiver in AIM -> AIMBOT TARGET, or press F / cycle target to move the lock. 'back to auto pick' lets the aimbot choose again.",
+	})
 	autoTab:CreateButton({
 		Name = "cycle target",
+		Description = "moves the lock to the next receiver in the list. same as F.",
 		Callback = function()
-			if #targetList > 0 then
-				cycle = (cycle % #targetList) + 1
-			end
+			nextLock()
 		end,
 	})
 	autoTab:CreateButton({
 		Name = "back to auto pick",
+		Description = "clears the lock and lets the aimbot choose again.",
 		Callback = function()
-			cycle = 0
+			clearLock()
 		end,
 	})
 
@@ -11004,7 +11244,22 @@ _G.SlimQbAim = {
 	probe = probe,
 	throw = releaseNow,
 	cycle = function(n)
+		clearLock()
 		cycle = tonumber(n) or 0
+	end,
+	lock = function(name)
+		for _, rec in ipairs(receiverRecords()) do
+			if tostring(rec.name) == tostring(name) or tostring(rec.slot) == tostring(name) then
+				setLock(rec)
+				return true
+			end
+		end
+		return false
+	end,
+	unlock = clearLock,
+	next = nextLock,
+	locked = function()
+		return lockName, lockSlot
 	end,
 	panic = panic,
 	stop = shutdown,
@@ -11041,9 +11296,7 @@ inputConn = UserInputService.InputBegan:Connect(function(input, gpe)
 		syncUi()
 		saveCfg()
 	elseif kc == Enum.KeyCode.F then
-		if #targetList > 0 then
-			cycle = (cycle % #targetList) + 1
-		end
+		nextLock()
 	elseif kc == Enum.KeyCode.H then
 		CFG.esp = not CFG.esp
 		CFG.arc = CFG.esp
@@ -11093,12 +11346,25 @@ RunService:BindToRenderStep(TAG, Enum.RenderPriority.Camera.Value + 2, function(
 				"%s\nreceivers %d\n%s",
 				statusLine,
 				#targetList,
-				pick and (pick.name .. "  " .. string.format("%.0f st", pick.dist)) or "no target"
+				pick and (pick.name .. (manualPick and "  locked" or "") .. "  " .. string.format("%.0f st", pick.dist)) or "no target"
 			))
 		end)
 		if ui.farm then
 			pcall(function()
 				ui.farm:Set(farmText())
+			end)
+		end
+		if ui.lockText then
+			pcall(function()
+				if lockSlot ~= nil or lockName ~= nil then
+					ui.lockText:Set(
+						(manualPick and "locked: " or "waiting: ")
+						.. tostring(lockName or ("slot " .. tostring(lockSlot)))
+						.. (manualPick and "" or "  (auto pick for now)")
+					)
+				else
+					ui.lockText:Set("aimbot auto target")
+				end
 			end)
 		end
 	end
