@@ -17515,6 +17515,13 @@ Hub.SUITE.mma = function()
 --   Touch.block                     guard state read by readMovement
 --   match.camYaw / camPitch         the game's own aim state (also turns the fighter)
 --
+-- STYLE | the collectible styles live in the server profile. this panel never
+-- grants one: "equip best owned" calls the same Styles equip remote the game's
+-- style menu uses, and "force fight style" only swaps the local Fighter's style
+-- object inside this client-authoritative match. THE VOID is selectable there
+-- because the fight sim reads the object, not the profile -- ownership does not
+-- change, and whether the server accepts a style you do not own is unverified.
+--
 -- nothing here invents remotes, writes career data, or fires fake server events.
 
 local prev = _G.RagdollMmaPanel
@@ -17543,6 +17550,8 @@ for k, v in pairs({
 	aggro = 60,
 	staminaFloor = 20,
 	strikeStyle = "smart",
+	styleForce = false,
+	fightStyle = "THE VOID",
 	rageMode = false,
 	rageBoost = false,
 	rageDamage = 8,
@@ -17672,9 +17681,13 @@ if not (Match and Touch and Config and Util) then
 	return
 end
 
+-- styles are optional: a missing module only disables the STYLE tab's actions.
+local Styles = tryRequire("Styles")
+
 local Remotes = ReplicatedStorage:FindFirstChild("ROFCRemotes")
 local GetCareer = Remotes and Remotes:FindFirstChild("GetCareer")
 local GetProfile = Remotes and Remotes:FindFirstChild("GetProfile")
+local StylesRemote = Remotes and Remotes:FindFirstChild("Styles")
 
 local dead = false
 local ui = {}
@@ -17720,6 +17733,349 @@ end
 
 local notify = function(text)
 	print("[MMA] " .. tostring(text))
+end
+
+--// styles ----------------------------------------------------------------------
+-- ROFC.Styles is the read-only catalogue; ROFCRemotes.Styles is the server-owned
+-- profile (get/equip/spin). owned styles are ranked by the game's own letter
+-- grades, so "best" means the highest total, not a value this panel invents.
+
+local GRADE_SCORE = {
+	["SS+"] = 14, SS = 13, ["S+"] = 12, S = 11,
+	["A+"] = 10, A = 9, ["B+"] = 8, B = 7,
+	["C+"] = 6, C = 5, ["D+"] = 4, D = 3,
+	["E+"] = 2, E = 1, F = 0,
+}
+local GRADE_KEYS = {
+	"STRIKING", "POWER", "SPEED", "DEFENCE", "KICKS",
+	"WRESTLING", "TD DEFENCE", "GROUND", "SUBS", "CHIN",
+}
+local RARITY_RANK = {
+	SECRET = 6, GODLY = 5, UNIQUE = 4, ADMIN = 3,
+	LEGENDARY = 2, RARE = 1, BYFL = 0,
+}
+
+local styleState = nil
+local styleStateAt = 0
+local styleError = nil
+local styleBusy = false
+local styleOptionIds = {}
+local stylesTriedAt = 0
+
+local function stylesModule()
+	if Styles then return Styles end
+	if now() - stylesTriedAt < 5 then return nil end
+	stylesTriedAt = now()
+	Styles = tryRequire("Styles")
+	return Styles
+end
+
+local function stylesRemoteFn()
+	if StylesRemote and StylesRemote.Parent then return StylesRemote end
+	local r = ReplicatedStorage:FindFirstChild("ROFCRemotes")
+	StylesRemote = r and r:FindFirstChild("Styles") or nil
+	return StylesRemote
+end
+
+local function styleScore(style)
+	local grades = type(style) == "table" and style.grades or nil
+	if type(grades) ~= "table" then return 0 end
+	local total = 0
+	for _, key in ipairs(GRADE_KEYS) do
+		local grade = string.upper(tostring(grades[key] or ""))
+		total = total + (GRADE_SCORE[grade] or 0)
+	end
+	return total
+end
+
+local function styleById(id)
+	if type(id) ~= "string" then return nil end
+	local mod = stylesModule()
+	if not mod then return nil end
+	local style = mod.BY_ID and mod.BY_ID[id]
+	if style then return style end
+	if type(mod.get) == "function" then
+		local ok, got = pcall(mod.get, id)
+		if ok then return got end
+	end
+	return nil
+end
+
+local function refreshStyleState()
+	local remote = stylesRemoteFn()
+	if not remote then
+		styleError = "Styles remote not found"
+		return nil
+	end
+	local ok, res = pcall(function() return remote:InvokeServer("get") end)
+	if ok and type(res) == "table" and type(res.state) == "table" then
+		styleState = res.state
+		styleStateAt = now()
+		styleError = nil
+		return styleState
+	end
+	styleError = ok and "Styles get returned no state" or tostring(res)
+	return nil
+end
+
+local function ownedStyles()
+	local state = styleState
+	if type(state) ~= "table" then return {} end
+	local slots = type(state.sl) == "table" and state.sl or {}
+	local count = math.max(tonumber(state.n) or 0, #slots)
+	local out = {}
+	for i = 1, count do
+		local id = slots[i]
+		if type(id) == "string" and id ~= "" then
+			local style = styleById(id)
+			out[#out + 1] = {
+				id = id,
+				index = i,
+				name = (style and style.name) or id,
+				rarity = (style and style.rarity) or "?",
+				score = styleScore(style),
+				style = style,
+			}
+		end
+	end
+	table.sort(out, function(a, b)
+		if a.score ~= b.score then return a.score > b.score end
+		local ar = RARITY_RANK[a.rarity] or 0
+		local br = RARITY_RANK[b.rarity] or 0
+		if ar ~= br then return ar > br end
+		return a.index < b.index
+	end)
+	return out
+end
+
+local function equippedStyle()
+	local state = styleState
+	if type(state) ~= "table" then return nil, nil end
+	local slots = type(state.sl) == "table" and state.sl or {}
+	local index = tonumber(state.eq) or 1
+	local id = slots[index]
+	if type(id) ~= "string" or id == "" then return nil, nil end
+	return styleById(id), id
+end
+
+local function buildStyleOptions()
+	styleOptionIds = {}
+	local rows, seen = {}, {}
+	local mod = stylesModule()
+	local byId = mod and mod.BY_ID
+	if type(byId) == "table" then
+		for id, style in pairs(byId) do
+			if not seen[id] and type(style) == "table" and type(style.name) == "string" then
+				seen[id] = true
+				rows[#rows + 1] = {
+					id = id,
+					name = style.name,
+					rarity = tostring(style.rarity or "?"),
+					score = styleScore(style),
+				}
+			end
+		end
+	end
+	table.sort(rows, function(a, b)
+		if a.score ~= b.score then return a.score > b.score end
+		return a.name < b.name
+	end)
+	local options = { "best owned" }
+	for _, row in ipairs(rows) do
+		local label = row.name
+		if styleOptionIds[label] then
+			label = row.name .. "  (" .. row.id .. ")"
+		end
+		styleOptionIds[label] = row.id
+		options[#options + 1] = label
+	end
+	return options
+end
+
+local function resolveFightStyle()
+	local choice = tostring(CFG.fightStyle or "THE VOID")
+	if choice == "best owned" then
+		local best = ownedStyles()[1]
+		return best and best.style or nil, best and best.id or nil
+	end
+	local id = styleOptionIds[choice]
+	if not id then
+		local mod = stylesModule()
+		local byId = mod and mod.BY_ID
+		if type(byId) == "table" then
+			local wanted = string.upper(choice)
+			for candidate, style in pairs(byId) do
+				if candidate == choice
+					or (type(style) == "table" and string.upper(tostring(style.name)) == wanted)
+				then
+					id = candidate
+					break
+				end
+			end
+		end
+	end
+	if not id then return nil, nil end
+	return styleById(id), id
+end
+
+local function styleSummary()
+	local list = ownedStyles()
+	local eq, eqId = equippedStyle()
+	local bits = {}
+	if type(styleState) == "table" then
+		bits[#bits + 1] = tostring(#list) .. " owned"
+		bits[#bits + 1] = "equipped " .. tostring(eq and eq.name or eqId or "none")
+		if list[1] then
+			bits[#bits + 1] = "best " .. list[1].name .. " (" .. list[1].rarity .. " " .. tostring(list[1].score) .. ")"
+		end
+	else
+		bits[#bits + 1] = styleError or "press scan styles"
+	end
+	if CFG.styleForce then
+		local target = resolveFightStyle()
+		bits[#bits + 1] = "fight " .. tostring(target and target.name or "unresolved")
+	end
+	return table.concat(bits, "  |  ")
+end
+
+local function updateStyleCard()
+	if not ui.styleCard then return end
+	pcall(function()
+		local list = ownedStyles()
+		ui.styleCard:SetTitle("styles  |  " .. (type(styleState) == "table" and (tostring(#list) .. " owned") or "not loaded"))
+		ui.styleCard:Set(styleSummary())
+	end)
+end
+
+local function applyFightStyle(m, silent)
+	local target, id = resolveFightStyle()
+	if not target then
+		if not silent then notify("no fight style resolved (scan styles for 'best owned')") end
+		return false
+	end
+	if not m or not m.player or type(m.player.setStyle) ~= "function" then
+		if not silent then notify("no live match to style") end
+		return false
+	end
+	local ok, err = pcall(function() m.player:setStyle(target) end)
+	if not ok then
+		if not silent then notify("setStyle failed: " .. tostring(err)) end
+		return false
+	end
+	if not silent then
+		notify("fight style -> " .. tostring(target.name or id) .. "  |  client sim only")
+		pushLog("style -> " .. tostring(target.name or id))
+	end
+	return true
+end
+
+local function restoreEquippedStyle()
+	local style = equippedStyle()
+	if not style then return false, nil end
+	if match and match.player and type(match.player.setStyle) == "function" then
+		local ok = pcall(function() match.player:setStyle(style) end)
+		if ok then return true, style end
+	end
+	return false, style
+end
+
+local function styleTick(m)
+	if not CFG.styleForce or not m or not m.player then return end
+	local target = resolveFightStyle()
+	if not target then return end
+	if m.player.fstyle == target then return end
+	pcall(function() m.player:setStyle(target) end)
+end
+
+local function scanStyles()
+	if styleBusy then return end
+	styleBusy = true
+	task.spawn(function()
+		local fresh = refreshStyleState()
+		if not fresh then
+			styleBusy = false
+			notify("style scan failed: " .. tostring(styleError or "unknown"))
+			updateStyleCard()
+			return
+		end
+		local list = ownedStyles()
+		local eq, eqId = equippedStyle()
+		local rows = {}
+		for _, entry in ipairs(list) do
+			rows[#rows + 1] = string.format(
+				"%s [%s %s] score %d slot %d",
+				entry.name, entry.rarity, entry.id, entry.score, entry.index
+			)
+		end
+		print("[MMA styles] owned " .. tostring(#list) .. ": " .. table.concat(rows, " | "))
+		print("[MMA styles] equipped: " .. tostring(eq and eq.name or eqId or "none")
+			.. "  |  best: " .. (list[1] and (list[1].name .. " " .. tostring(list[1].score)) or "none"))
+		notify("styles scanned: " .. tostring(#list) .. " owned, best "
+			.. (list[1] and (list[1].name .. " (" .. list[1].rarity .. ")") or "none"))
+		styleBusy = false
+		updateStyleCard()
+	end)
+end
+
+local function equipBestOwned()
+	if styleBusy then return end
+	styleBusy = true
+	task.spawn(function()
+		local remote = stylesRemoteFn()
+		if not remote then
+			styleBusy = false
+			notify("Styles remote not found")
+			return
+		end
+		local fresh = refreshStyleState()
+		if not fresh then
+			styleBusy = false
+			notify("style list refresh failed: " .. tostring(styleError or "unknown"))
+			updateStyleCard()
+			return
+		end
+		local list = ownedStyles()
+		if #list == 0 then
+			styleBusy = false
+			notify("no owned styles found")
+			updateStyleCard()
+			return
+		end
+		local best = list[1]
+		local state = styleState
+		if type(state) == "table" and (tonumber(state.eq) or 1) == best.index then
+			styleBusy = false
+			notify("best owned already equipped: " .. best.name .. " (" .. best.rarity .. ")")
+			updateStyleCard()
+			return
+		end
+		local function attempt(arg)
+			local ok, res = pcall(function() return remote:InvokeServer("equip", arg) end)
+			if not ok then return false, tostring(res) end
+			if type(res) == "table" and type(res.state) == "table" then
+				styleState = res.state
+				styleStateAt = now()
+				styleError = nil
+				return true, nil
+			end
+			if type(res) == "table" and (res.err or res.need) then
+				return false, tostring(res.err or res.need)
+			end
+			return true, nil
+		end
+		local ok, err = attempt(best.index)
+		if not ok then
+			ok, err = attempt(best.id)
+		end
+		styleBusy = false
+		updateStyleCard()
+		if ok then
+			notify("equipped best owned: " .. best.name .. " (" .. best.rarity .. ", score " .. tostring(best.score) .. ")")
+			pushLog("equipped style " .. best.name)
+		else
+			notify("equip failed: " .. tostring(err))
+		end
+	end)
 end
 
 --// ranked automation -----------------------------------------------------------
@@ -17919,7 +18275,8 @@ end
 --// best config -----------------------------------------------------------------
 -- one preset that plays the whole match: pressure without gassing, head hunting,
 -- ground and submissions on. it bends a little around the opponent's style so a
--- wrestler is fought at range and a kicker is crowded instead.
+-- wrestler is fought at range and a kicker is crowded instead. it also turns on
+-- the client-side THE VOID style, which maxes every grade in the fight sim.
 
 local BEST = {
 	autoMaster = true,
@@ -17940,6 +18297,8 @@ local BEST = {
 	autoGround = true,
 	autoSub = true,
 	autoSprawl = true,
+	styleForce = true,
+	fightStyle = "THE VOID",
 }
 
 local GRAPPLERS = { wrestler = true, grappler = true, blackbelt = true, aikido = true, kravmaga = true, silat = true, bokh = true, shaolin = true, suikendo = true }
@@ -17988,6 +18347,8 @@ local function pushFlags()
 		ui.window:Set("mma_autoGround", CFG.autoGround)
 		ui.window:Set("mma_autoSub", CFG.autoSub)
 		ui.window:Set("mma_autoSprawl", CFG.autoSprawl)
+		ui.window:Set("mma_styleForce", CFG.styleForce)
+		ui.window:Set("mma_fightStyle", CFG.fightStyle)
 	end)
 end
 
@@ -18080,6 +18441,12 @@ local function adopt(m)
 	status = "match captured"
 	pushLog("match captured (round " .. tostring(m.round) .. ", " .. tostring(m.rounds) .. " rounds)")
 	notify("match captured")
+	if not styleState or now() - styleStateAt > 60 then
+		task.spawn(function()
+			pcall(refreshStyleState)
+			pcall(updateStyleCard)
+		end)
+	end
 	if CFG.autoBest then
 		pcall(applyBestCfg, "match start")
 	end
@@ -19156,6 +19523,7 @@ local function buildUI()
 	end)
 
 	local fightTab = w:CreateTab({ name = "FIGHT" })
+	local styleTab = w:CreateTab({ name = "STYLE" })
 	local rageTab = w:CreateTab({ name = "RAGE" })
 	local groundTab = w:CreateTab({ name = "GROUND" })
 	local rankedTab = w:CreateTab({ name = "RANKED" })
@@ -19276,6 +19644,131 @@ local function buildUI()
 		flag = "mma_autoSkip",
 		value = CFG.autoSkip,
 		callback = function(v) CFG.autoSkip = v end,
+	})
+
+	-- STYLE
+	ui.styleCard = styleTab:CreateText({ name = "styles  |  not loaded", text = "press scan styles" })
+	styleTab:CreateButton({
+		name = "BEST STYLE  |  use THE VOID now",
+		description = "one click: turns the fight override on, selects THE VOID (every grade SS) and applies it to the current match. client-side sim only - it does not add the style to your profile.",
+		callback = function()
+			CFG.styleForce = true
+			CFG.fightStyle = "THE VOID"
+			if ui.window then
+				pcall(function() ui.window:Set("mma_styleForce", true) end)
+				pcall(function() ui.window:Set("mma_fightStyle", "THE VOID") end)
+			end
+			if match then
+				applyFightStyle(match)
+			else
+				notify("THE VOID armed; it applies when a match is captured")
+			end
+			updateStyleCard()
+		end,
+	})
+	styleTab:CreateButton({
+		name = "scan styles (owned)",
+		description = "one Styles:get invoke. prints every owned style with its slot, rarity and the sum of the game's ten letter grades, then names the best one. read-only.",
+		callback = function() scanStyles() end,
+	})
+	styleTab:CreateButton({
+		name = "equip best owned",
+		description = "calls the same Styles:equip remote the game's style menu calls, switching your equipped slot to the highest-graded style you already own. it does not grant or roll anything.",
+		callback = function() equipBestOwned() end,
+	})
+	styleTab:CreateSection({ name = "FIGHT OVERRIDE  |  CLIENT SIM" })
+	local styleOptions = buildStyleOptions()
+	local styleValue = tostring(CFG.fightStyle or "THE VOID")
+	if styleValue ~= "best owned" and not styleOptionIds[styleValue] then
+		-- a saved file can hold a raw id from an older build; show its label
+		local matched = false
+		for label, id in pairs(styleOptionIds) do
+			if id == styleValue then
+				styleValue = label
+				matched = true
+				break
+			end
+		end
+		if not matched then
+			for label, id in pairs(styleOptionIds) do
+				if string.upper(label) == string.upper(styleValue) then
+					styleValue = label
+					matched = true
+					break
+				end
+			end
+		end
+		if not matched then styleValue = styleOptions[1] end
+	end
+	CFG.fightStyle = styleValue
+	styleTab:CreateToggle({
+		name = "force fight style",
+		description = "sets the live Fighter's style object in this client-authoritative match. the dropdown can pick styles you do not own (THE VOID is the strongest, all ten grades SS); it changes the fight sim only and does not add ownership. if the server validates the live style, a forced pick may be rejected or flagged.",
+		flag = "mma_styleForce",
+		value = CFG.styleForce,
+		callback = function(v)
+			CFG.styleForce = v
+			if v then
+				task.spawn(function()
+					if not styleState then refreshStyleState() end
+					if match then applyFightStyle(match) end
+					updateStyleCard()
+				end)
+			else
+				local ok, style = restoreEquippedStyle()
+				if ok then notify("fight style restored to " .. tostring(style.name)) end
+				updateStyleCard()
+			end
+		end,
+	})
+	styleTab:CreateDropdown({
+		name = "fight style",
+		description = "best owned follows the scan ranking. THE VOID is the hidden max style: every grade SS and every modifier near the top. picking it here only affects the local fight sim.",
+		flag = "mma_fightStyle",
+		options = styleOptions,
+		value = CFG.fightStyle,
+		callback = function(v)
+			CFG.fightStyle = tostring(v)
+			if CFG.styleForce and match then applyFightStyle(match) end
+			updateStyleCard()
+		end,
+	})
+	styleTab:CreateButton({
+		name = "apply fight style now",
+		description = "applies the dropdown choice to the match already running. no new match or reload needed.",
+		callback = function()
+			if not match then
+				notify("no match captured")
+				return
+			end
+			task.spawn(function()
+				if not styleState and CFG.fightStyle == "best owned" then refreshStyleState() end
+				applyFightStyle(match)
+				updateStyleCard()
+			end)
+		end,
+	})
+	styleTab:CreateButton({
+		name = "restore equipped style",
+		description = "turns the override off and puts the game's own equipped style back on the current fighter. same as flipping force fight style off.",
+		callback = function()
+			CFG.styleForce = false
+			if ui.window then pcall(function() ui.window:Set("mma_styleForce", false) end) end
+			task.spawn(function()
+				if not styleState then refreshStyleState() end
+				local ok, style = restoreEquippedStyle()
+				if ok then
+					notify("restored " .. tostring(style.name))
+				else
+					notify("no equipped style to restore")
+				end
+				updateStyleCard()
+			end)
+		end,
+	})
+	styleTab:CreateText({
+		name = "ownership",
+		text = "styles are stored on the server (get/equip/spin). there is no client-side grant: the panel can equip a style you own and use any style object in the local fight sim, but it cannot add a style to your profile, and a forced style is unverified against server checks.",
 	})
 
 	-- RAGE
@@ -19442,7 +19935,7 @@ local function buildUI()
 	rankedTab:CreateSection({ name = "BEST CFG" })
 	rankedTab:CreateToggle({
 		name = "auto best cfg",
-		description = "the moment a match is captured (including one already running when the panel loads) the winning preset is written into every fight setting and the master switch is turned on. this is the auto-execute part: it re-arms the whole panel for you on every ranked join.",
+		description = "the moment a match is captured (including one already running when the panel loads) the winning preset is written into every fight setting, the master switch is turned on, and the fight style is set to THE VOID in the client sim. this is the auto-execute part: it re-arms the whole panel for you on every ranked join.",
 		flag = "mma_autoBest",
 		value = CFG.autoBest,
 		callback = function(v)
@@ -19589,14 +20082,16 @@ local function panic()
 	CFG.rageStamina = false
 	CFG.rageSpeed = false
 	CFG.rageFreeze = false
+	CFG.styleForce = false
 	restoreRage()
+	pcall(restoreEquippedStyle)
 	if match then
 		pcall(function()
 			match.debugMove = nil
 		end)
 	end
 	pcall(function() Touch.block = false end)
-	for _, flag in ipairs({ "mma_autoFight", "mma_autoAim", "mma_autoBlock", "mma_autoCounter", "mma_autoTakedown", "mma_autoGround", "mma_autoSub", "mma_autoSprawl", "mma_autoQueue", "mma_autoBest", "mma_autoContinue", "mma_rageMode", "mma_rageBoost", "mma_rageOnePunch", "mma_rageGod", "mma_rageStamina", "mma_rageSpeed", "mma_rageFreeze" }) do
+	for _, flag in ipairs({ "mma_autoFight", "mma_autoAim", "mma_autoBlock", "mma_autoCounter", "mma_autoTakedown", "mma_autoGround", "mma_autoSub", "mma_autoSprawl", "mma_autoQueue", "mma_autoBest", "mma_autoContinue", "mma_rageMode", "mma_rageBoost", "mma_rageOnePunch", "mma_rageGod", "mma_rageStamina", "mma_rageSpeed", "mma_rageFreeze", "mma_styleForce" }) do
 		if ui.window then pcall(function() ui.window:Set(flag, false) end) end
 	end
 	status = "panic  |  automation off"
@@ -19608,6 +20103,8 @@ local shutdown
 shutdown = function()
 	if dead then return end
 	dead = true
+	CFG.styleForce = false
+	pcall(restoreEquippedStyle)
 	restoreRage()
 	if match then
 		pcall(function() match.debugMove = nil end)
@@ -19707,6 +20204,7 @@ local function syncUI()
 			))
 		end)
 	end
+	updateStyleCard()
 end
 
 local lastSync = 0
@@ -19744,6 +20242,7 @@ local function tick()
 		end
 		pcall(watch, m)
 		pcall(rageTick, m)
+		pcall(styleTick, m)
 		if autoOn("autoFight") then pcall(fightTick, m) end
 		pcall(groundTick, m)
 		pcall(driveTick, m)
@@ -19796,6 +20295,10 @@ refreshCareer()
 pushLog("panel loaded")
 pcall(armAutoExec)
 pcall(saveCfg)
+task.spawn(function()
+	pcall(refreshStyleState)
+	pcall(updateStyleCard)
+end)
 
 _G.RagdollMmaPanel = {
 	cfg = CFG,
@@ -19817,6 +20320,17 @@ _G.RagdollMmaPanel = {
 	instantKO = instantKO,
 	instantWin = instantWin,
 	restoreRage = restoreRage,
+	styles = {
+		scan = scanStyles,
+		equipBest = equipBestOwned,
+		apply = function()
+			if match then return applyFightStyle(match) end
+			return false
+		end,
+		restore = restoreEquippedStyle,
+		resolve = resolveFightStyle,
+		state = function() return styleState end,
+	},
 	raging = function()
 		return CFG.rageMode
 	end,
