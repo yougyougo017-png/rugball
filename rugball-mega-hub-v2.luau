@@ -22965,7 +22965,8 @@ Hub.SUITE.criminal = function()
 	            "Rob ..." and "Open" proximity prompts, travel buttons for truck, sell box,
 	            chop shop, hideout, shop computer and job board.
 	  players : esp, player list, teleport.
-	  movement: walk speed, jump power, infinite jump, noclip.
+	  movement: walk speed, speed guard (safe cap + ramp), infinite stamina, jump power,
+	            infinite jump, noclip.
 	  visuals : fullbright, no fog, fov.
 	  status  : cash, level, objective, quota, day/night, debt, difficulty, carried loot.
 	  misc    : rejoin, panic (P), unload.
@@ -22976,7 +22977,12 @@ Hub.SUITE.criminal = function()
 	  - enabled proximity prompts can be fired from any distance (a mailbox at 94 m
 	    spawned a loot cluster). disabled prompts stay inert.
 	  - walk speed sticks when the game's own write is immediately overwritten with a
-	    property-changed hook.
+	    property-changed hook. the speed guard caps at the game's own sprint speed
+	    (about 60) and ramps changes instead of snapping.
+	  - infinite stamina uses the SprintClient's own God check: setting the local
+	    God attribute keeps u70 full. a 0.75 s sprint held the bar at 100% with it on
+	    and dropped to 89.5% with it off. it is local only and does not grant real
+	    god mode.
 	  - long direct cframe jumps can be pulled back by the server; stepTeleport moves in
 	    small steps to make the trip survivable. still best-effort.
 
@@ -23022,6 +23028,10 @@ for k, v in pairs({
 	playerEspTracer = true,
 	customSpeed = false,
 	walkSpeed = 60,
+	speedGuard = true,
+	speedCap = 60,
+	speedNoCap = false,
+	infiniteStamina = false,
 	customJump = false,
 	jumpPower = 120,
 	infiniteJump = false,
@@ -23742,16 +23752,43 @@ end
 
 local noclipSaved = {}
 local speedConn = nil
+local speedHook = nil
 local jumpConn = nil
 local baseWalk = nil
 local baseJump = nil
 local baseUseJumpPower = nil
+local speedNow = nil
+local applyingSpeed = false
+local staminaGodOwned = nil
+local staminaGodCharges = nil
+
+local function speedTarget()
+	local target = tonumber(CFG.walkSpeed) or 60
+	if CFG.speedGuard and not CFG.speedNoCap then
+		local cap = tonumber(CFG.speedCap) or 60
+		if cap > 0 and target > cap then target = cap end
+	end
+	return target
+end
 
 local function stopSpeed()
 	if speedConn then
 		pcall(function() speedConn:Disconnect() end)
 		speedConn = nil
 	end
+	if speedHook then
+		pcall(function() speedHook:Disconnect() end)
+		speedHook = nil
+	end
+	speedNow = nil
+end
+
+local function applySpeed(hum)
+	if not speedNow then return end
+	if math.abs(hum.WalkSpeed - speedNow) <= 0.05 then return end
+	applyingSpeed = true
+	hum.WalkSpeed = speedNow
+	applyingSpeed = false
 end
 
 local function startSpeed()
@@ -23759,12 +23796,29 @@ local function startSpeed()
 	local hum = charHumanoid()
 	if not hum then return end
 	if baseWalk == nil then baseWalk = hum.WalkSpeed end
-	hum.WalkSpeed = CFG.walkSpeed
-	speedConn = hum:GetPropertyChangedSignal("WalkSpeed"):Connect(function()
+	speedNow = hum.WalkSpeed
+	-- the game's SprintClient writes WalkSpeed from RenderStepped every frame.
+	-- react to that write immediately (the property hook is what actually holds
+	-- the value), while the heartbeat only advances the ramp.
+	speedHook = hum:GetPropertyChangedSignal("WalkSpeed"):Connect(function()
+		if dead or not CFG.customSpeed or applyingSpeed then return end
+		applySpeed(hum)
+	end)
+	speedConn = RunService.Heartbeat:Connect(function(dt)
 		if dead or not CFG.customSpeed then return end
-		if math.abs(hum.WalkSpeed - CFG.walkSpeed) > 0.1 then
-			hum.WalkSpeed = CFG.walkSpeed
+		local h = charHumanoid()
+		if not h then return end
+		local want = speedTarget()
+		if CFG.speedGuard then
+			-- ramp instead of snapping: a sudden 16 -> 120 jump is the easiest
+			-- thing for a position-based check to notice.
+			local alpha = math.clamp((dt or 0) * 8, 0, 1)
+			speedNow = (speedNow or h.WalkSpeed) + (want - (speedNow or h.WalkSpeed)) * alpha
+			if math.abs(speedNow - want) < 0.5 then speedNow = want end
+		else
+			speedNow = want
 		end
+		applySpeed(h)
 	end)
 end
 
@@ -23790,6 +23844,51 @@ local function startJump()
 		end
 		if not hum.UseJumpPower then hum.UseJumpPower = true end
 	end)
+end
+
+local function staminaBar()
+	local gui = LP:FindFirstChildOfClass("PlayerGui")
+	local hud = gui and gui:FindFirstChild("HUD")
+	return hud and hud:FindFirstChild("StaminaBar")
+end
+
+local function restoreStamina()
+	if staminaGodOwned == nil then return end
+	-- only undo our local God flag. if the server spent a God charge while this
+	-- was on, leave the real one alone.
+	local charges = tonumber(LP:GetAttribute("GodCharges")) or 0
+	local granted = staminaGodCharges ~= nil and charges < staminaGodCharges
+	if not granted then
+		if staminaGodOwned == "nil" then
+			LP:SetAttribute("God", nil)
+		else
+			LP:SetAttribute("God", staminaGodOwned)
+		end
+	end
+	staminaGodOwned = nil
+	staminaGodCharges = nil
+end
+
+local function staminaTick()
+	if not CFG.infiniteStamina then
+		if staminaGodOwned ~= nil then restoreStamina() end
+		return
+	end
+	if staminaGodOwned == nil then
+		local current = LP:GetAttribute("God")
+		staminaGodOwned = (current == nil) and "nil" or current
+		staminaGodCharges = tonumber(LP:GetAttribute("GodCharges")) or 0
+	end
+	-- SprintClient checks this attribute every frame. when it is true the
+	-- game's own code refills u70 and skips the 22/s drain + Breathing(true).
+	if LP:GetAttribute("God") ~= true then
+		LP:SetAttribute("God", true)
+	end
+	local bar = staminaBar()
+	local fill = bar and bar:FindFirstChild("Fill")
+	if fill then
+		fill.Size = UDim2.fromScale(1, 1)
+	end
 end
 
 local function saveNoclipParts(char)
@@ -23828,6 +23927,7 @@ local function movementTick()
 	local hum = char and char:FindFirstChildOfClass("Humanoid")
 	if not hum then return end
 
+	staminaTick()
 	if CFG.customSpeed and not speedConn then startSpeed() end
 	if CFG.customJump then
 		if not jumpConn then startJump() end
@@ -24259,6 +24359,7 @@ local function shutdown()
 	stopSpeed()
 	stopJump()
 	restoreMovement()
+	restoreStamina()
 	if jumpRequestConn then pcall(function() jumpRequestConn:Disconnect() end) end
 	if ui.loopConn then pcall(function() ui.loopConn:Disconnect() end) end
 	if ui.keyConn then pcall(function() ui.keyConn:Disconnect() end) end
@@ -24284,6 +24385,8 @@ panic = function()
 	CFG.npcEsp = false
 	CFG.playerEsp = false
 	CFG.customSpeed = false
+	CFG.speedNoCap = false
+	CFG.infiniteStamina = false
 	CFG.customJump = false
 	CFG.infiniteJump = false
 	CFG.noclip = false
@@ -24293,13 +24396,15 @@ panic = function()
 	stopSpeed()
 	stopJump()
 	restoreMovement()
+	restoreStamina()
 	restoreNoclip()
 	restoreVisuals()
 	hideEverything()
 	if ui.window then
 		for _, flag in ipairs({
 			"crim_lootesp", "crim_autograb", "crim_autoload", "crim_autorb",
-			"crim_npcesp", "crim_pesp", "crim_speed", "crim_jump",
+			"crim_npcesp", "crim_pesp", "crim_speed", "crim_infstam",
+			"crim_speednocap", "crim_jump",
 			"crim_infjump", "crim_noclip", "crim_fullbright", "crim_nofog", "crim_fovon",
 		}) do
 			pcall(function() ui.window:Set(flag, false) end)
@@ -24724,7 +24829,7 @@ local function buildUI()
 	moveTab:CreateSection({ Name = "SPEED" })
 	moveTab:CreateToggle({
 		Name = "custom walk speed",
-		Description = "holds your walk speed against the game's own writes.",
+		Description = "holds your walk speed against the game's own writes. the speed guard decides how high it actually goes.",
 		Flag = "crim_speed",
 		Value = CFG.customSpeed,
 		Callback = function(v)
@@ -24739,19 +24844,44 @@ local function buildUI()
 			end
 		end,
 	})
+	moveTab:CreateToggle({
+		Name = "speed guard (anti-cheat)",
+		Description = "caps at the safe speed below and ramps changes instead of snapping. leave this on for normal play.",
+		Flag = "crim_speedguard",
+		Value = CFG.speedGuard,
+		Callback = function(v)
+			CFG.speedGuard = v
+			local hum = charHumanoid()
+			if hum then speedNow = hum.WalkSpeed end
+		end,
+	})
+	moveTab:CreateSlider({
+		Name = "safe speed cap",
+		Description = "the game's own sprint speed is about 60 ws.",
+		Range = { 16, 100 },
+		Increment = 1,
+		Value = CFG.speedCap,
+		Suffix = " ws",
+		Flag = "crim_speedcap",
+		Callback = function(v) CFG.speedCap = v end,
+	})
+	moveTab:CreateToggle({
+		Name = "ignore safe cap",
+		Description = "lets the slider go above the cap. server movement checks can pull you back or kick you; that part cannot be fully bypassed.",
+		Flag = "crim_speednocap",
+		Value = CFG.speedNoCap,
+		Callback = function(v) CFG.speedNoCap = v end,
+	})
 	moveTab:CreateSlider({
 		Name = "walk speed",
-		Range = { 16, 120 },
+		Range = { 16, 200 },
 		Increment = 1,
 		Value = CFG.walkSpeed,
 		Suffix = " ws",
 		Flag = "crim_ws",
-		Callback = function(v)
-			CFG.walkSpeed = v
-			local hum = charHumanoid()
-			if CFG.customSpeed and hum then hum.WalkSpeed = v end
-		end,
+		Callback = function(v) CFG.walkSpeed = v end,
 	})
+	ui.speedInfo = moveTab:CreateText({ Name = "speed status", Text = "..." })
 	moveTab:CreateSection({ Name = "JUMP" })
 	moveTab:CreateToggle({
 		Name = "custom jump power",
@@ -24788,6 +24918,17 @@ local function buildUI()
 		Flag = "crim_infjump",
 		Value = CFG.infiniteJump,
 		Callback = function(v) CFG.infiniteJump = v end,
+	})
+	moveTab:CreateSection({ Name = "STAMINA" })
+	moveTab:CreateToggle({
+		Name = "infinite stamina",
+		Description = "keeps the sprint stamina bar full and stops the winded state. uses the game's own zero-drain path; it does not make you invincible.",
+		Flag = "crim_infstam",
+		Value = CFG.infiniteStamina,
+		Callback = function(v)
+			CFG.infiniteStamina = v
+			if not v then restoreStamina() end
+		end,
 	})
 	moveTab:CreateSection({ Name = "COLLISION" })
 	moveTab:CreateToggle({
@@ -24930,6 +25071,20 @@ local function tick()
 			end
 			pcall(function() ui.npcInfo:Set(table.concat(counts, "  |  ")) end)
 		end
+		if ui.speedInfo then
+			local hum = charHumanoid()
+			local mode = (CFG.speedGuard and not CFG.speedNoCap)
+				and ("guard cap " .. math.floor((tonumber(CFG.speedCap) or 60) + 0.5))
+				or "guard off"
+			pcall(function()
+				ui.speedInfo:Set(string.format(
+					"slider %d ws  |  %s  |  actual %d ws",
+					math.floor((tonumber(CFG.walkSpeed) or 60) + 0.5),
+					mode,
+					hum and math.floor(hum.WalkSpeed + 0.5) or 0
+				))
+			end)
+		end
 		if ui.logText then pcall(function() ui.logText:Set(#log > 0 and table.concat(log, "\n") or "-") end) end
 	end
 	if t - lastSave > 4 then
@@ -24959,7 +25114,7 @@ ui.loopConn = RunService.Heartbeat:Connect(function()
 end)
 
 ui.charConn = LP.CharacterAdded:Connect(function()
-	speedConn = nil
+	stopSpeed()
 	jumpConn = nil
 	baseWalk = nil
 	baseJump = nil
@@ -24968,6 +25123,7 @@ ui.charConn = LP.CharacterAdded:Connect(function()
 	task.wait(0.5)
 	if CFG.customSpeed then startSpeed() end
 	if CFG.customJump then startJump() end
+	if CFG.infiniteStamina then staminaTick() end
 end)
 
 ui.removeConn = Players.PlayerRemoving:Connect(function(plr)
@@ -25014,9 +25170,11 @@ _G.CriminalPanel = {
 	stop = shutdown,
 	panic = panic,
 	teleport = stepTeleport,
+	stamina = staminaTick,
+	speedTarget = speedTarget,
 }
 
-print("[CRIMINAL] panel loaded - loot esp, prompt sniper, movement")
+print("[CRIMINAL] panel loaded - loot esp, prompt sniper, stamina, speed guard, movement")
 end
 
 --// dispatch -------------------------------------------------------------------
