@@ -7987,10 +7987,12 @@ Hub.SUITE.qb_aimbot = function()
 	  RightShift  master toggle        F  cycle locked receiver
 	  G           auto target          H  visuals
 	  T           auto throw           E  release now
+	  LeftShift   sprint (MOVE: infinite + auto)
 	  P           panic
 
-	_G.SlimQbAim exports cfg, stats, pick, list, probe, throw, cycle, lock, unlock,
-	next, locked, panic, stop, play, rebirth, farm.
+	_G.SlimQbAim exports cfg, stats, pick, list, probe, catchProbe, throw, cycle,
+	lock, unlock, next, locked, panic, stop, play, rebirth, farm, sprint,
+	autoSprint.
 --]]
 
 if game.PlaceId ~= 125942529011157 then
@@ -8069,6 +8071,9 @@ local DEFAULTS = {
 	gravity = 80,
 	walkSpeed = false,
 	walkSpeedValue = 30,
+	infSprint = false,
+	autoSprint = false,
+	sprintSpeed = 32,
 	spoofWalk = 18,
 	spoofJumpPower = 50,
 	spoofJumpHeight = 7.2,
@@ -8234,6 +8239,8 @@ local acTrackOriginal = nil
 local acTrackHook = nil
 local acTrackOn = false
 local acWalkBound = false
+local acSprintBound = false
+local acSprintActive = false
 local acHeartbeat = nil
 local startAcTick
 
@@ -8732,6 +8739,56 @@ local function applyWalkSpeed(on)
 	end
 end
 
+-- sprint is the same contract as the walk override: write WalkSpeed after the
+-- controller's own write on the same frame (Camera+3 is the walk layer, this is
+-- Camera+4), so DriveExtras cannot overwrite it back to 18. no stamina is read
+-- or spent because the game's sprint action is never invoked; the speed is ours.
+local function sprintEnabled()
+	return CFG.infSprint or CFG.autoSprint
+end
+
+local function sprintWanted(humanoid)
+	if CFG.autoSprint then
+		return humanoid.MoveDirection.Magnitude > 0.05
+	end
+	return UserInputService:IsKeyDown(Enum.KeyCode.LeftShift)
+end
+
+local function applySprint(on)
+	if on then
+		startAcTick()
+		if not acSprintBound then
+			RunService:BindToRenderStep("SlimQbSprint", Enum.RenderPriority.Camera.Value + 4, function()
+				if dead or not sprintEnabled() then return end
+				local hum = currentHumanoid()
+				if not hum or hum.Health <= 0 or hum.SeatPart then return end
+				if sprintWanted(hum) then
+					hum.WalkSpeed = math.max(CFG.sprintSpeed, CFG.walkSpeed and CFG.walkSpeedValue or 0)
+					acSprintActive = true
+				elseif acSprintActive then
+					acSprintActive = false
+					if not CFG.walkSpeed then
+						hum.WalkSpeed = CFG.spoofWalk
+					end
+				end
+			end)
+			acSprintBound = true
+		end
+	else
+		if acSprintBound then
+			pcall(function()
+				RunService:UnbindFromRenderStep("SlimQbSprint")
+			end)
+			acSprintBound = false
+		end
+		acSprintActive = false
+		local hum = currentHumanoid()
+		if hum and not CFG.walkSpeed then
+			hum.WalkSpeed = CFG.spoofWalk
+		end
+	end
+end
+
 local function stepTick(dt)
 	local humanoid = currentHumanoid()
 	local character = LP.Character
@@ -8792,6 +8849,7 @@ local function bypassTick(dt)
 		if CFG.anim and not acWhitelistOn then installAnim() end
 		if CFG.animTracks and not acTrackOn then installTrackGuard() end
 		if CFG.walkSpeed and not acWalkBound then applyWalkSpeed(true) end
+		if sprintEnabled() and not acSprintBound then applySprint(true) end
 	end
 
 	if now - acLastApply > 0.5 then
@@ -8885,6 +8943,7 @@ local function installBypass()
 	if CFG.anim then installAnim() end
 	if CFG.animTracks then installTrackGuard() end
 	if CFG.walkSpeed then applyWalkSpeed(true) end
+	if sprintEnabled() then applySprint(true) end
 	if CFG.admin then applyAdmin(true) end
 	if CFG.inflate then applyInflate(true) end
 	if CFG.customJump then applyJump(true) end
@@ -8898,6 +8957,7 @@ local function applyBypassAll()
 	if CFG.anim then installAnim() else removeAnim() end
 	if CFG.animTracks then installTrackGuard() else removeTrackGuard() end
 	if CFG.walkSpeed then applyWalkSpeed(true) else applyWalkSpeed(false) end
+	if sprintEnabled() then applySprint(true) else applySprint(false) end
 	if CFG.admin then applyAdmin(true) else applyAdmin(false) end
 	if CFG.inflate then applyInflate(true) else applyInflate(false) end
 	if CFG.customJump then applyJump(true) else applyJump(false) end
@@ -8912,6 +8972,7 @@ local function stopBypass()
 		acHeartbeat = nil
 	end
 	applyWalkSpeed(false)
+	applySprint(false)
 	removeAnim()
 	removeTrackGuard()
 	removeNamecall()
@@ -10990,6 +11051,49 @@ local function buildUI()
 		end,
 	})
 
+	moveTab:CreateSection({ Name = "SPRINT" })
+	moveTab:CreateText({
+		Name = "sprint note",
+		Text = "sprint writes WalkSpeed at Camera+4, after DriveExtras and the walk override, so the speed sticks and no stamina is spent. needs closure, ACAdmin or inflation or MoveGuard clamps it.",
+	})
+	reg("qb_infsprint", "infSprint")
+	moveTab:CreateToggle({
+		Name = "infinite sprint",
+		Description = "hold LeftShift to sprint at the slider speed. the game's stamina is never checked.",
+		Flag = "qb_infsprint",
+		Value = CFG.infSprint,
+		Callback = function(v)
+			CFG.infSprint = v
+			applySprint(sprintEnabled())
+			saveCfg()
+		end,
+	})
+	reg("qb_autosprint", "autoSprint")
+	moveTab:CreateToggle({
+		Name = "auto sprint",
+		Description = "sprint whenever you are moving, no LeftShift needed.",
+		Flag = "qb_autosprint",
+		Value = CFG.autoSprint,
+		Callback = function(v)
+			CFG.autoSprint = v
+			applySprint(sprintEnabled())
+			saveCfg()
+		end,
+	})
+	reg("qb_sprint_value", "sprintSpeed")
+	moveTab:CreateSlider({
+		Name = "sprint speed",
+		Range = { 18, 80 },
+		Increment = 1,
+		Value = CFG.sprintSpeed,
+		Suffix = " ws",
+		Flag = "qb_sprint_value",
+		Callback = function(v)
+			CFG.sprintSpeed = v
+			saveCfg()
+		end,
+	})
+
 	moveTab:CreateSection({ Name = "DIRECT SPEED" })
 	moveTab:CreateText({
 		Name = "direct speed note",
@@ -11266,6 +11370,8 @@ local function panic()
 	CFG.customJump = false
 	CFG.lowGravity = false
 	CFG.walkSpeed = false
+	CFG.infSprint = false
+	CFG.autoSprint = false
 	restoreAll()
 	stopBypass()
 	clearVisuals()
@@ -11354,6 +11460,18 @@ _G.SlimQbAim = {
 	play = startMatch,
 	rebirth = requestRebirth,
 	farm = farmText,
+	sprint = function(on)
+		CFG.infSprint = on ~= false
+		applySprint(sprintEnabled())
+		syncUi()
+		saveCfg()
+	end,
+	autoSprint = function(on)
+		CFG.autoSprint = on ~= false
+		applySprint(sprintEnabled())
+		syncUi()
+		saveCfg()
+	end,
 	ac = {
 		state = acStateText,
 		probe = acProbe,
