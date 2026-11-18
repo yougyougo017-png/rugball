@@ -14,6 +14,7 @@
 		122283827051026  NBA: Heroes (place v144) nba
 		134954408729617  Basketball Duels         duels
 		125942529011157  Throw A Football         qb aimbot (bypass built in)
+		87966800745299   Throw A Football (7s)    qb aimbot
 		96120449121277   PhysBox (HitBout)       physbox
 		335760407        TPS: Street Soccer      tps
 		75703135112691   TPS: Street Soccer      tps (match sub-place)
@@ -48,6 +49,7 @@ Hub.ORDER = {
 	{ place = 122283827051026, label = "NBA HEROES V144",  suites = { "nba" } },
 	{ place = 134954408729617, label = "BASKETBALL DUELS", suites = { "duels" } },
 	{ place = 125942529011157, label = "THROW A FOOTBALL", suites = { "qb_aimbot" } },
+	{ place = 87966800745299,  label = "THROW A FOOTBALL 7S", suites = { "qb_aimbot" } },
 	{ place = 96120449121277,  label = "PHYSBOX HITBOUT",  suites = { "physbox" } },
 	{ place = 335760407,       label = "TPS STREET SOCCER", suites = { "tps" } },
 	{ place = 75703135112691, label = "TPS MATCH",         suites = { "tps" } },
@@ -62,6 +64,14 @@ Hub.GAMES = {}
 for _, g in ipairs(Hub.ORDER) do
 	Hub.GAMES[g.place] = g
 end
+
+-- fallback by universe id: an unwired sub-place of a known experience runs the
+-- same suite chain. exact place ids above always win, so modes with their own
+-- mapping (Drive Duels) keep it. Throw A Football / Albie's Arcade is
+-- universe 10768235926; place 87966800745299 ("7s") is its live match place.
+Hub.UNIVERSE = {
+	[10768235926] = { "qb_aimbot" },
+}
 
 Hub.SUITE_ORDER = { "football", "anime", "nba", "swish", "duels", "qb_aimbot", "taf_bypass", "physbox", "tps", "track", "rss", "mma", "carsoccer", "skyview" }
 
@@ -20563,6 +20573,13 @@ end
 
 local place = game.PlaceId
 local wired = Hub.GAMES[place]
+if not wired then
+	local universe = tonumber(game.GameId)
+	local chain = universe and Hub.UNIVERSE[universe] or nil
+	if chain then
+		wired = { place = place, label = "UNIVERSE " .. tostring(universe), suites = chain }
+	end
+end
 
 if wired then
 	print(string.format("[RugballHub] place %d -> %s  (%s)",
