@@ -24,8 +24,11 @@
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local VirtualInputManager = game:GetService("VirtualInputManager")
 local TweenService = game:GetService("TweenService")
+local VirtualInputManager
+pcall(function()
+	VirtualInputManager = game:GetService("VirtualInputManager")
+end)
 local LocalPlayer = Players.LocalPlayer
 
 local CFG = {
@@ -159,6 +162,7 @@ local function signal(btn)
 end
 
 local function virtualClick(btn)
+	if not VirtualInputManager then return false end
 	return pcall(function()
 		local x, y = center(btn)
 		VirtualInputManager:SendMouseButtonEvent(x, y, 0, true, game, 1)
