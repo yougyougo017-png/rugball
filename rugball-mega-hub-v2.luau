@@ -19209,6 +19209,9 @@ local function readSummary()
 	if READ.counter ~= "" then
 		table.insert(lines, "counter: " .. READ.counter)
 	end
+	if TUNE.takedown == true and not autoOn("autoTakedown") then
+		table.insert(lines, "takedowns off  |  auto takedown is off")
+	end
 	return table.concat(lines, "\n")
 end
 
@@ -19271,6 +19274,7 @@ local lastGroundOpt = 0
 local lastSprawl = 0
 local lastSkip = 0
 local lastTakedown = 0
+local counterSpent = false
 local function setMove(vec)
 	match.debugMove = vec
 	nextMoveClear = now() + 0.25
@@ -19354,10 +19358,12 @@ local function fightTick(m)
 		end
 	end
 
-	local tdOn = TUNE.takedown
-	if tdOn == nil then tdOn = autoOn("autoTakedown") end
+	-- the read may suggest a takedown, but it must never turn one on: shooting is
+	-- the user's switch. adaptive can only veto it (boxer/wrestler counters).
+	local tdOn = autoOn("autoTakedown")
+	if TUNE.takedown == false then tdOn = false end
 	local tdStam = tonumber(TUNE.takedownStamina) or CFG.takedownStamina
-	local tdGap = TUNE.counterShot and 0.35 or 0.55
+	local tdGap = TUNE.counterShot and 0.9 or 0.75
 	if tdOn and now() - lastTakedown > tdGap and p.stamina >= tdStam then
 		local ok, can = pcall(function() return m:canShoot(p) end)
 		local shootRange = 3.4 * ((p.s or 1) + (o.s or 1)) / 2
@@ -19372,11 +19378,14 @@ local function fightTick(m)
 		elseif TUNE.counterShot == "pressure" then
 			counterWindow = incomingStep and dist <= shootRange and not o.shot
 		end
-		local pressured = (o.rockedT or 0) > 0 or o.stamina < 35 or (o.hp.head < 35) or counterWindow or math.random() < 0.02
+		if not counterWindow then counterSpent = false end
+		local pressured = (o.rockedT or 0) > 0 or o.stamina < 35 or (o.hp.head < 35)
+			or (counterWindow and not counterSpent) or math.random() < 0.02
 		if ok and can and pressured and dist <= shootRange * 0.92 then
 			local ok2 = pcall(m.playerShoot, m)
 			if ok2 then
 				lastTakedown = now()
+				if counterWindow then counterSpent = true end
 				pushLog("takedown shot at " .. string.format("%.1fm", dist))
 			end
 		end
@@ -20954,6 +20963,9 @@ _G.RagdollMmaPanel = {
 				farT = READ.farT,
 				styleOverride = TUNE.strikeStyle,
 				aimZone = effAim(),
+				takedown = TUNE.takedown,
+				counterShot = TUNE.counterShot,
+				takedownStamina = TUNE.takedownStamina,
 			}
 		end,
 		set = setAdaptive,
