@@ -18974,8 +18974,13 @@ local function fightTick(m)
 	end
 	if CFG.strikeStyle == "kicks" then
 		-- stand where the legs reach and the arms do not; safeKicks then has a
-		-- band it can actually use instead of kicking in the pocket
-		want = math.min(reach * 1.25, math.max(want, armReach(o) + 0.55 * (o.s or 1)))
+		-- band it can actually use instead of kicking in the pocket. if the
+		-- opponent out-ranges the kick, fall back to boxing range rather than
+		-- standing outside both.
+		local kickWant = math.max(want, armReach(o) + 0.55 * (o.s or 1))
+		if kickWant <= reach * 1.28 then
+			want = kickWant
+		end
 	end
 
 	local fwd, side = 0, 0
