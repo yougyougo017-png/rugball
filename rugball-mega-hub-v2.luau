@@ -17861,30 +17861,78 @@ local acShieldOn = false
 local acKilled = 0
 local acChecked = setmetatable({}, { __mode = "k" })
 
-local function acKillHeartbeat()
-	if not getconnections then return 0 end
+-- Real's debug.getupvalue returns (value, name), while stock Luau returns
+-- (name, value). accept either shape so the snapshot lookup works in both.
+local function acUpvalue(f, i)
+	local ok, a, b = pcall(debug.getupvalue, f, i)
+	if not ok then return nil end
+	if type(a) == "string" and b ~= nil then return a, b end
+	return (type(b) == "string" and b or nil), a
+end
+
+local function acFindSnapshot(f, depth)
+	if type(f) ~= "function" or depth < 0 then return nil end
+	if not (debug and debug.getupvalue) then return nil end
+	for i = 1, 32 do
+		local _, v = acUpvalue(f, i)
+		if type(v) == "table" and type(v.refs) == "table" and type(v.power) == "number" and type(v.speedMul) == "number" then
+			return v
+		end
+		if depth > 0 and type(v) == "function" then
+			local sub = acFindSnapshot(v, depth - 1)
+			if sub then return sub end
+		end
+	end
+	return nil
+end
+
+local function acKillHeartbeat(m)
+	if not (getconnections and debug and debug.info) then return 0, nil end
 	local ok, conns = pcall(getconnections, RunService.Heartbeat)
-	if not ok or type(conns) ~= "table" then return 0 end
-	local n = 0
+	if not ok or type(conns) ~= "table" then return 0, nil end
+	local n, snap = 0, nil
 	for _, c in ipairs(conns) do
 		local f = c.Function
 		local src = nil
-		if f and debug and debug.info then
+		if f then
 			local ok2, s = pcall(debug.info, f, "s")
 			if ok2 then src = tostring(s) end
 		end
 		if src and string.find(src, "AntiCheat", 1, true) then
-			pcall(function() c:Disconnect() end)
-			n = n + 1
+			local bound = m == nil or not debug.getupvalue
+			if not bound then
+				for i = 1, 24 do
+					local _, v = acUpvalue(f, i)
+					if v == m then
+						bound = true
+						break
+					end
+				end
+			end
+			if bound then
+				snap = snap or acFindSnapshot(f, 2)
+				pcall(function() c:Disconnect() end)
+				n = n + 1
+			end
 		end
 	end
-	return n
+	return n, snap
 end
 
 local function acCleanMatch(m)
 	if not m or acChecked[m] then return false end
 	acChecked[m] = true
-	local cleaned = false
+	-- read the checker's own nerf snapshot before the wrappers go away. its
+	-- power/speedMul are the values it wrote (base * 0.3 / 0.4), so dividing
+	-- them recovers the real base even when the old panel already restored the
+	-- live fighter fields and a blind divide would inflate the fighter.
+	local snap = acFindSnapshot(rawget(m, "netSend"), 2)
+		or acFindSnapshot(rawget(m, "onNet"), 2)
+		or acFindSnapshot(rawget(m, "netDriveRemote"), 2)
+	local killed, hs = acKillHeartbeat(m)
+	acKilled = acKilled + killed
+	snap = snap or hs
+	local cleaned = killed > 0
 	for _, key in ipairs({ "netSend", "onNet", "netDriveRemote" }) do
 		local raw = rawget(m, key)
 		if raw then
@@ -17896,11 +17944,14 @@ local function acCleanMatch(m)
 		end
 	end
 	if m.acMe and m.player then
-		-- attach already restored its snapshot, then multiplied. divide the
-		-- multiplier back out so the next rageTick starts from the real base.
 		local p = m.player
-		p.speedMul = (tonumber(p.speedMul) or 1) / 0.4
-		p.power = (tonumber(p.power) or 1) / 0.3
+		if snap then
+			p.power = snap.power / 0.3
+			p.speedMul = snap.speedMul / 0.4
+		else
+			p.power = (tonumber(p.power) or 1) / 0.3
+			p.speedMul = (tonumber(p.speedMul) or 1) / 0.4
+		end
 		m.acMe = nil
 		cleaned = true
 	end
@@ -17908,7 +17959,6 @@ local function acCleanMatch(m)
 		m.acTold = nil
 		cleaned = true
 	end
-	acKilled = acKilled + acKillHeartbeat()
 	return cleaned
 end
 
@@ -17929,8 +17979,7 @@ local function setAcShield(on)
 		end
 		AntiCheat.attach = function() end
 		acShieldOn = true
-		acKilled = acKilled + acKillHeartbeat()
-		acCleanMatch(match)
+		if match then acCleanMatch(match) end
 		pushLog("anti-cheat shield on  |  ranked pvp checker skipped")
 	else
 		if AntiCheat and type(acAttachOriginal) == "function" then
@@ -17943,8 +17992,8 @@ local function setAcShield(on)
 end
 
 local function acStatusText()
-	if not AntiCheat then return "checker not present  |  shield idle" end
-	if CFG.acBypass then return "checker found  |  shield on  |  new ranked matches skip it" end
+	if not AntiCheat or type(acAttachOriginal) ~= "function" then return "checker not present  |  shield idle" end
+	if acShieldOn then return "checker found  |  shield on  |  new ranked matches skip it" end
 	return "checker found  |  shield off  |  ranked matches use it"
 end
 
