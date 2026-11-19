@@ -19486,64 +19486,18 @@ local function setBlock(on)
 	end
 end
 
-local function fightTick(m)
+-- the guard is its own job so `auto block` keeps working when `auto fight` is
+-- off: it writes only the game's two guard inputs, never movement or strikes.
+local function guardTick(m, dist, pressing, threat)
 	local p, o = m.player, m.opp
 	if not (p and o and p.rig and o.rig) then return end
 	if m.state ~= "fight" or m.finish or not m.controls then return end
 	if p.down or o.down or p.rig.ragdolled or o.rig.ragdolled then return end
 	if m.gnd or m.drive then return end
+	if threat == nil then threat = incomingStrike(m) end
+	if not dist then dist = flat(o.pos - p.pos).Magnitude end
+	pressing = pressing == true
 
-	if autoOn("autoAim") then
-		aimAt(m, effAim())
-	end
-
-	local delta = flat(o.pos - p.pos)
-	local dist = delta.Magnitude
-	local reach = (p.d and p.d.reach or 2.27) + 0.75 * (p.s or 1) + (tonumber(p.reachBonus) or 0)
-
-	-- read the fight: are they hurt enough to press, or are we too tired to trade
-	local headHp = (o.hp and o.hp.head) or 100
-	local hurt = (o.rockedT or 0) > 0 or headHp < 26 or o.stamina < 20
-	local gassed = p.stamina < math.max(6, effRetreat())
-	local finishPush = effFinishPush()
-	local pressing = finishPush and hurt and not gassed
-
-	local aggro = tonumber(TUNE.aggro) or CFG.aggro
-	local want = reach * (0.60 + 0.55 * (aggro / 100))
-	if effStyle() == "kicks" then
-		-- stand where the legs reach and the arms do not; safeKicks then has a
-		-- band it can actually use instead of kicking in the pocket. if the
-		-- opponent out-ranges the kick, fall back to boxing range rather than
-		-- standing outside both.
-		local kickWant = math.max(want, armReach(o) + 0.55 * (o.s or 1))
-		if kickWant <= reach * 1.28 then
-			want = kickWant
-		end
-	end
-	-- the adaptive counter's own range wins in the neutral state, then the
-	-- finish/retreat states take over so a hurt or gassed read cannot trap us
-	if tonumber(TUNE.range) then
-		want = reach * TUNE.range
-	end
-	if pressing then
-		want = reach * 0.52          -- walk onto the finish instead of trading at range
-	end
-	if gassed then
-		want = reach * 1.55          -- back out and breathe, let them walk onto a counter
-	end
-
-	local fwd, side = 0, 0
-	if dist > want + 0.05 then
-		fwd = -1
-	elseif dist < want * 0.6 then
-		fwd = 0.8
-	end
-	-- small orbit so the AI cannot just line us up, and so we stay off the fence
-	local t = now()
-	side = math.sin(t * 1.3) * (gassed and 0.55 or 0.25)
-	setMove(Vector3.new(side, 0, fwd))
-
-	local threat = incomingStrike(m)
 	if autoOn("autoBlock") then
 		local tnow = now()
 		local dt = math.max(0, math.min(0.1, tnow - (guardT > 0 and guardT or tnow)))
@@ -19603,6 +19557,67 @@ local function fightTick(m)
 		guardHeld, guardPulse, guardT = 0, 0, 0
 		if Touch.lowBlock then Touch.lowBlock = false end
 	end
+end
+
+local function fightTick(m)
+	local p, o = m.player, m.opp
+	if not (p and o and p.rig and o.rig) then return end
+	if m.state ~= "fight" or m.finish or not m.controls then return end
+	if p.down or o.down or p.rig.ragdolled or o.rig.ragdolled then return end
+	if m.gnd or m.drive then return end
+
+	if autoOn("autoAim") then
+		aimAt(m, effAim())
+	end
+
+	local delta = flat(o.pos - p.pos)
+	local dist = delta.Magnitude
+	local reach = (p.d and p.d.reach or 2.27) + 0.75 * (p.s or 1) + (tonumber(p.reachBonus) or 0)
+
+	-- read the fight: are they hurt enough to press, or are we too tired to trade
+	local headHp = (o.hp and o.hp.head) or 100
+	local hurt = (o.rockedT or 0) > 0 or headHp < 26 or o.stamina < 20
+	local gassed = p.stamina < math.max(6, effRetreat())
+	local finishPush = effFinishPush()
+	local pressing = finishPush and hurt and not gassed
+
+	local aggro = tonumber(TUNE.aggro) or CFG.aggro
+	local want = reach * (0.60 + 0.55 * (aggro / 100))
+	if effStyle() == "kicks" then
+		-- stand where the legs reach and the arms do not; safeKicks then has a
+		-- band it can actually use instead of kicking in the pocket. if the
+		-- opponent out-ranges the kick, fall back to boxing range rather than
+		-- standing outside both.
+		local kickWant = math.max(want, armReach(o) + 0.55 * (o.s or 1))
+		if kickWant <= reach * 1.28 then
+			want = kickWant
+		end
+	end
+	-- the adaptive counter's own range wins in the neutral state, then the
+	-- finish/retreat states take over so a hurt or gassed read cannot trap us
+	if tonumber(TUNE.range) then
+		want = reach * TUNE.range
+	end
+	if pressing then
+		want = reach * 0.52          -- walk onto the finish instead of trading at range
+	end
+	if gassed then
+		want = reach * 1.55          -- back out and breathe, let them walk onto a counter
+	end
+
+	local fwd, side = 0, 0
+	if dist > want + 0.05 then
+		fwd = -1
+	elseif dist < want * 0.6 then
+		fwd = 0.8
+	end
+	-- small orbit so the AI cannot just line us up, and so we stay off the fence
+	local t = now()
+	side = math.sin(t * 1.3) * (gassed and 0.55 or 0.25)
+	setMove(Vector3.new(side, 0, fwd))
+
+	local threat = incomingStrike(m)
+	guardTick(m, dist, pressing, threat)
 
 	local allowStrike = pressing or (not autoOn("autoBlock")) or (not threat) or (not autoOn("autoCounter"))
 	if allowStrike and not gassed and dist <= reach * 1.30 and now() - lastTry > 0.09 then
@@ -20536,7 +20551,7 @@ local function buildUI()
 	})
 	fightTab:CreateToggle({
 		name = "auto block",
-		description = "holds the game's own guard: Touch.block inside punching range through every windup and extend, dropped for three ticks between strikes to reset guard fatigue, and Touch.lowBlock whenever a body strike is aimed at you or a takedown is live. a reactive block is too late for 1.3x-speed hands.",
+		description = "holds the game's own guard: Touch.block inside punching range through every windup and extend, dropped for three ticks between strikes to reset guard fatigue, and Touch.lowBlock whenever a body strike is aimed at you or a takedown is live. a reactive block is too late for 1.3x-speed hands. runs with auto fight off: the guard only writes the game's two guard inputs, never movement or strikes.",
 		flag = "mma_autoBlock",
 		value = CFG.autoBlock,
 		callback = function(v) CFG.autoBlock = v end,
@@ -21150,7 +21165,12 @@ local function tick()
 		pcall(watch, m)
 		pcall(adaptTick, m)
 		pcall(rageTick, m)
-		if autoOn("autoFight") then pcall(fightTick, m) end
+		if autoOn("autoFight") then
+			pcall(fightTick, m)
+		elseif autoOn("autoBlock") then
+			-- block is its own switch: keep guarding even when auto fight is off
+			pcall(guardTick, m)
+		end
 		pcall(groundTick, m)
 		pcall(driveTick, m)
 		if not CFG.autoFight and not CFG.autoGround and not CFG.autoSprawl then
