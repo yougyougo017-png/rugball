@@ -22961,19 +22961,22 @@ Hub.SUITE.criminal = function()
 	what it does
 	  loot    : esp with display name, value, weight and distance, value/range filters,
 	            nearest and highest-value teleports, best-effort grab + truck loading,
-	            and a one-shot haul that grabs every matching item in range and releases
-	            it at the nearest truck cargo zone.
+	            a one-shot haul that grabs every matching item in range and releases
+	            it at the nearest truck cargo zone, plus an auto haul loop and a max
+	            item limit.
 	  world   : npc esp (residents / guards / police) with optional detail tags, a live
 	            npc details window (health, distance, state, gender, outfit, home, spot)
-	            and a full npc attribute dump, prompt sniper for the game's own
-	            "Rob ..." and "Open" proximity prompts, travel buttons for truck, sell box,
-	            chop shop, hideout, shop computer and job board.
+	            and a full npc attribute dump, auto knockout with the game's own Punch
+	            remote, auto escape to the hideout on nearby police, auto door opening,
+	            prompt sniper for the game's own "Rob ..." and "Open" proximity prompts,
+	            travel buttons for truck, sell box, chop shop, hideout, shop computer
+	            and job board.
 	  players : esp, player list, teleport.
 	  movement: walk speed, speed guard (safe cap + ramp), infinite stamina, jump power,
-	            infinite jump, noclip.
+	            infinite jump, noclip, client-side fly.
 	  visuals : fullbright, no fog, fov.
 	  status  : cash, level, objective, quota, day/night, debt, difficulty, carried loot.
-	  misc    : rejoin, panic (P), unload.
+	  misc    : max mode preset, rejoin, panic (P), unload.
 
 	what is verified live
 	  - loot attributes (Value / Weight / DisplayName / HeldBy) and the game's LootGrab
@@ -23016,6 +23019,18 @@ for k, v in pairs({
 	autoLoad = false,
 	grabRadius = 500,
 	haulRadius = 250,
+	haulLimit = 0,
+	autoHaul = false,
+	autoHaulDelay = 30,
+	autoKnockout = false,
+	knockoutRadius = 25,
+	knockoutPunches = 6,
+	autoEscape = false,
+	autoEscapeRadius = 60,
+	autoDoors = false,
+	autoDoorsRadius = 60,
+	fly = false,
+	flySpeed = 80,
 	npcEsp = false,
 	npcResidents = true,
 	npcGuards = true,
@@ -23124,6 +23139,13 @@ local grabbing = false
 local lastGrabNotice = 0
 local hauling = false
 local haulStop = false
+local lastAutoHaulAt = 0
+local knockoutBusy = false
+local knockoutStop = false
+local knockoutCurrent = nil
+local lastKnockoutNotice = 0
+local failedKnockAt = setmetatable({}, { __mode = "k" })
+local escaping = false
 
 local function now()
 	return os.clock()
@@ -23456,11 +23478,53 @@ local function stepTeleport(target)
 	return true
 end
 
+local function grabStand(item, part, root)
+	-- pick a point that is close to the item but has a real line of sight to it.
+	-- the old code always stood on the player's side, which is the wrong side of
+	-- a wall for loot inside a house. try the player side first, then a ring.
+	local pos = part.Position
+	local dirs = {}
+	local away = root.Position - pos
+	away = Vector3.new(away.X, 0, away.Z)
+	if away.Magnitude > 0.1 then
+		table.insert(dirs, away.Unit)
+	end
+	for _, d in ipairs({
+		Vector3.new(1, 0, 0), Vector3.new(-1, 0, 0),
+		Vector3.new(0, 0, 1), Vector3.new(0, 0, -1),
+		Vector3.new(0.707, 0, 0.707), Vector3.new(-0.707, 0, 0.707),
+		Vector3.new(0.707, 0, -0.707), Vector3.new(-0.707, 0, -0.707),
+	}) do
+		table.insert(dirs, d)
+	end
+
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { LP.Character }
+
+	local fallback = pos + Vector3.new(0, 0, 3)
+	for _, dir in ipairs(dirs) do
+		for _, dist in ipairs({ 3, 4 }) do
+			local stand = pos + dir.Unit * dist
+			local from = stand + Vector3.new(0, 2.5, 0)
+			local hit = workspace:Raycast(from, pos - from, params)
+			local clear = hit == nil or hit.Instance == part or hit.Instance:IsDescendantOf(item)
+			if clear then
+				return stand
+			end
+			if dir == dirs[1] and dist == 3 then
+				fallback = stand
+			end
+		end
+	end
+	return fallback
+end
+
 local function faceAndGrab(item)
 	if grabbing then return false, "grab already running" end
 	if not item or not item.Parent then return false, "loot gone" end
 	if item:GetAttribute("HeldBy") then return false, "already held" end
-	if not Remotes then return false, "remotes not found" end
+	if not Remotes or not Remotes:FindFirstChild("LootGrab") then return false, "remotes not found" end
 
 	grabbing = true
 	local part = partOf(item)
@@ -23470,13 +23534,7 @@ local function faceAndGrab(item)
 		return false, "no loot part / character"
 	end
 
-	local pos = part.Position
-	local away = root.Position - pos
-	away = Vector3.new(away.X, 0, away.Z)
-	if away.Magnitude < 0.1 then away = Vector3.new(0, 0, 1) end
-	away = away.Unit
-	local stand = pos + away * 3
-
+	local stand = grabStand(item, part, root)
 	local ok, err = stepTeleport(stand)
 	if not ok then
 		grabbing = false
@@ -23488,28 +23546,50 @@ local function faceAndGrab(item)
 		grabbing = false
 		return false, "character lost"
 	end
-	root.CFrame = CFrame.lookAt(root.Position, pos)
+	root.CFrame = CFrame.lookAt(root.Position, part.Position)
 
 	local cam = workspace.CurrentCamera
 	local oldType, oldCF = nil, nil
 	if cam then
 		oldType, oldCF = cam.CameraType, cam.CFrame
 		cam.CameraType = Enum.CameraType.Scriptable
-		cam.CFrame = CFrame.lookAt(cam.CFrame.Position, pos)
+		cam.CFrame = CFrame.lookAt(cam.CFrame.Position, part.Position)
 	end
-	task.wait(0.1)
-	Remotes.LootGrab:FireServer(item)
-	task.wait(0.4)
-	local held = item:GetAttribute("HeldBy")
+
+	-- a long step teleport reaches the client immediately but the server only
+	-- sees the new position after it replicates. firing at 0.1 s was rejected
+	-- for every item. give the position time to land, then retry once.
+	task.wait(0.5)
+
+	local function tryGrab()
+		if not part.Parent then return false end
+		local r = charRoot()
+		if r then r.CFrame = CFrame.lookAt(r.Position, part.Position) end
+		if cam then cam.CFrame = CFrame.lookAt(cam.CFrame.Position, part.Position) end
+		local fireOk = pcall(function() Remotes.LootGrab:FireServer(item) end)
+		if not fireOk then return false end
+		task.wait(0.6)
+		local held = item:GetAttribute("HeldBy")
+		return held ~= nil and tostring(held) == tostring(LP.UserId)
+	end
+
+	local grabbed = tryGrab()
+	if not grabbed and not dead then
+		task.wait(0.25)
+		grabbed = tryGrab()
+	end
+
 	if cam then
-		cam.CameraType = oldType
-		cam.CFrame = oldCF
+		pcall(function()
+			cam.CameraType = oldType
+			cam.CFrame = oldCF
+		end)
 	end
 	grabbing = false
-	if held ~= nil and tostring(held) == tostring(LP.UserId) then
-		return true
-	end
-	return false, "server rejected the grab (hidden / room / line of sight)"
+	if grabbed then return true end
+	root = charRoot()
+	local d = root and (root.Position - part.Position).Magnitude or 0
+	return false, string.format("server rejected the grab at %.1fm (hidden / room / line of sight)", d)
 end
 
 local function findCargoZone()
@@ -23540,10 +23620,20 @@ local function deliverHeld()
 	if not cargo then return false, "no truck cargo zone" end
 	local ok, err = stepTeleport(cargo.Position)
 	if not ok then return false, tostring(err) end
-	task.wait(0.35)
-	if Remotes then Remotes.LootRelease:FireServer() end
 	task.wait(0.55)
+	if Remotes and Remotes:FindFirstChild("LootRelease") then
+		pcall(function() Remotes.LootRelease:FireServer() end)
+	end
+	task.wait(0.7)
 	local h = held:GetAttribute("HeldBy")
+	if h == nil then return true end
+	-- the server may not have registered the cargo-zone position yet; one retry
+	-- is cheap and stops a good grab from being logged as a failed delivery.
+	if Remotes and Remotes:FindFirstChild("LootRelease") then
+		pcall(function() Remotes.LootRelease:FireServer() end)
+	end
+	task.wait(0.5)
+	h = held:GetAttribute("HeldBy")
 	if h == nil then return true end
 	return false, "release did not clear HeldBy"
 end
@@ -23591,8 +23681,14 @@ local function refreshHaulInfo()
 	if not ui.haulInfo then return end
 	local radius = math.clamp(tonumber(CFG.haulRadius) or 250, 25, 2000)
 	local count = #haulTargets(radius)
+	local extra = ""
+	if CFG.autoHaul then
+		local delay = math.clamp(tonumber(CFG.autoHaulDelay) or 30, 10, 300)
+		local remain = math.max(0, math.ceil(delay - (now() - lastAutoHaulAt)))
+		extra = string.format("  |  auto haul in %ds", remain)
+	end
 	pcall(function()
-		ui.haulInfo:Set(string.format("idle  |  %d items within %dm", count, math.floor(radius)))
+		ui.haulInfo:Set(string.format("idle  |  %d items within %dm%s", count, math.floor(radius), extra))
 	end)
 end
 
@@ -24053,6 +24149,76 @@ local function startJump()
 	end)
 end
 
+local flyBody = nil
+local flyGyro = nil
+local flyConn = nil
+
+local function stopFly()
+	if flyConn then
+		pcall(function() flyConn:Disconnect() end)
+		flyConn = nil
+	end
+	if flyBody then
+		pcall(function() flyBody:Destroy() end)
+		flyBody = nil
+	end
+	if flyGyro then
+		pcall(function() flyGyro:Destroy() end)
+		flyGyro = nil
+	end
+end
+
+local function startFly()
+	stopFly()
+	local char = LP.Character
+	local hrp = char and char:FindFirstChild("HumanoidRootPart")
+	if not hrp then return end
+	local body = Instance.new("BodyVelocity")
+	body.Name = "SlimhubFly"
+	body.MaxForce = Vector3.new(1e9, 1e9, 1e9)
+	body.Velocity = Vector3.zero
+	body.P = 12500
+	body.Parent = hrp
+	local gyro = Instance.new("BodyGyro")
+	gyro.Name = "SlimhubFlyGyro"
+	gyro.MaxTorque = Vector3.new(1e9, 1e9, 1e9)
+	gyro.P = 3000
+	gyro.D = 50
+	gyro.CFrame = hrp.CFrame
+	gyro.Parent = hrp
+	flyBody = body
+	flyGyro = gyro
+
+	flyConn = RunService.RenderStepped:Connect(function()
+		if dead or not CFG.fly then return end
+		local root = charRoot()
+		local cam = workspace.CurrentCamera
+		if not root or not cam or not flyBody or not flyGyro then return end
+		local speed = math.clamp(tonumber(CFG.flySpeed) or 80, 10, 300)
+		local dir = Vector3.zero
+		if UserInputService:IsKeyDown(Enum.KeyCode.W) then dir = dir + cam.CFrame.LookVector end
+		if UserInputService:IsKeyDown(Enum.KeyCode.S) then dir = dir - cam.CFrame.LookVector end
+		if UserInputService:IsKeyDown(Enum.KeyCode.D) then dir = dir + cam.CFrame.RightVector end
+		if UserInputService:IsKeyDown(Enum.KeyCode.A) then dir = dir - cam.CFrame.RightVector end
+		if UserInputService:IsKeyDown(Enum.KeyCode.Space) then dir = dir + Vector3.new(0, 1, 0) end
+		if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then dir = dir - Vector3.new(0, 1, 0) end
+		if dir.Magnitude > 0.01 then
+			flyBody.Velocity = dir.Unit * speed
+		else
+			flyBody.Velocity = Vector3.zero
+		end
+		flyGyro.CFrame = CFrame.new(root.Position, root.Position + cam.CFrame.LookVector)
+	end)
+end
+
+local function flyTick()
+	if CFG.fly and not flyBody then
+		startFly()
+	elseif not CFG.fly and flyBody then
+		stopFly()
+	end
+end
+
 local function staminaBar()
 	local gui = LP:FindFirstChildOfClass("PlayerGui")
 	local hud = gui and gui:FindFirstChild("HUD")
@@ -24135,6 +24301,7 @@ local function movementTick()
 	if not hum then return end
 
 	staminaTick()
+	flyTick()
 	if CFG.customSpeed and not speedConn then startSpeed() end
 	if CFG.customJump then
 		if not jumpConn then startJump() end
@@ -24288,6 +24455,37 @@ local function fireMatching(matchFn, cooldown, label)
 				task.wait(0.04)
 			else
 				skipped = skipped + 1
+			end
+		end
+	end
+	if fired > 0 then pushLog(string.format("%s: %d fired", label or "prompts", fired)) end
+	return fired, skipped, nil
+end
+
+local function fireNearbyMatching(matchFn, radius, cooldown, label)
+	if not fireproximityprompt then return 0, 0, "executor has no fireproximityprompt" end
+	local root = charRoot()
+	if not root then return 0, 0, "no character" end
+	local myPos = root.Position
+	radius = math.clamp(tonumber(radius) or 60, 5, 300)
+	local fired, skipped = 0, 0
+	local t = now()
+	for _, prompt in ipairs(allPrompts()) do
+		if prompt.Parent and prompt.Enabled and matchFn(prompt) then
+			local part = promptPart(prompt)
+			if part and (part.Position - myPos).Magnitude <= radius then
+				local last = promptCooldown[prompt] or 0
+				if cooldown <= 0 or (t - last) >= cooldown then
+					promptCooldown[prompt] = t
+					if pcall(function() fireproximityprompt(prompt) end) then
+						fired = fired + 1
+					else
+						skipped = skipped + 1
+					end
+					task.wait(0.04)
+				else
+					skipped = skipped + 1
+				end
 			end
 		end
 	end
@@ -24827,6 +25025,309 @@ local function npcDetailDump()
 	return #rows
 end
 
+--// auto knockout --------------------------------------------------------------
+
+local function npcKnockedOut(model)
+	if not model or not model.Parent then return true end
+	local untilAt = tonumber(model:GetAttribute("KnockedOutUntil")) or 0
+	return untilAt > workspace:GetServerTimeNow()
+end
+
+local function knockoutTargets(radius)
+	local rows = {}
+	local root = charRoot()
+	if not root then return rows end
+	local myPos = root.Position
+	radius = math.clamp(tonumber(radius) or 25, 5, 200)
+	local groups = { "Npcs", "Guards", "Police" }
+	if workspace:FindFirstChild("Dogs") then table.insert(groups, "Dogs") end
+	for _, group in ipairs(groups) do
+		local folder = workspace:FindFirstChild(group)
+		if folder then
+			for _, model in ipairs(folder:GetChildren()) do
+				if model:IsA("Model") then
+					local hum = model:FindFirstChildOfClass("Humanoid")
+					local part = model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart or partOf(model)
+					if hum and part and hum.Health > 0 and not npcKnockedOut(model) then
+						local d = (part.Position - myPos).Magnitude
+						if d <= radius then
+							rows[#rows + 1] = {
+								model = model,
+								part = part,
+								group = group,
+								name = tostring(model:GetAttribute("DisplayName") or model.Name),
+								dist = d,
+								hp = hum.Health,
+							}
+						end
+					end
+				end
+			end
+		end
+	end
+	table.sort(rows, function(a, b) return a.dist < b.dist end)
+	return rows
+end
+
+local function knockoutStand(model, part)
+	local rootPart = model:FindFirstChild("HumanoidRootPart") or part
+	local pos = part.Position
+	local npcPos = rootPart.Position
+	local look = rootPart.CFrame.LookVector
+	look = Vector3.new(look.X, 0, look.Z)
+	if look.Magnitude < 0.1 then look = Vector3.new(0, 0, 1) end
+	look = look.Unit
+	local dirs = {
+		-look,
+		Vector3.new(-look.Z, 0, look.X),
+		Vector3.new(look.Z, 0, -look.X),
+		look,
+	}
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { LP.Character }
+	local fallback = nil
+	for _, dir in ipairs(dirs) do
+		for _, dist in ipairs({ 2.8, 3.8 }) do
+			local stand = Vector3.new(npcPos.X + dir.X * dist, npcPos.Y - 2, npcPos.Z + dir.Z * dist)
+			local from = Vector3.new(stand.X, npcPos.Y + 1.2, stand.Z)
+			local hit = workspace:Raycast(from, pos - from, params)
+			local clear = hit == nil or hit.Instance == part or hit.Instance:IsDescendantOf(model)
+			if clear then return stand end
+			if not fallback then fallback = stand end
+		end
+	end
+	return fallback or Vector3.new(pos.X, npcPos.Y - 2, pos.Z + 3)
+end
+
+local function punchCount()
+	local char = LP.Character
+	local v = char and char:GetAttribute("Punches")
+	return tonumber(v) or 0
+end
+
+local function punchClear(model, torso, from)
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { LP.Character }
+	local hit = workspace:Raycast(from, torso.Position - from, params)
+	if hit == nil then return false end
+	local inst = hit.Instance
+	return inst == torso or inst:IsDescendantOf(model)
+end
+
+local function knockoutNpc(model, silent, manual)
+	if dead then return false, "panel unloaded" end
+	if not model or not model.Parent then return false, "npc gone" end
+	if knockoutBusy then return false, "knockout already running" end
+	if escaping then return false, "escape in progress" end
+	if hauling or grabbing then return false, "finish the current action first" end
+	local hum = model:FindFirstChildOfClass("Humanoid")
+	if not hum or hum.Health <= 0 then return false, "npc already down" end
+	if npcKnockedOut(model) then return false, "npc already knocked out" end
+	if not Remotes or not Remotes:FindFirstChild("Punch") then return false, "punch remote not found" end
+	manual = manual ~= false
+
+	knockoutBusy = true
+	knockoutStop = false
+	knockoutCurrent = model
+	pcall(function()
+		local h = charHumanoid()
+		if h then h:UnequipTools() end
+	end)
+	local ok = false
+	local reason = "not enough punches"
+	local punches = 0
+	local cam = workspace.CurrentCamera
+	local oldType = cam and cam.CameraType or nil
+	local oldCF = cam and cam.CFrame or nil
+	local function restoreCam()
+		if not cam then return end
+		pcall(function()
+			cam.CameraType = oldType
+			cam.CFrame = oldCF
+		end)
+	end
+
+	local callOk, callErr = pcall(function()
+		local torso = model:FindFirstChild("UpperTorso")
+			or model:FindFirstChild("Torso")
+			or model:FindFirstChild("HumanoidRootPart")
+			or partOf(model)
+		if not torso then reason = "npc has no body part" return end
+		local root = charRoot()
+		if not root then reason = "character lost" return end
+
+		-- auto mode never teleports: the game rubber-bands a long jump back
+		-- within about 0.7 s, and a punch sent from the old position is
+		-- rejected. only act when the npc is already in punch range.
+		local dist = (root.Position - torso.Position).Magnitude
+		if dist > 9.5 then
+			if not manual then
+				reason = string.format("out of punch range (%.0fm)", dist)
+				return
+			end
+			local stand = knockoutStand(model, torso)
+			local tOk, tErr = stepTeleport(stand)
+			if not tOk then reason = tostring(tErr) return end
+			task.wait(0.5)
+			if dead or knockoutStop then reason = "stopped" return end
+			root = charRoot()
+			if not root then reason = "character lost" return end
+		end
+
+		local aim = nil
+		pcall(function()
+			aim = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("MeleeAim"))
+		end)
+
+		local maxPunches = math.clamp(tonumber(CFG.knockoutPunches) or 6, 1, 10)
+		local rejected = 0
+		local lastPunches = punchCount()
+		for _ = 1, maxPunches do
+			if dead or knockoutStop then reason = "stopped" break end
+			local h = model:FindFirstChildOfClass("Humanoid")
+			if not h or h.Health <= 0 then ok = true reason = "dead" break end
+			if npcKnockedOut(model) then ok = true reason = "knocked out" break end
+			local r = charRoot()
+			if not r then reason = "character lost" break end
+			torso = model:FindFirstChild("UpperTorso")
+				or model:FindFirstChild("Torso")
+				or model:FindFirstChild("HumanoidRootPart")
+				or partOf(model)
+			if not torso then reason = "npc lost its body parts" break end
+			r.CFrame = CFrame.lookAt(r.Position, torso.Position)
+			if cam then
+				cam.CameraType = Enum.CameraType.Scriptable
+				cam.CFrame = CFrame.lookAt(r.Position + Vector3.new(0, 2, 0), torso.Position)
+			end
+			if not punchClear(model, torso, cam and cam.CFrame.Position or r.Position + Vector3.new(0, 2, 0)) then
+				reason = "no clear line of sight"
+				break
+			end
+			local targetPart = torso
+			if aim then
+				local aOk, aimed = pcall(aim.target, 9, { players = true })
+				if aOk and aimed and aimed:IsDescendantOf(model) then
+					targetPart = aimed
+				end
+			end
+			local pOk = pcall(function() Remotes.Punch:FireServer(targetPart) end)
+			punches = punches + 1
+			if not pOk then reason = "punch remote failed" break end
+			task.wait(0.55)
+			local nowPunches = punchCount()
+			if nowPunches <= lastPunches then
+				rejected = rejected + 1
+			else
+				rejected = 0
+			end
+			lastPunches = nowPunches
+			-- the server ignores punches from a stale position. two ignored
+			-- swings in a row means retrying just alerts the npc for nothing.
+			if rejected >= 2 then
+				reason = "server rejected the punch (range / line of sight)"
+				break
+			end
+		end
+		if not ok then
+			if npcKnockedOut(model) then ok = true reason = "knocked out" end
+			local h = model:FindFirstChildOfClass("Humanoid")
+			if h and h.Health <= 0 then ok = true reason = "dead" end
+		end
+	end)
+	if not callOk then reason = tostring(callErr) end
+	restoreCam()
+	knockoutBusy = false
+	knockoutCurrent = nil
+	if not ok then failedKnockAt[model] = now() end
+	if not silent then
+		local name = tostring(model:GetAttribute("DisplayName") or model.Name)
+		if ok then
+			notify(string.format("knockout: %s down after %d punch%s (%s)", name, punches, punches == 1 and "" or "es", reason))
+		elseif now() - lastKnockoutNotice > 6 then
+			lastKnockoutNotice = now()
+			notify("knockout failed on " .. name .. ": " .. tostring(reason))
+		end
+	end
+	return ok, reason, punches
+end
+
+local function knockoutNearest()
+	if hauling or grabbing then return false, "finish the current action first" end
+	local targets = knockoutTargets(tonumber(CFG.knockoutRadius) or 25)
+	if #targets == 0 then return false, "no npc in range" end
+	return knockoutNpc(targets[1].model, false, true)
+end
+
+local function autoKnockoutStep()
+	if dead or not CFG.autoKnockout or knockoutBusy or escaping then return end
+	if hauling or grabbing then return end
+	local radius = math.clamp(tonumber(CFG.knockoutRadius) or 25, 5, 200)
+	local targets = knockoutTargets(radius)
+	local pick = nil
+	for _, target in ipairs(targets) do
+		local failedAt = failedKnockAt[target.model]
+		if not failedAt or now() - failedAt > 20 then
+			pick = target
+			break
+		end
+	end
+	if not pick then return end
+	knockoutNpc(pick.model, true, false)
+end
+
+--// auto escape ----------------------------------------------------------------
+
+local function policeNear(radius)
+	local root = charRoot()
+	if not root then return nil end
+	local folder = workspace:FindFirstChild("Police")
+	if not folder then return nil end
+	radius = math.clamp(tonumber(radius) or 60, 10, 300)
+	local best, bestDist = nil, nil
+	for _, model in ipairs(folder:GetChildren()) do
+		if model:IsA("Model") then
+			local hum = model:FindFirstChildOfClass("Humanoid")
+			local part = model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart
+			if hum and hum.Health > 0 and part then
+				local d = (part.Position - root.Position).Magnitude
+				if d <= radius and (not bestDist or d < bestDist) then
+					best, bestDist = model, d
+				end
+			end
+		end
+	end
+	return best, bestDist
+end
+
+local function escapeToHideout()
+	local target = findHideout()
+	if not target then return false, "hideout not found" end
+	haulStop = true
+	local ok, err = stepTeleport(target.Position)
+	if ok then
+		notify("escaped to the hideout")
+	else
+		notify("escape failed: " .. tostring(err))
+	end
+	return ok
+end
+
+--// sell now ------------------------------------------------------------------
+
+local function sellNow()
+	if findHeldLoot() then
+		return false, "still holding loot - load it into the truck first"
+	end
+	local target = findSellLever() or findSellBox()
+	if not target then return false, "sell box / lever not found" end
+	local ok, err = stepTeleport(target.Position)
+	if not ok then return false, tostring(err) end
+	task.wait(0.8)
+	return fireNearest(isSellPrompt, "sell")
+end
+
 --// teleport to selected -------------------------------------------------------
 
 local function teleportToPlayer(name)
@@ -24894,6 +25395,68 @@ local function rejoin()
 	end)
 end
 
+--// max mode preset -------------------------------------------------------------
+
+local function maxMode()
+	if dead then return end
+	CFG.lootEsp = true
+	CFG.autoGrab = true
+	CFG.autoLoad = true
+	CFG.autoHaul = true
+	CFG.autoHaulDelay = 20
+	CFG.haulRadius = 250
+	CFG.haulLimit = 25
+	CFG.autoKnockout = true
+	CFG.knockoutRadius = 20
+	CFG.knockoutPunches = 6
+	CFG.autoEscape = true
+	CFG.autoEscapeRadius = 50
+	CFG.autoDoors = true
+	CFG.autoDoorsRadius = 60
+	CFG.customSpeed = true
+	CFG.walkSpeed = 60
+	CFG.speedGuard = true
+	CFG.speedNoCap = false
+	CFG.infiniteStamina = true
+	CFG.noclip = true
+	CFG.fullbright = true
+	CFG.noFog = true
+	CFG.fovOn = true
+	CFG.fov = 90
+
+	if ui.window then
+		for _, flag in ipairs({
+			"crim_lootesp", "crim_autograb", "crim_autoload",
+			"crim_autohaul", "crim_autoknock", "crim_autoescape", "crim_autodoors",
+			"crim_speed", "crim_infstam", "crim_noclip",
+			"crim_fullbright", "crim_nofog", "crim_fovon",
+		}) do
+			pcall(function() ui.window:Set(flag, true) end)
+		end
+		for flag, value in pairs({
+			crim_haulradius = 250,
+			crim_haullimit = 25,
+			crim_autohauldelay = 20,
+			crim_knockradius = 20,
+			crim_knockpunches = 6,
+			crim_escaperadius = 50,
+			crim_doorradius = 60,
+			crim_ws = 60,
+			crim_fov = 90,
+		}) do
+			pcall(function() ui.window:Set(flag, value) end)
+		end
+	end
+
+	pcall(startSpeed)
+	pcall(applyFullbright)
+	pcall(applyNoFog)
+	pcall(staminaTick)
+	local cam = workspace.CurrentCamera
+	if cam then cam.FieldOfView = 90 end
+	notify("MAX MODE: loot esp, auto grab/load, auto haul (25 max, 250m), auto knockout, auto escape, auto doors, speed 60, stamina, noclip, fullbright, no fog, fov 90. fly stays as-is.")
+end
+
 --// panic / shutdown ------------------------------------------------------------
 
 local function hideEverything()
@@ -24908,6 +25471,8 @@ local function shutdown()
 	if dead then return end
 	dead = true
 	haulStop = true
+	knockoutStop = true
+	stopFly()
 	stopSpeed()
 	stopJump()
 	restoreMovement()
@@ -24932,9 +25497,15 @@ end
 panic = function()
 	if dead then return end
 	haulStop = true
+	knockoutStop = true
 	CFG.lootEsp = false
 	CFG.autoGrab = false
 	CFG.autoLoad = false
+	CFG.autoHaul = false
+	CFG.autoKnockout = false
+	CFG.autoEscape = false
+	CFG.autoDoors = false
+	CFG.fly = false
 	CFG.autoRob = false
 	CFG.npcEsp = false
 	CFG.npcTags = false
@@ -24949,6 +25520,7 @@ panic = function()
 	CFG.fullbright = false
 	CFG.noFog = false
 	CFG.fovOn = false
+	stopFly()
 	stopSpeed()
 	stopJump()
 	restoreMovement()
@@ -24960,10 +25532,12 @@ panic = function()
 	if ui.window then
 		for _, flag in ipairs({
 			"crim_lootesp", "crim_autograb", "crim_autoload", "crim_autorb",
+			"crim_autohaul", "crim_autoknock", "crim_autoescape", "crim_autodoors",
 			"crim_npcesp", "crim_npctags", "crim_npcdetails", "crim_pesp",
 			"crim_speed", "crim_infstam",
 			"crim_speednocap", "crim_jump",
 			"crim_infjump", "crim_noclip", "crim_fullbright", "crim_nofog", "crim_fovon",
+			"crim_fly",
 		}) do
 			pcall(function() ui.window:Set(flag, false) end)
 		end
@@ -25161,12 +25735,40 @@ local function buildUI()
 			refreshHaulInfo()
 		end,
 	})
+	lootTab:CreateSlider({
+		Name = "haul max items",
+		Description = "0 = every matching item. 25 is a good quick run.",
+		Range = { 0, 100 },
+		Increment = 5,
+		Value = CFG.haulLimit,
+		Suffix = " items",
+		Flag = "crim_haullimit",
+		Callback = function(v) CFG.haulLimit = v end,
+	})
+	lootTab:CreateToggle({
+		Name = "auto haul loop",
+		Description = "repeats the haul while it has targets. stops when panic, unload, death or stop haul is used.",
+		Flag = "crim_autohaul",
+		Value = CFG.autoHaul,
+		Callback = function(v) CFG.autoHaul = v end,
+	})
+	lootTab:CreateSlider({
+		Name = "auto haul delay",
+		Description = "wait between automatic hauls.",
+		Range = { 10, 300 },
+		Increment = 5,
+		Value = CFG.autoHaulDelay,
+		Suffix = " s",
+		Flag = "crim_autohauldelay",
+		Callback = function(v) CFG.autoHaulDelay = v end,
+	})
 	lootTab:CreateButton({
 		Name = "haul all items to truck",
 		Description = "teleports to each matching item, grabs it, teleports to the nearest truck and releases. stop haul aborts after the current item.",
 		Callback = function()
 			task.spawn(function()
-				local ok, err = pcall(haulAll)
+				local limit = tonumber(CFG.haulLimit) or 0
+				local ok, err = pcall(haulAll, limit > 0 and limit or nil)
 				if not ok then notify("haul error: " .. tostring(err)) end
 			end)
 		end,
@@ -25319,6 +25921,73 @@ local function buildUI()
 		Text = "details come from the model's own attributes and humanoid. state = the game's routine/post value. nothing is invented.",
 	})
 
+	worldTab:CreateSection({ Name = "AUTO KNOCKOUT  (PUNCH)" })
+	worldTab:CreateText({
+		Name = "knockout note",
+		Text = "uses the game's own Punch remote and stops early if the server ignores two swings. auto mode only punches an npc already within punch range (about 9 m) with a clear line of sight - it does not teleport, because the game pulls a long jump back before the punch lands. the manual button can step to the target once, but is still best effort. guards and police can react. pauses while a grab or haul is running.",
+	})
+	worldTab:CreateToggle({
+		Name = "auto knockout nearby",
+		Flag = "crim_autoknock",
+		Value = CFG.autoKnockout,
+		Callback = function(v) CFG.autoKnockout = v end,
+	})
+	worldTab:CreateSlider({
+		Name = "knockout radius",
+		Range = { 5, 200 },
+		Increment = 5,
+		Value = CFG.knockoutRadius,
+		Suffix = " m",
+		Flag = "crim_knockradius",
+		Callback = function(v) CFG.knockoutRadius = v end,
+	})
+	worldTab:CreateSlider({
+		Name = "max punches",
+		Range = { 1, 10 },
+		Increment = 1,
+		Value = CFG.knockoutPunches,
+		Suffix = " hits",
+		Flag = "crim_knockpunches",
+		Callback = function(v) CFG.knockoutPunches = v end,
+	})
+	worldTab:CreateButton({
+		Name = "knock out nearest  (best effort)",
+		Description = "steps to the nearest npc in range and punches until it goes down or the server rejects two swings.",
+		Callback = function()
+			task.spawn(function()
+				local ok, err = knockoutNearest()
+				if not ok then notify("knockout: " .. tostring(err)) end
+			end)
+		end,
+	})
+	ui.knockInfo = worldTab:CreateText({ Name = "knockout status", Text = "off" })
+
+	worldTab:CreateSection({ Name = "AUTO ESCAPE" })
+	worldTab:CreateToggle({
+		Name = "auto escape on police",
+		Description = "when a live police officer is inside the radius, stops the haul and teleports to the hideout. best effort; a teleport can still be seen or pulled back.",
+		Flag = "crim_autoescape",
+		Value = CFG.autoEscape,
+		Callback = function(v) CFG.autoEscape = v end,
+	})
+	worldTab:CreateSlider({
+		Name = "escape radius",
+		Range = { 20, 300 },
+		Increment = 10,
+		Value = CFG.autoEscapeRadius,
+		Suffix = " m",
+		Flag = "crim_escaperadius",
+		Callback = function(v) CFG.autoEscapeRadius = v end,
+	})
+	worldTab:CreateButton({
+		Name = "escape to hideout now",
+		Callback = function()
+			local ok, err = escapeToHideout()
+			if not ok then notify("escape: " .. tostring(err)) end
+		end,
+	})
+	ui.escapeInfo = worldTab:CreateText({ Name = "escape status", Text = "off" })
+
 	worldTab:CreateSection({ Name = "PROMPT SNIPER" })
 	worldTab:CreateText({
 		Name = "how it works",
@@ -25363,6 +26032,22 @@ local function buildUI()
 		Value = CFG.autoRob,
 		Callback = function(v) CFG.autoRob = v end,
 	})
+	worldTab:CreateToggle({
+		Name = "auto open nearby doors",
+		Description = "fires enabled Open / Climb Through prompts around you with a per-prompt cooldown. helps with loot inside houses.",
+		Flag = "crim_autodoors",
+		Value = CFG.autoDoors,
+		Callback = function(v) CFG.autoDoors = v end,
+	})
+	worldTab:CreateSlider({
+		Name = "door sweep radius",
+		Range = { 15, 150 },
+		Increment = 5,
+		Value = CFG.autoDoorsRadius,
+		Suffix = " m",
+		Flag = "crim_doorradius",
+		Callback = function(v) CFG.autoDoorsRadius = v end,
+	})
 	ui.promptInfo = worldTab:CreateText({ Name = "last sweep", Text = "-" })
 
 	worldTab:CreateSection({ Name = "TRAVEL" })
@@ -25377,6 +26062,16 @@ local function buildUI()
 	worldTab:CreateButton({
 		Name = "sell lever  (truck must be home)",
 		Callback = function() teleportTo(findSellLever(), "sell lever", Vector3.new(0, 3, 0)) end,
+	})
+	worldTab:CreateButton({
+		Name = "sell now  (truck must be home)",
+		Description = "teleports to the hideout sell lever/box and fires the game's own Sell prompt. send the truck home first if it is out.",
+		Callback = function()
+			task.spawn(function()
+				local ok, err = sellNow()
+				notify(ok and "fired the sell prompt" or ("sell failed: " .. tostring(err)))
+			end)
+		end,
 	})
 	worldTab:CreateButton({
 		Name = "chop shop",
@@ -25584,6 +26279,28 @@ local function buildUI()
 		end,
 	})
 
+	moveTab:CreateSection({ Name = "FLY  (CLIENT-SIDE)" })
+	moveTab:CreateToggle({
+		Name = "fly",
+		Description = "client-side body velocity. WASD moves, Space goes up, LeftControl goes down. the server can still pull or kick a flying character; that part is not promised.",
+		Flag = "crim_fly",
+		Value = CFG.fly,
+		Callback = function(v)
+			CFG.fly = v
+			if v then startFly() else stopFly() end
+		end,
+	})
+	moveTab:CreateSlider({
+		Name = "fly speed",
+		Range = { 10, 300 },
+		Increment = 10,
+		Value = CFG.flySpeed,
+		Suffix = " ws",
+		Flag = "crim_flyspeed",
+		Callback = function(v) CFG.flySpeed = v end,
+	})
+	ui.flyInfo = moveTab:CreateText({ Name = "fly status", Text = "off" })
+
 	-- VISUALS (kept inside MOVEMENT so the tab bar stays five wide)
 	local visTab = moveTab
 	moveTab:CreateSection({ Name = "VISUALS" })
@@ -25632,6 +26349,16 @@ local function buildUI()
 			if ui.status then pcall(function() ui.status:Set(statusText()) end) end
 			notify("status refreshed")
 		end,
+	})
+	statusTab:CreateSection({ Name = "PRESETS" })
+	statusTab:CreateButton({
+		Name = "MAX MODE  (loot + haul + knockout + escape)",
+		Description = "enables loot esp, auto grab/load, auto haul (25 items, 250 m), auto knockout, auto escape, auto doors, 60 ws strength, infinite stamina, noclip, fullbright, no fog and 90 fov.",
+		Callback = function() maxMode() end,
+	})
+	statusTab:CreateText({
+		Name = "max mode note",
+		Text = "max mode is a stack of the same best-effort features. it does not grant cash or quota, and fly is left off because it fights the teleport haul. press P to turn everything off.",
 	})
 	statusTab:CreateSection({ Name = "SESSION" })
 	statusTab:CreateButton({
@@ -25734,6 +26461,39 @@ local function tick()
 				))
 			end)
 		end
+		if ui.knockInfo then
+			local targets = knockoutTargets(tonumber(CFG.knockoutRadius) or 25)
+			local near = targets[1]
+			local mode = "off"
+			if knockoutBusy then
+				mode = "working"
+			elseif CFG.autoKnockout then
+				mode = "armed"
+			end
+			pcall(function()
+				ui.knockInfo:Set(string.format(
+					"%s  |  %d npc in range  |  nearest %s",
+					mode,
+					#targets,
+					near and (near.name .. " @ " .. math.floor(near.dist) .. "m") or "-"
+				))
+			end)
+		end
+		if ui.escapeInfo then
+			local police, dist = policeNear(tonumber(CFG.autoEscapeRadius) or 60)
+			pcall(function()
+				ui.escapeInfo:Set(CFG.autoEscape
+					and (police and string.format("ARMED - police %.0fm", dist) or "armed - no police in range")
+					or "off")
+			end)
+		end
+		if ui.flyInfo then
+			pcall(function()
+				ui.flyInfo:Set(CFG.fly
+					and string.format("on  |  %d ws", math.floor((tonumber(CFG.flySpeed) or 80) + 0.5))
+					or "off")
+			end)
+		end
 		if ui.logText then pcall(function() ui.logText:Set(#log > 0 and table.concat(log, "\n") or "-") end) end
 	end
 	if t - lastSave > 4 then
@@ -25771,6 +26531,7 @@ ui.loopConn = RunService.Heartbeat:Connect(function()
 end)
 
 ui.charConn = LP.CharacterAdded:Connect(function()
+	stopFly()
 	stopSpeed()
 	jumpConn = nil
 	baseWalk = nil
@@ -25781,6 +26542,7 @@ ui.charConn = LP.CharacterAdded:Connect(function()
 	if CFG.customSpeed then startSpeed() end
 	if CFG.customJump then startJump() end
 	if CFG.infiniteStamina then staminaTick() end
+	if CFG.fly then startFly() end
 	if not hauling then pcall(refreshHaulInfo) end
 end)
 
@@ -25796,6 +26558,17 @@ task.spawn(function()
 				pcall(function() ui.promptInfo:Set(string.format("auto rob: %d fired, %d cooling down", fired, skipped)) end)
 			end
 		end
+		if CFG.autoDoors then
+			local fired, skipped = fireNearbyMatching(
+				isOpenPrompt,
+				tonumber(CFG.autoDoorsRadius) or 60,
+				8,
+				"auto doors"
+			)
+			if fired > 0 and ui.promptInfo then
+				pcall(function() ui.promptInfo:Set(string.format("auto doors: %d fired, %d cooling down", fired, skipped)) end)
+			end
+		end
 		task.wait(3)
 	end
 end)
@@ -25807,6 +26580,62 @@ task.spawn(function()
 			if not ok then warn("[CRIMINAL] auto grab error: " .. tostring(err)) end
 		end
 		task.wait(1.2)
+	end
+end)
+
+task.spawn(function()
+	while not dead do
+		if CFG.autoHaul and not hauling and not grabbing and not knockoutBusy and not escaping then
+			local delay = math.clamp(tonumber(CFG.autoHaulDelay) or 30, 10, 300)
+			if now() - lastAutoHaulAt >= delay then
+				local radius = math.clamp(tonumber(CFG.haulRadius) or 250, 25, 2000)
+				if #haulTargets(radius) > 0 then
+					lastAutoHaulAt = now()
+					local limit = tonumber(CFG.haulLimit) or 0
+					local ok, err = pcall(haulAll, limit > 0 and limit or nil)
+					if not ok then notify("auto haul error: " .. tostring(err)) end
+				else
+					lastAutoHaulAt = now()
+				end
+			end
+		end
+		task.wait(1)
+	end
+end)
+
+task.spawn(function()
+	while not dead do
+		if CFG.autoKnockout then
+			local ok, err = pcall(autoKnockoutStep)
+			if not ok then warn("[CRIMINAL] auto knockout error: " .. tostring(err)) end
+		end
+		task.wait(0.9)
+	end
+end)
+
+task.spawn(function()
+	while not dead do
+		if CFG.autoEscape and not escaping then
+			if hauling or grabbing then
+				haulStop = true
+			else
+				local police, dist = policeNear(tonumber(CFG.autoEscapeRadius) or 60)
+				if police then
+					escaping = true
+					knockoutStop = true
+					local waited = 0
+					while knockoutBusy and waited < 1.5 and not dead do
+						task.wait(0.1)
+						waited = waited + 0.1
+					end
+					notify(string.format("police %.0fm - escaping to hideout", dist or 0))
+					pcall(escapeToHideout)
+					task.wait(2)
+					escaping = false
+				end
+			end
+		end
+		task.wait(0.7)
 	end
 end)
 
@@ -25827,6 +26656,14 @@ _G.CriminalPanel = {
 	drop = dropHeld,
 	haul = haulAll,
 	haulCount = function() return #haulTargets(tonumber(CFG.haulRadius) or 250) end,
+	knockout = knockoutNpc,
+	knockoutNearest = knockoutNearest,
+	knockoutCount = function() return #knockoutTargets(tonumber(CFG.knockoutRadius) or 25) end,
+	escape = escapeToHideout,
+	sell = sellNow,
+	maxMode = maxMode,
+	flyOn = startFly,
+	flyOff = stopFly,
 	stop = shutdown,
 	panic = panic,
 	teleport = stepTeleport,
@@ -25836,7 +26673,7 @@ _G.CriminalPanel = {
 	npcDump = npcDetailDump,
 }
 
-print("[CRIMINAL] panel loaded - loot esp, haul to truck, npc details, prompt sniper, stamina, speed guard, movement")
+print("[CRIMINAL] panel loaded - loot esp, haul to truck, auto knockout, auto escape, fly, npc details, prompt sniper, stamina, speed guard, movement")
 end
 
 --// dispatch -------------------------------------------------------------------
