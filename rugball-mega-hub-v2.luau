@@ -19553,10 +19553,18 @@ local function fightTick(m)
 		local impact = strikeImpactIn(m)
 
 		if guardPulse > 0 then
-			guardPulse = guardPulse - 1
-			setBlock(false)
-			guardHeld = 0
-		elseif guardHeld >= 1.25 and (impact == nil or impact > 0.09) then
+			if impact == 0 then
+				-- a strike reached its extend while the guard was down: abort
+				-- the reset and start ramping blockAmt for the next one.
+				guardPulse = 0
+				setBlock(true)
+				guardHeld = 0.9
+			else
+				guardPulse = guardPulse - 1
+				setBlock(false)
+				guardHeld = 0
+			end
+		elseif guardHeld >= 1.25 and (impact == nil or impact > 0.13) then
 			-- the game punishes a held guard: blockHold past 1.5 s drags the
 			-- block roll from 0.78 toward 0.23. three ticks below the 0.55
 			-- threshold reset it, so only drop it when nothing is landing.
