@@ -23018,6 +23018,7 @@ for k, v in pairs({
 	lootMaxLabels = 90,
 	lootHideHeld = true,
 	lootOnlyLiftable = true,
+	maxStrength = false,
 	autoGrab = false,
 	autoLoad = false,
 	grabRadius = 500,
@@ -23328,7 +23329,73 @@ local function heldByMe(item)
 	return h ~= nil and tostring(h) == tostring(LP.UserId)
 end
 
+-- max strength: the game's Lifter upgrade caps at level 2 and the heaviest
+-- loot in the catalog is weight 3, so level 2 lifts everything. Strong Back
+-- is the gamepass that stops heavy loot slowing you; the game's own
+-- SprintClient reads both attributes. Setting them locally only changes the
+-- client - the server still owns the real purchase and can reject a grab.
+local strength = {
+	baseLifter = nil,
+	baseStrong = nil,
+	bumpedLifter = false,
+	setStrong = false,
+	lastCheck = 0,
+}
+
+function strength.apply()
+	if dead or not CFG.maxStrength then return end
+	local lifter = tonumber(LP:GetAttribute("Shop_Lifter")) or 0
+	if lifter < 2 then
+		if not strength.bumpedLifter then
+			strength.baseLifter = LP:GetAttribute("Shop_Lifter")
+		end
+		pcall(function() LP:SetAttribute("Shop_Lifter", 2) end)
+		strength.bumpedLifter = true
+	end
+	local strong = tonumber(LP:GetAttribute("Shop_StrongBack")) or 0
+	if strong < 1 then
+		if not strength.setStrong then
+			strength.baseStrong = LP:GetAttribute("Shop_StrongBack")
+		end
+		pcall(function() LP:SetAttribute("Shop_StrongBack", 1) end)
+		strength.setStrong = true
+	end
+end
+
+function strength.restore()
+	if strength.bumpedLifter and (tonumber(LP:GetAttribute("Shop_Lifter")) or 0) == 2 then
+		pcall(function() LP:SetAttribute("Shop_Lifter", strength.baseLifter) end)
+	end
+	if strength.setStrong and (tonumber(LP:GetAttribute("Shop_StrongBack")) or 0) == 1 then
+		pcall(function() LP:SetAttribute("Shop_StrongBack", strength.baseStrong) end)
+	end
+	strength.baseLifter = nil
+	strength.baseStrong = nil
+	strength.bumpedLifter = false
+	strength.setStrong = false
+end
+
+function strength.set(on)
+	if dead then return CFG.maxStrength end
+	CFG.maxStrength = on and true or false
+	if CFG.maxStrength then
+		strength.apply()
+	else
+		strength.restore()
+	end
+	return CFG.maxStrength
+end
+
+function strength.tick()
+	if not CFG.maxStrength then return end
+	local t = os.clock()
+	if t - strength.lastCheck < 1 then return end
+	strength.lastCheck = t
+	strength.apply()
+end
+
 local function liftable(item)
+	if CFG.maxStrength then return true end
 	local w = tonumber(item:GetAttribute("Weight")) or 1
 	if item:GetAttribute("AnyoneLifts") == true then return true end
 	if w < 2 then return true end
@@ -24664,6 +24731,7 @@ local function statusText()
 		"debt        " .. money(debt),
 		"difficulty  " .. tostring(diff) .. "   " .. tostring(mode),
 		"carrying    " .. heldText,
+		"lifter      " .. tostring(LP:GetAttribute("Shop_Lifter") or 0) .. " / 2" .. (CFG.maxStrength and "  MAX" or ""),
 		"truck       " .. cargoText,
 	}, "\n")
 end
@@ -25662,6 +25730,7 @@ end
 local function maxMode()
 	if dead then return end
 	CFG.lootEsp = true
+	CFG.maxStrength = true
 	CFG.autoGrab = true
 	CFG.autoLoad = true
 	CFG.autoHaul = true
@@ -25693,7 +25762,7 @@ local function maxMode()
 
 	if ui.window then
 		for _, flag in ipairs({
-			"crim_lootesp", "crim_autograb", "crim_autoload",
+			"crim_lootesp", "crim_maxstrength", "crim_autograb", "crim_autoload",
 			"crim_autohaul", "crim_autoknock", "crim_autoescape", "crim_autodoors",
 			"crim_antidetect", "crim_sightcones", "crim_sightwarn",
 			"crim_speed", "crim_infstam", "crim_noclip",
@@ -25719,12 +25788,13 @@ local function maxMode()
 	end
 
 	pcall(startSpeed)
+	pcall(strength.apply)
 	pcall(applyFullbright)
 	pcall(applyNoFog)
 	pcall(staminaTick)
 	local cam = workspace.CurrentCamera
 	if cam then cam.FieldOfView = 90 end
-	notify("MAX MODE: loot esp, auto grab/load, auto haul (25 max, 250m), auto knockout, auto escape, auto doors, anti-detect sneak + sight cones, speed 60, stamina, noclip, fullbright, no fog, fov 90. fly stays as-is.")
+	notify("MAX MODE: loot esp, max strength, auto grab/load, auto haul (25 max, 250m), auto knockout, auto escape, auto doors, anti-detect sneak + sight cones, speed 60, stamina, noclip, fullbright, no fog, fov 90. fly stays as-is.")
 end
 
 --// panic / shutdown ------------------------------------------------------------
@@ -25748,6 +25818,7 @@ local function shutdown()
 	stopJump()
 	restoreMovement()
 	restoreStamina()
+	pcall(strength.restore)
 	if jumpRequestConn then pcall(function() jumpRequestConn:Disconnect() end) end
 	if ui.loopConn then pcall(function() ui.loopConn:Disconnect() end) end
 	if ui.keyConn then pcall(function() ui.keyConn:Disconnect() end) end
@@ -25771,6 +25842,7 @@ panic = function()
 	haulStop = true
 	knockoutStop = true
 	CFG.lootEsp = false
+	CFG.maxStrength = false
 	CFG.autoGrab = false
 	CFG.autoLoad = false
 	CFG.autoHaul = false
@@ -25802,13 +25874,14 @@ panic = function()
 	stopJump()
 	restoreMovement()
 	restoreStamina()
+	pcall(strength.restore)
 	restoreNoclip()
 	restoreVisuals()
 	hideEverything()
 	npcDetailTeardown()
 	if ui.window then
 		for _, flag in ipairs({
-			"crim_lootesp", "crim_autograb", "crim_autoload", "crim_autorb",
+			"crim_lootesp", "crim_maxstrength", "crim_autograb", "crim_autoload", "crim_autorb",
 			"crim_autohaul", "crim_autoknock", "crim_autoescape", "crim_autodoors",
 			"crim_antidetect", "crim_sightcones", "crim_sightwarn",
 			"crim_npcesp", "crim_npctags", "crim_npcdetails", "crim_pesp",
@@ -25914,6 +25987,13 @@ local function buildUI()
 		Flag = "crim_lootlift",
 		Value = CFG.lootOnlyLiftable,
 		Callback = function(v) CFG.lootOnlyLiftable = v end,
+	})
+	lootTab:CreateToggle({
+		Name = "max strength",
+		Description = "locks local Lifter to 2 (the game's max, enough for every weight-3 item) and turns on Strong Back locally so heavy loot no longer slows you. client-side only: the server still owns the real upgrade and can reject a grab if your actual Lifter is too low.",
+		Flag = "crim_maxstrength",
+		Value = CFG.maxStrength,
+		Callback = function(v) strength.set(v) end,
 	})
 
 	lootTab:CreateSection({ Name = "GRAB  (BEST EFFORT)" })
@@ -26748,6 +26828,7 @@ local function tick()
 
 	pcall(stealth.sneakTick)
 	pcall(stealth.sightConeTick)
+	pcall(strength.tick)
 
 	if CFG.npcDetails then
 		pcall(npcDetailTick)
@@ -26881,6 +26962,10 @@ if CFG.npcDetails then
 	pcall(npcDetailBuild)
 end
 
+if CFG.maxStrength then
+	pcall(strength.apply)
+end
+
 if ui.window then
 	local conn = UserInputService.InputBegan:Connect(function(input, gp)
 		if gp then return end
@@ -26916,6 +27001,7 @@ ui.charConn = LP.CharacterAdded:Connect(function()
 	if CFG.customSpeed then startSpeed() end
 	if CFG.customJump then startJump() end
 	if CFG.infiniteStamina then staminaTick() end
+	if CFG.maxStrength then strength.apply() end
 	if CFG.fly then startFly() end
 	if not hauling then pcall(refreshHaulInfo) end
 end)
@@ -27051,6 +27137,8 @@ _G.CriminalPanel = {
 		return n
 	end,
 	maxMode = maxMode,
+	maxStrength = strength.set,
+	lifter = function() return tonumber(LP:GetAttribute("Shop_Lifter")) or 0 end,
 	flyOn = startFly,
 	flyOff = stopFly,
 	stop = shutdown,
