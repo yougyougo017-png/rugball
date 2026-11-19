@@ -17597,6 +17597,7 @@ for k, v in pairs({
 	aggro = 60,
 	staminaFloor = 20,
 	strikeStyle = "smart",
+	safeKicks = true,
 	fightStyle = "best owned",
 	spinCount = 10,
 	spinStopRare = true,
@@ -18477,6 +18478,7 @@ local BEST = {
 	autoMaster = true,
 	aimZone = "head",
 	strikeStyle = "smart",
+	safeKicks = true,
 	aggro = 72,
 	staminaFloor = 16,
 	retreatStamina = 30,
@@ -18525,6 +18527,7 @@ local function pushFlags()
 		ui.window:Set("mma_autoMaster", CFG.autoMaster)
 		ui.window:Set("mma_aimZone", CFG.aimZone)
 		ui.window:Set("mma_strikeStyle", CFG.strikeStyle)
+		ui.window:Set("mma_safeKicks", CFG.safeKicks)
 		ui.window:Set("mma_aggro", CFG.aggro)
 		ui.window:Set("mma_staminaFloor", CFG.staminaFloor)
 		ui.window:Set("mma_retreatStamina", CFG.retreatStamina)
@@ -18730,52 +18733,123 @@ local function canThrow(f, move)
 	return true
 end
 
-local function pickStrike(m, dist, reach)
+-- the game measures reach from the root as arm reach plus a body allowance; its
+-- own AI uses d.reach + 0.75 * s + reachBonus. anything inside that is punch
+-- range, whatever the swing looks like.
+local function armReach(f)
+	if not f then return 0 end
+	local d = f.d
+	local base = (d and tonumber(d.reach)) or 2.27
+	return base + 0.75 * (tonumber(f.s) or 1) + (tonumber(f.reachBonus) or 0)
+end
+
+local function strikePhase(st)
+	local def = st and (st.def or strikeDef(st.kind))
+	if not def then return nil end
+	local speed = math.max(0.1, tonumber(st.speed) or 1)
+	local t = tonumber(st.t) or 0
+	local windup = (def.windup or 0.1) / speed
+	local extend = (def.extend or 0.12) / speed
+	local hold = (def.hold or 0.05) / speed
+	local retract = (def.retract or 0.2) / speed
+	if t < windup then return "windup" end
+	if t < windup + extend then return "extend" end
+	if t < windup + extend + hold then return "hold" end
+	if t < windup + extend + hold + retract then return "retract" end
+	return "done"
+end
+
+-- Fighter sets blockAmt to 0 while isStriking(), so a kick started inside the
+-- opponent's punch range is a free counter for them. only kick when they cannot
+-- answer with a punch: their leg strike is out (canStart refuses every punch
+-- while strikes.leg exists), their body is hurt enough to lose the action, or
+-- they are outside arm reach and have to step in first.
+local function kickWindow(m, dist)
+	local o = m and m.opp
+	if not o then return false end
+	if o.down or (o.rig and o.rig.ragdolled) or o.mode ~= "fight" or o.shot or o.clinch then return false end
+	if (tonumber(o.bodyHurtT) or 0) > 0.3 then return true end
+	local strikes = o.strikes
+	if type(strikes) == "table" then
+		local leg = strikes.leg
+		if leg then
+			local phase = strikePhase(leg)
+			if phase == "hold" or phase == "retract" or phase == "done" then return true end
+			return false
+		end
+	end
+	return dist > armReach(o) + 0.4 * (tonumber(o.s) or 1)
+end
+
+local function pickStrike(m, dist, reach, threat)
 	local o = m.opp
 	local p = m.player
 	local style = CFG.strikeStyle
 	local stamina = p.stamina
+	local safeKick = true
+	if CFG.safeKicks then
+		safeKick = (not threat) and kickWindow(m, dist)
+	end
+	local canKick = safeKick and dist <= reach * 1.30
 
-	if style == "jab" then return "jab" end
+	if style == "jab" then
+		if dist <= reach then return "jab" end
+		return nil
+	end
 
 	local rocked = (o.rockedT or 0) > 0
 	local gas = o.stamina < 30
 
 	if style == "smart" then
-		if stamina < 26 then return "jab" end
+		if stamina < 26 then
+			if dist <= reach then return "jab" end
+			return nil
+		end
 		if rocked then
-			if stamina >= 11 and dist > reach * 0.55 then return "rkick" end
-			if stamina >= 4.6 then return "rhook" end
+			if stamina >= 11 and canKick and dist > reach * 0.55 then return "rkick" end
+			if dist <= reach and stamina >= 4.6 then return "rhook" end
+			if dist <= reach then return "jab" end
+			return nil
 		end
-		if gas and stamina >= 6.5 and dist > reach * 0.5 then return "lkick" end
 		if dist > reach * 0.82 then
-			if stamina >= 8 and math.random() < 0.45 then return "rkick" end
-			if stamina >= 6.5 and math.random() < 0.5 then return "lkick" end
-			return "jab"
+			if canKick and stamina >= 8 and math.random() < 0.45 then return "rkick" end
+			if canKick and stamina >= 6.5 and math.random() < 0.5 then return "lkick" end
+			if dist <= reach then return "jab" end
+			return nil
 		end
-		if dist < reach * 0.45 and stamina >= 20 and math.random() < 0.35 then return "knee" end
+		if gas and stamina >= 6.5 and canKick and dist > reach * 0.5 then return "lkick" end
+		if dist < reach * 0.45 and stamina >= 20 and canKick and math.random() < 0.35 then return "knee" end
 		local pool = { "jab", "cross", "jab", "cross", "lhook", "rhook", "jab", "cross" }
 		return pool[math.random(1, #pool)]
 	end
 
 	if style == "power" then
+		if dist > reach then return nil end
 		if stamina < 5 then return "jab" end
 		local pool = { "cross", "rhook", "lhook", "cross" }
 		return pool[math.random(1, #pool)]
 	end
 
 	if style == "kicks" then
-		if stamina < 8 then return "jab" end
-		local pool = { "lkick", "rkick", "lkick", "jab" }
-		return pool[math.random(1, #pool)]
+		if stamina >= 8 and canKick and dist > reach * 0.7 then
+			local pool = { "lkick", "rkick", "lkick", "jab" }
+			return pool[math.random(1, #pool)]
+		end
+		if dist <= reach then
+			local pool = { "jab", "cross", "jab" }
+			return pool[math.random(1, #pool)]
+		end
+		return nil
 	end
 
 	if style == "combo" then
+		if dist > reach then return nil end
 		local pool = { "jab", "cross", "jab", "cross", "lhook", "rhook" }
 		return pool[math.random(1, #pool)]
 	end
 
-	return "jab"
+	if dist <= reach then return "jab" end
+	return nil
 end
 
 -- any opponent strike in windup or extend, with the opponent close enough to matter.
@@ -18784,7 +18858,7 @@ local function incomingStrike(m)
 	local p = m.player
 	if not o or not p then return false, nil end
 	local dist = flat(o.pos - p.pos).Magnitude
-	local reach = (p.d and p.d.reach or 1.1) + 1.4 * (p.s or 1)
+	local reach = (p.d and p.d.reach or 2.27) + 1.4 * (p.s or 1)
 	if dist > reach then return false, nil end
 	local ok, strikes = pcall(function() return o.strikes end)
 	if not ok or type(strikes) ~= "table" then return false, nil end
@@ -18883,7 +18957,7 @@ local function fightTick(m)
 
 	local delta = flat(o.pos - p.pos)
 	local dist = delta.Magnitude
-	local reach = (p.d and p.d.reach or 1.1) + 0.75 * (p.s or 1)
+	local reach = (p.d and p.d.reach or 2.27) + 0.75 * (p.s or 1) + (tonumber(p.reachBonus) or 0)
 
 	-- read the fight: are they hurt enough to press, or are we too tired to trade
 	local headHp = (o.hp and o.hp.head) or 100
@@ -18898,6 +18972,11 @@ local function fightTick(m)
 	if gassed then
 		want = reach * 1.55          -- back out and breathe, let them walk onto a counter
 	end
+	if CFG.strikeStyle == "kicks" then
+		-- stand where the legs reach and the arms do not; safeKicks then has a
+		-- band it can actually use instead of kicking in the pocket
+		want = math.min(reach * 1.25, math.max(want, armReach(o) + 0.55 * (o.s or 1)))
+	end
 
 	local fwd, side = 0, 0
 	if dist > want + 0.05 then
@@ -18910,16 +18989,15 @@ local function fightTick(m)
 	side = math.sin(t * 1.3) * (gassed and 0.55 or 0.25)
 	setMove(Vector3.new(side, 0, fwd))
 
-	local threat = false
+	local threat = incomingStrike(m)
 	if autoOn("autoBlock") then
-		threat = incomingStrike(m)
+		setBlock(threat ~= false and not pressing)
 	end
-	setBlock(threat ~= false and not pressing)
 
 	local allowStrike = pressing or (not autoOn("autoBlock")) or (not threat) or (not autoOn("autoCounter"))
-	if allowStrike and not gassed and dist <= reach * 1.0 and now() - lastTry > 0.09 then
-		local move = pickStrike(m, dist, reach)
-		if canThrow(p, move) then
+	if allowStrike and not gassed and dist <= reach * 1.30 and now() - lastTry > 0.09 then
+		local move = pickStrike(m, dist, reach, threat)
+		if move and canThrow(p, move) then
 			lastTry = now()
 			strikeAt(m, move, CFG.aimZone)
 		end
@@ -19775,11 +19853,18 @@ local function buildUI()
 	})
 	fightTab:CreateDropdown({
 		name = "strike style",
-		description = "smart reacts to range, gas and rocked state; power spends stamina on hooks and crosses; kicks fights at range; combo is a steady boxing rhythm.",
+		description = "smart reacts to range, gas and rocked state; power spends stamina on hooks and crosses; kicks fights at range; combo is a steady boxing rhythm. safe kicks still applies when it is on.",
 		flag = "mma_strikeStyle",
 		options = { "smart", "combo", "power", "kicks", "jab" },
 		value = CFG.strikeStyle,
 		callback = function(v) CFG.strikeStyle = tostring(v) end,
+	})
+	fightTab:CreateToggle({
+		name = "safe kicks",
+		description = "only starts a kick when the opponent cannot answer with a punch: outside their arm reach, already mid-kick, or hurt. the game zeroes your guard while you strike, so a kick thrown inside their punch range is a free counter.",
+		flag = "mma_safeKicks",
+		value = CFG.safeKicks,
+		callback = function(v) CFG.safeKicks = v end,
 	})
 	fightTab:CreateSlider({
 		name = "aggression",
@@ -20460,6 +20545,24 @@ _G.RagdollMmaPanel = {
 		if match then return strikeAt(match, move or "jab", CFG.aimZone) end
 		return false
 	end,
+	combat = {
+		kickWindow = function(dist, opp)
+			local o = opp or (match and match.opp)
+			if not o then return false end
+			if not dist then
+				if not match or not match.player then return false end
+				dist = flat(match.opp.pos - match.player.pos).Magnitude
+			end
+			return kickWindow({ opp = o }, dist)
+		end,
+		pick = function()
+			if not match or not match.player or not match.opp then return nil end
+			local p = match.player
+			local dist = flat(match.opp.pos - p.pos).Magnitude
+			local reach = (p.d and p.d.reach or 2.27) + 0.75 * (p.s or 1) + (tonumber(p.reachBonus) or 0)
+			return pickStrike(match, dist, reach, incomingStrike(match))
+		end,
+	},
 	instantKO = instantKO,
 	instantWin = instantWin,
 	restoreRage = restoreRage,
