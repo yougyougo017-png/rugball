@@ -19128,6 +19128,37 @@ local function incomingStrike(m)
 	return false, nil
 end
 
+-- seconds until the opponent's next live strike reaches its extend phase.
+-- 0 means one is extending right now, nil means nothing is coming.
+local function strikeImpactIn(m)
+	local o = m and m.opp
+	if not o then return nil end
+	local ok, strikes = pcall(function() return o.strikes end)
+	if not ok or type(strikes) ~= "table" then return nil end
+	local best = nil
+	for _, st in pairs(strikes) do
+		if type(st) == "table" then
+			local def = st.def or strikeDef(st.kind)
+			if def then
+				local speed = math.max(0.1, tonumber(st.speed) or 1)
+				local windup = (def.windup or 0.1) / speed
+				local extend = (def.extend or 0.12) / speed
+				local t = tonumber(st.t) or 0
+				local left = nil
+				if t < windup then
+					left = windup - t
+				elseif t < windup + extend + 0.02 then
+					left = 0
+				end
+				if left and (best == nil or left < best) then
+					best = left
+				end
+			end
+		end
+	end
+	return best
+end
+
 --// adaptive counter ------------------------------------------------------------
 -- classify the opponent's habits from the live fighter table. these are the same
 -- numbers the FIGHT tab exposes: dist is root-to-root, reach is the game's own
@@ -19433,6 +19464,12 @@ local lastSprawl = 0
 local lastSkip = 0
 local lastTakedown = 0
 local counterSpent = false
+-- guard posture: the game ramps blockAmt at damp 16, so a reactive block is
+-- already too late for a 1.3x-speed jab; and blockHold past 1.5 s drops the
+-- block roll from 0.78 to 0.23, so the guard has to be reset between strikes.
+local guardHeld = 0
+local guardPulse = 0
+local guardT = 0
 local function setMove(vec)
 	match.debugMove = vec
 	nextMoveClear = now() + 0.25
@@ -19503,7 +19540,40 @@ local function fightTick(m)
 
 	local threat = incomingStrike(m)
 	if autoOn("autoBlock") then
-		setBlock(threat ~= false and not pressing)
+		local tnow = now()
+		local dt = math.max(0, math.min(0.1, tnow - (guardT > 0 and guardT or tnow)))
+		guardT = tnow
+
+		-- hold the guard before the strike instead of after it: inside their
+		-- arm reach a fast jab winds up in two frames, and blockAmt only
+		-- counts above 0.55, which takes about three frames to ramp.
+		local pocket = dist <= armReach(o) + 0.6 * (tonumber(o.s) or 1)
+		local ready = o.mode == "fight" and not o.down and not o.shot and not o.clinch
+			and (tonumber(o.stamina) or 100) >= 8
+		local impact = strikeImpactIn(m)
+
+		if guardPulse > 0 then
+			guardPulse = guardPulse - 1
+			setBlock(false)
+			guardHeld = 0
+		elseif guardHeld >= 1.25 and (impact == nil or impact > 0.09) then
+			-- the game punishes a held guard: blockHold past 1.5 s drags the
+			-- block roll from 0.78 toward 0.23. three ticks below the 0.55
+			-- threshold reset it, so only drop it when nothing is landing.
+			guardPulse = 3
+			setBlock(false)
+			guardHeld = 0
+		else
+			local up = (not pressing) and ((threat ~= false) or (pocket and ready))
+			setBlock(up)
+			if up then
+				guardHeld = guardHeld + dt
+			else
+				guardHeld = 0
+			end
+		end
+	else
+		guardHeld, guardPulse, guardT = 0, 0, 0
 	end
 
 	local allowStrike = pressing or (not autoOn("autoBlock")) or (not threat) or (not autoOn("autoCounter"))
@@ -20438,7 +20508,7 @@ local function buildUI()
 	})
 	fightTab:CreateToggle({
 		name = "auto block",
-		description = "reads the opponent's live strike phases and holds Touch.block (the game's own guard state) through the windup and extend of anything in range.",
+		description = "holds Touch.block (the game's own guard) while the opponent is inside punching range, through every windup and extend, and drops it for three ticks between strikes to reset the game's guard fatigue. a reactive block is too late for 1.3x-speed hands.",
 		flag = "mma_autoBlock",
 		value = CFG.autoBlock,
 		callback = function(v) CFG.autoBlock = v end,
