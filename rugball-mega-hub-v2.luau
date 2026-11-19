@@ -17599,6 +17599,7 @@ for k, v in pairs({
 	strikeStyle = "smart",
 	safeKicks = true,
 	adaptive = true,
+	acBypass = true,
 	fightStyle = "best owned",
 	spinCount = 10,
 	spinStopRare = true,
@@ -17842,6 +17843,112 @@ end
 local notify = function(text)
 	print("[MMA] " .. tostring(text))
 end
+
+--// anti-cheat shield --------------------------------------------------------------
+-- place version 107 added ReplicatedStorage.ROFC.AntiCheat. the client only
+-- attaches it to ranked PvP bouts: at the bell it snapshots player.power,
+-- speedMul, strikeSpeed, chin, toughness and fstyle.mods, then every 0.5 s it
+-- restores anything that moved and cuts that fighter to 0.4x speed and 0.3x
+-- power for the rest of the fight. the auto fighter, safe kicks and the read
+-- never write those fields, so they are unaffected; RAGE is. this shield keeps
+-- the checker off matches that start while it is on, and strips it from a match
+-- already running. client-side only: a server-side check can still reject or
+-- nerf a boosted fighter.
+
+local AntiCheat = tryRequire("AntiCheat")
+local acAttachOriginal = AntiCheat and AntiCheat.attach
+local acShieldOn = false
+local acKilled = 0
+local acChecked = setmetatable({}, { __mode = "k" })
+
+local function acKillHeartbeat()
+	if not getconnections then return 0 end
+	local ok, conns = pcall(getconnections, RunService.Heartbeat)
+	if not ok or type(conns) ~= "table" then return 0 end
+	local n = 0
+	for _, c in ipairs(conns) do
+		local f = c.Function
+		local src = nil
+		if f and debug and debug.info then
+			local ok2, s = pcall(debug.info, f, "s")
+			if ok2 then src = tostring(s) end
+		end
+		if src and string.find(src, "AntiCheat", 1, true) then
+			pcall(function() c:Disconnect() end)
+			n = n + 1
+		end
+	end
+	return n
+end
+
+local function acCleanMatch(m)
+	if not m or acChecked[m] then return false end
+	acChecked[m] = true
+	local cleaned = false
+	for _, key in ipairs({ "netSend", "onNet", "netDriveRemote" }) do
+		local raw = rawget(m, key)
+		if raw then
+			local ok, src = pcall(debug.info, raw, "s")
+			if ok and string.find(tostring(src), "AntiCheat", 1, true) then
+				rawset(m, key, nil)
+				cleaned = true
+			end
+		end
+	end
+	if m.acMe and m.player then
+		-- attach already restored its snapshot, then multiplied. divide the
+		-- multiplier back out so the next rageTick starts from the real base.
+		local p = m.player
+		p.speedMul = (tonumber(p.speedMul) or 1) / 0.4
+		p.power = (tonumber(p.power) or 1) / 0.3
+		m.acMe = nil
+		cleaned = true
+	end
+	if m.acTold then
+		m.acTold = nil
+		cleaned = true
+	end
+	acKilled = acKilled + acKillHeartbeat()
+	return cleaned
+end
+
+local function acEnsure()
+	if not AntiCheat then
+		AntiCheat = tryRequire("AntiCheat")
+		acAttachOriginal = AntiCheat and AntiCheat.attach or nil
+	end
+	return AntiCheat ~= nil and type(acAttachOriginal) == "function"
+end
+
+local function setAcShield(on)
+	CFG.acBypass = on and true or false
+	if on then
+		if not acEnsure() then
+			acShieldOn = false
+			return false, "anti-cheat module not found"
+		end
+		AntiCheat.attach = function() end
+		acShieldOn = true
+		acKilled = acKilled + acKillHeartbeat()
+		acCleanMatch(match)
+		pushLog("anti-cheat shield on  |  ranked pvp checker skipped")
+	else
+		if AntiCheat and type(acAttachOriginal) == "function" then
+			AntiCheat.attach = acAttachOriginal
+			pushLog("anti-cheat shield off  |  next match is checked")
+		end
+		acShieldOn = false
+	end
+	return true
+end
+
+local function acStatusText()
+	if not AntiCheat then return "checker not present  |  shield idle" end
+	if CFG.acBypass then return "checker found  |  shield on  |  new ranked matches skip it" end
+	return "checker found  |  shield off  |  ranked matches use it"
+end
+
+pcall(setAcShield, CFG.acBypass)
 
 --// styles ----------------------------------------------------------------------
 -- ROFC.Styles is the read-only catalogue; ROFCRemotes.Styles is the server-owned
@@ -18697,6 +18804,8 @@ end
 local function adopt(m)
 	if match == m and not m.closed then return end
 	match = m
+	if CFG.acBypass and not acShieldOn then pcall(setAcShield, true) end
+	if acShieldOn then pcall(acCleanMatch, m) end
 	resetWatch()
 	resetAdapt()
 	if m.finish then lastState.finished = true end
@@ -20474,6 +20583,19 @@ local function buildUI()
 		value = CFG.rageFreeze,
 		callback = function(v) CFG.rageFreeze = v end,
 	})
+	rageTab:CreateSection({ name = "ANTI-CHEAT  |  RANKED PVP" })
+	ui.acCard = rageTab:CreateText({ name = "anti-cheat  |  on", text = acStatusText() })
+	rageTab:CreateToggle({
+		name = "anti-cheat shield",
+		description = "place version 107 added a client-side checker to ranked PvP: at the bell it snapshots power, speed, strike speed, chin, toughness and style mods, restores anything that changes, and cuts you to 40% speed and 30% power for the rest of the fight. auto fight, safe kicks and the opponent read never write those fields; rage does. this keeps the checker off matches that start while it is on and strips it from the match already running. client-side only: the server can still reject or nerf a boosted fighter, and a match already cleaned cannot be re-checked if you turn this off mid-fight.",
+		flag = "mma_acBypass",
+		value = CFG.acBypass,
+		callback = function(v)
+			local ok, err = setAcShield(v)
+			if not ok then notify("anti-cheat shield: " .. tostring(err)) end
+			if ui.acCard then pcall(function() ui.acCard:Set(acStatusText()) end) end
+		end,
+	})
 	rageTab:CreateSection({ name = "INSTANT FINISH" })
 	rageTab:CreateButton({
 		name = "instant knockout",
@@ -20704,15 +20826,17 @@ local function panic()
 	CFG.rageStamina = false
 	CFG.rageSpeed = false
 	CFG.rageFreeze = false
+	CFG.acBypass = false
 	spinStop = true
 	restoreRage()
+	pcall(setAcShield, false)
 	if match then
 		pcall(function()
 			match.debugMove = nil
 		end)
 	end
 	pcall(function() Touch.block = false end)
-	for _, flag in ipairs({ "mma_autoFight", "mma_autoAim", "mma_autoBlock", "mma_autoCounter", "mma_autoTakedown", "mma_autoGround", "mma_autoSub", "mma_autoSprawl", "mma_autoQueue", "mma_autoBest", "mma_autoContinue", "mma_rageMode", "mma_rageBoost", "mma_rageOnePunch", "mma_rageGod", "mma_rageStamina", "mma_rageSpeed", "mma_rageFreeze" }) do
+	for _, flag in ipairs({ "mma_autoFight", "mma_autoAim", "mma_autoBlock", "mma_autoCounter", "mma_autoTakedown", "mma_autoGround", "mma_autoSub", "mma_autoSprawl", "mma_autoQueue", "mma_autoBest", "mma_autoContinue", "mma_rageMode", "mma_rageBoost", "mma_rageOnePunch", "mma_rageGod", "mma_rageStamina", "mma_rageSpeed", "mma_rageFreeze", "mma_acBypass" }) do
 		if ui.window then pcall(function() ui.window:Set(flag, false) end) end
 	end
 	status = "panic  |  automation off"
@@ -20726,6 +20850,10 @@ shutdown = function()
 	dead = true
 	spinStop = true
 	restoreRage()
+	if AntiCheat and type(acAttachOriginal) == "function" then
+		pcall(function() AntiCheat.attach = acAttachOriginal end)
+	end
+	acShieldOn = false
 	if match then
 		pcall(function() match.debugMove = nil end)
 	end
@@ -20798,6 +20926,12 @@ local function syncUI()
 			end
 			ui.rageCard:SetTitle("rage  |  " .. (CFG.rageMode and "MASTER" or (#bits > 0 and "custom" or "off")))
 			ui.rageCard:Set(txt)
+		end)
+	end
+	if ui.acCard then
+		pcall(function()
+			ui.acCard:SetTitle("anti-cheat  |  " .. (CFG.acBypass and "on" or "off"))
+			ui.acCard:Set(acStatusText())
 		end)
 	end
 	if ui.sFights then pcall(function() ui.sFights:Set(stats.fights) end) end
@@ -20974,6 +21108,20 @@ _G.RagdollMmaPanel = {
 			resetRead()
 		end,
 		classify = function(s) return classifyStats(s) end,
+	},
+	antiCheat = {
+		get = function()
+			return {
+				enabled = acShieldOn,
+				module = AntiCheat ~= nil,
+				patched = AntiCheat ~= nil and type(acAttachOriginal) == "function" and AntiCheat.attach ~= acAttachOriginal,
+				killed = acKilled,
+				checked = match ~= nil and acChecked[match] == true,
+				cfg = CFG.acBypass,
+			}
+		end,
+		set = setAcShield,
+		clean = function() return acCleanMatch(match) end,
 	},
 	combat = {
 		kickWindow = function(dist, opp)
