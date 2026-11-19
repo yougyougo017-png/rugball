@@ -17598,6 +17598,7 @@ for k, v in pairs({
 	staminaFloor = 20,
 	strikeStyle = "smart",
 	safeKicks = true,
+	adaptive = true,
 	fightStyle = "best owned",
 	spinCount = 10,
 	spinStopRare = true,
@@ -17753,6 +17754,59 @@ local function flat(v)
 	return Vector3.new(v.X, 0, v.Z)
 end
 
+--// opponent read / adaptive counter -------------------------------------------
+-- the game exposes the opponent's live fighter table, so its habits can be read
+-- without guessing: strikes actually thrown, guard time, shot attempts, distance
+-- and whether it is walking in or backing out. the counter only shifts the same
+-- settings the FIGHT tab uses; nothing here writes the server profile.
+
+local TUNE = {}
+local READ = {
+	t0 = 0, time = 0, punches = 0, kicks = 0, knees = 0, shots = 0,
+	blockT = 0, closeT = 0, farT = 0, fwdT = 0, backT = 0, moveT = 0,
+	lastSeen = setmetatable({}, { __mode = "k" }),
+	lastShot = false, lastT = 0, lastClass = 0,
+	lastOPos = nil, lastPPos = nil, incoming = false,
+	read = "unknown", candidate = "unknown", candidateT = 0,
+	counter = "", style = "", prior = "", confidence = 0, changedAt = 0,
+}
+
+local function clearTune()
+	for k in pairs(TUNE) do TUNE[k] = nil end
+end
+
+local function resetAdapt()
+	clearTune()
+	local t = now()
+	READ.t0 = t
+	READ.time = 0
+	READ.punches = 0
+	READ.kicks = 0
+	READ.knees = 0
+	READ.shots = 0
+	READ.blockT = 0
+	READ.closeT = 0
+	READ.farT = 0
+	READ.fwdT = 0
+	READ.backT = 0
+	READ.moveT = 0
+	READ.lastSeen = setmetatable({}, { __mode = "k" })
+	READ.lastShot = false
+	READ.lastT = t
+	READ.lastClass = 0
+	READ.lastOPos = nil
+	READ.lastPPos = nil
+	READ.incoming = false
+	READ.read = "unknown"
+	READ.candidate = "unknown"
+	READ.candidateT = 0
+	READ.counter = ""
+	READ.style = ""
+	READ.prior = ""
+	READ.confidence = 0
+	READ.changedAt = 0
+end
+
 local function fmtTime(t)
 	if Util and Util.formatTime then
 		local ok, s = pcall(Util.formatTime, t)
@@ -17778,6 +17832,11 @@ local function pushLog(text)
 	while #log > math.max(3, CFG.logSize) do
 		table.remove(log)
 	end
+end
+
+local function resetRead()
+	resetAdapt()
+	pushLog("opponent read reset")
 end
 
 local notify = function(text)
@@ -18479,6 +18538,7 @@ local BEST = {
 	aimZone = "head",
 	strikeStyle = "smart",
 	safeKicks = true,
+	adaptive = true,
 	aggro = 72,
 	staminaFloor = 16,
 	retreatStamina = 30,
@@ -18528,6 +18588,7 @@ local function pushFlags()
 		ui.window:Set("mma_aimZone", CFG.aimZone)
 		ui.window:Set("mma_strikeStyle", CFG.strikeStyle)
 		ui.window:Set("mma_safeKicks", CFG.safeKicks)
+		ui.window:Set("mma_adaptive", CFG.adaptive)
 		ui.window:Set("mma_aggro", CFG.aggro)
 		ui.window:Set("mma_staminaFloor", CFG.staminaFloor)
 		ui.window:Set("mma_retreatStamina", CFG.retreatStamina)
@@ -18551,6 +18612,9 @@ end
 
 local function applyBestCfg(reason)
 	for k, v in pairs(BEST) do CFG[k] = v end
+	clearTune()
+	READ.counter = ""
+	READ.style = ""
 	local style = tuneTo(match)
 	pushFlags()
 	local text = "best cfg  |  " .. (reason or "manual") .. (style ~= "" and ("  |  vs " .. style) or "")
@@ -18634,6 +18698,7 @@ local function adopt(m)
 	if match == m and not m.closed then return end
 	match = m
 	resetWatch()
+	resetAdapt()
 	if m.finish then lastState.finished = true end
 	status = "match captured"
 	pushLog("match captured (round " .. tostring(m.round) .. ", " .. tostring(m.rounds) .. " rounds)")
@@ -18743,6 +18808,23 @@ local function armReach(f)
 	return base + 0.75 * (tonumber(f.s) or 1) + (tonumber(f.reachBonus) or 0)
 end
 
+local function effStyle()
+	return TUNE.strikeStyle or CFG.strikeStyle
+end
+
+local function effAim()
+	return TUNE.aimZone or CFG.aimZone
+end
+
+local function effFinishPush()
+	if TUNE.finishPush ~= nil then return TUNE.finishPush end
+	return CFG.finishPush
+end
+
+local function effRetreat()
+	return tonumber(TUNE.retreatStamina) or CFG.retreatStamina
+end
+
 local function strikePhase(st)
 	local def = st and (st.def or strikeDef(st.kind))
 	if not def then return nil end
@@ -18767,7 +18849,8 @@ end
 local function kickWindow(m, dist)
 	local o = m and m.opp
 	if not o then return false end
-	if o.down or (o.rig and o.rig.ragdolled) or o.mode ~= "fight" or o.shot or o.clinch then return false end
+	if o.down or (o.rig and o.rig.ragdolled) or o.mode ~= "fight" then return false end
+	if o.shot or o.clinch then return true end
 	if (tonumber(o.bodyHurtT) or 0) > 0.3 then return true end
 	local strikes = o.strikes
 	if type(strikes) == "table" then
@@ -18784,13 +18867,24 @@ end
 local function pickStrike(m, dist, reach, threat)
 	local o = m.opp
 	local p = m.player
-	local style = CFG.strikeStyle
+	local style = effStyle()
 	local stamina = p.stamina
 	local safeKick = true
 	if CFG.safeKicks then
 		safeKick = (not threat) and kickWindow(m, dist)
 	end
 	local canKick = safeKick and dist <= reach * 1.30
+
+	-- a shot or a clinch locks the opponent out of starting a strike, so this is
+	-- the cleanest counter window in the game: knee the level change or kick the
+	-- committed body.
+	if o.shot or o.clinch then
+		if canKick then
+			if dist <= reach * 0.95 and stamina >= 20 then return "knee" end
+			if stamina >= 8 then return "rkick" end
+		end
+		return nil
+	end
 
 	if style == "jab" then
 		if dist <= reach then return "jab" end
@@ -18876,6 +18970,248 @@ local function incomingStrike(m)
 	return false, nil
 end
 
+--// adaptive counter ------------------------------------------------------------
+-- classify the opponent's habits from the live fighter table. these are the same
+-- numbers the FIGHT tab exposes: dist is root-to-root, reach is the game's own
+-- arm reach, and moveInput is the world-space stick the sim actually walks with.
+
+local function classifyStats(s)
+	local t = math.max(0.1, tonumber(s.time) or 0)
+	local strikes = (tonumber(s.punches) or 0) + (tonumber(s.kicks) or 0) + (tonumber(s.knees) or 0)
+	local kickShare = strikes > 0 and ((tonumber(s.kicks) or 0) + (tonumber(s.knees) or 0)) / strikes or 0
+	local blockFrac = (tonumber(s.blockT) or 0) / t
+	local closeFrac = (tonumber(s.closeT) or 0) / t
+	local farFrac = (tonumber(s.farT) or 0) / t
+	local moveT = math.max(0.1, tonumber(s.moveT) or 0)
+	local fwdFrac = (tonumber(s.fwdT) or 0) / moveT
+	local backFrac = (tonumber(s.backT) or 0) / moveT
+	local rate = strikes / t
+	local shots = tonumber(s.shots) or 0
+	local conf = math.min(1, t / 8) * 0.55 + math.min(1, strikes / 10) * 0.3 + math.min(1, shots / 2) * 0.15
+
+	if shots >= 2 then
+		return "wrestler", math.min(1, 0.65 + shots * 0.1)
+	end
+	if t >= 2.5 and strikes >= 3 and kickShare >= 0.35 then
+		return "kicker", math.min(1, 0.55 + kickShare * 0.4)
+	end
+	if t >= 4 and strikes >= 3 and blockFrac >= 0.42 then
+		return "guard", math.min(1, 0.55 + blockFrac * 0.4)
+	end
+	if t >= 4 and moveT >= 1.5 and fwdFrac >= 0.55 then
+		return "pressure", math.min(1, 0.55 + fwdFrac * 0.35)
+	end
+	if t >= 4 and (backFrac >= 0.5 or (farFrac >= 0.5 and fwdFrac < 0.3)) then
+		return "outfighter", math.min(1, 0.55 + math.max(backFrac, farFrac) * 0.35)
+	end
+	if strikes >= 5 and kickShare <= 0.2 then
+		return "boxer", math.min(1, 0.55 + (1 - kickShare) * 0.3)
+	end
+	if t >= 6 and rate < 0.3 and fwdFrac < 0.35 then
+		return "passive", math.min(1, 0.5 + (1 - math.min(1, rate / 0.3)) * 0.35)
+	end
+	return "unknown", math.min(1, conf)
+end
+
+local COUNTERS = {
+	kicker = {
+		label = "crowd the kick, box the body, shoot the planted leg",
+		aggro = 82, range = 0.62, strikeStyle = "combo", aimZone = "body",
+		takedown = true, takedownStamina = 28, finishPush = true,
+		counterShot = "kick", ground = "sub",
+	},
+	boxer = {
+		label = "stay off the pocket, kick the lead leg, reset",
+		strikeStyle = "kicks", aimZone = "legs", takedown = false,
+		finishPush = false, counterShot = "none", ground = "escape",
+	},
+	guard = {
+		label = "break the guard low, change levels, then shoot",
+		aggro = 68, range = 0.8, strikeStyle = "smart", aimZone = "legs",
+		takedown = true, takedownStamina = 32, finishPush = true,
+		counterShot = "guard", ground = "sub",
+	},
+	wrestler = {
+		label = "keep it long, sprawl, knee the shot, do not follow down",
+		strikeStyle = "kicks", aimZone = "head", takedown = false,
+		takedownStamina = 80, finishPush = false, counterShot = "none",
+		ground = "escape",
+	},
+	pressure = {
+		label = "circle, jab the entry, shoot the step-in",
+		aggro = 56, range = 0.9, strikeStyle = "combo", aimZone = "head",
+		takedown = true, takedownStamina = 40, finishPush = true,
+		counterShot = "pressure", ground = "sub",
+	},
+	outfighter = {
+		label = "cut the cage, close, kick the body",
+		aggro = 90, range = 0.85, strikeStyle = "smart", aimZone = "body",
+		takedown = true, takedownStamina = 36, finishPush = true,
+		counterShot = "none", ground = "sub",
+	},
+	passive = {
+		label = "lead, kick the body and legs, force the grapple",
+		aggro = 84, range = 0.88, strikeStyle = "combo", aimZone = "body",
+		takedown = true, takedownStamina = 34, finishPush = true,
+		counterShot = "guard", ground = "sub",
+	},
+}
+
+local function applyCounter(kind)
+	clearTune()
+	local c = COUNTERS[kind]
+	if not c then
+		READ.counter = ""
+		READ.style = ""
+		return
+	end
+	READ.style = c.strikeStyle or ""
+	if not CFG.adaptive then
+		READ.counter = "read only  |  adaptive is off"
+		return
+	end
+	for k, v in pairs(c) do
+		if k ~= "label" then TUNE[k] = v end
+	end
+	READ.counter = c.label
+end
+
+local function setAdaptive(on)
+	CFG.adaptive = on and true or false
+	if CFG.adaptive then
+		applyCounter(READ.read)
+	else
+		clearTune()
+		READ.counter = "adaptive off"
+	end
+end
+
+local function adaptTick(m)
+	if not m or m.closed then return end
+	local p, o = m.player, m.opp
+	if not (p and o) then return end
+	if m.state ~= "fight" or m.finish then return end
+	if p.down or o.down or p.rig.ragdolled or o.rig.ragdolled then return end
+
+	local t = now()
+	local dt = t - (READ.lastT or t)
+	if dt <= 0 then return end
+	dt = math.min(dt, 0.25)
+	READ.lastT = t
+	READ.time = READ.time + dt
+
+	if READ.prior == "" and m.oppStyle then
+		local s = tostring(m.oppStyle)
+		if GRAPPLERS[s] then
+			READ.prior = "wrestler"
+		elseif KICKERS[s] then
+			READ.prior = "kicker"
+		elseif SLUGGERS[s] then
+			READ.prior = "pressure"
+		end
+	end
+
+	local strikes = o.strikes
+	if type(strikes) == "table" then
+		for _, st in pairs(strikes) do
+			if type(st) == "table" and not READ.lastSeen[st] then
+				READ.lastSeen[st] = true
+				local def = st.def or strikeDef(st.kind)
+				local kind = def and def.kind or nil
+				if kind == "kick" then
+					READ.kicks = READ.kicks + 1
+				elseif kind == "knee" then
+					READ.knees = READ.knees + 1
+				else
+					READ.punches = READ.punches + 1
+				end
+			end
+		end
+	end
+
+	local shot = o.shot ~= nil
+	if shot and not READ.lastShot then READ.shots = READ.shots + 1 end
+	READ.lastShot = shot
+
+	if (tonumber(o.blockAmt) or 0) > 0.45 then READ.blockT = READ.blockT + dt end
+
+	local theirReach = armReach(o)
+	local dist = flat(o.pos - p.pos).Magnitude
+	if dist < theirReach * 0.8 then
+		READ.closeT = READ.closeT + dt
+	elseif dist > theirReach * 1.15 then
+		READ.farT = READ.farT + dt
+	end
+
+	-- use the positions the sim actually moved, not the input vector: a fighter
+	-- can be pushed, slid or clinched, and moveInput's space is not guaranteed.
+	READ.incoming = false
+	if READ.lastOPos then
+		local step = flat(o.pos - READ.lastOPos)
+		local speed = step.Magnitude / dt
+		if speed > 0.6 then
+			READ.moveT = READ.moveT + dt
+			local toUs = flat(p.pos - o.pos)
+			if toUs.Magnitude > 0.05 then
+				local dot = step.Unit:Dot(toUs.Unit)
+				if dot > 0.35 then
+					READ.fwdT = READ.fwdT + dt
+					READ.incoming = true
+				elseif dot < -0.35 then
+					READ.backT = READ.backT + dt
+				end
+			end
+		end
+	end
+	READ.lastOPos = o.pos
+	READ.lastPPos = p.pos
+
+	if READ.time < 2.5 then return end
+	if t - (READ.lastClass or 0) < 0.5 then return end
+	READ.lastClass = t
+
+	local kind, conf = classifyStats(READ)
+	READ.confidence = math.floor((conf or 0) * 100 + 0.5)
+	if kind == "unknown" then return end
+
+	if kind == READ.read then
+		READ.candidate = kind
+		READ.candidateT = t
+		return
+	end
+	if kind ~= READ.candidate then
+		READ.candidate = kind
+		READ.candidateT = t
+		return
+	end
+	if t - READ.candidateT < 1.6 then return end
+
+	READ.read = kind
+	READ.changedAt = t
+	applyCounter(kind)
+	pushLog("opponent read: " .. string.upper(kind) .. "  |  " .. tostring(READ.counter))
+end
+
+local function readSummary()
+	if not match then return "no match captured" end
+	local t = math.max(0.1, READ.time)
+	local strikes = READ.punches + READ.kicks + READ.knees
+	local kickPct = strikes > 0 and math.floor((READ.kicks + READ.knees) / strikes * 100 + 0.5) or 0
+	local blockPct = math.floor(READ.blockT / t * 100 + 0.5)
+	local fwdPct = READ.moveT > 0.1 and math.floor(READ.fwdT / READ.moveT * 100 + 0.5) or 0
+	local lines = {
+		string.format("%s  |  %ds  |  %d strikes  |  %d%% kick", string.upper(READ.read), math.floor(READ.time), strikes, kickPct),
+		string.format("guard %d%%  |  forward %d%%  |  shots %d  |  confidence %d%%", blockPct, fwdPct, READ.shots, READ.confidence),
+	}
+	if READ.read == "unknown" and READ.prior ~= "" then
+		table.insert(lines, "prior from server style: " .. READ.prior)
+	end
+	if READ.counter ~= "" then
+		table.insert(lines, "counter: " .. READ.counter)
+	end
+	return table.concat(lines, "\n")
+end
+
 --// ground menu handling --------------------------------------------------------
 
 local POS_RANK = { guard = 1, half = 2, side = 3, mount = 4, back = 5 }
@@ -18892,7 +19228,9 @@ end
 local function scoreOption(entry, isTop, gnd)
 	local action = entry[1]
 	local target = entry[2]
+	local groundMode = TUNE.ground
 	if action == "sub" then
+		if groundMode == "escape" then return -1 end
 		if not autoOn("autoSub") then return -1 end
 		return 60 + (SUB_PREF[target] or 1) * 5
 	end
@@ -18900,9 +19238,9 @@ local function scoreOption(entry, isTop, gnd)
 		if not isTop then return -1 end
 		return 30 + (POS_RANK[target] or 0) * 12 + (target == "back" and 8 or 0)
 	end
-	if action == "esc" then return 90 end
+	if action == "esc" then return groundMode == "escape" and 200 or 90 end
 	if action == "up" then return 25 + (gnd and gnd.pos == "back" and 20 or 0) end
-	if action == "rev" then return 45 end
+	if action == "rev" then return groundMode == "escape" and 70 or 45 end
 	if action == "subrev" then return 80 end
 	if action == "stand" then return 18 end
 	return 5
@@ -18952,7 +19290,7 @@ local function fightTick(m)
 	if m.gnd or m.drive then return end
 
 	if autoOn("autoAim") then
-		aimAt(m, CFG.aimZone)
+		aimAt(m, effAim())
 	end
 
 	local delta = flat(o.pos - p.pos)
@@ -18962,17 +19300,13 @@ local function fightTick(m)
 	-- read the fight: are they hurt enough to press, or are we too tired to trade
 	local headHp = (o.hp and o.hp.head) or 100
 	local hurt = (o.rockedT or 0) > 0 or headHp < 26 or o.stamina < 20
-	local gassed = p.stamina < math.max(6, CFG.retreatStamina)
-	local pressing = CFG.finishPush and hurt and not gassed
+	local gassed = p.stamina < math.max(6, effRetreat())
+	local finishPush = effFinishPush()
+	local pressing = finishPush and hurt and not gassed
 
-	local want = reach * (0.60 + 0.55 * (CFG.aggro / 100))
-	if pressing then
-		want = reach * 0.52          -- walk onto the finish instead of trading at range
-	end
-	if gassed then
-		want = reach * 1.55          -- back out and breathe, let them walk onto a counter
-	end
-	if CFG.strikeStyle == "kicks" then
+	local aggro = tonumber(TUNE.aggro) or CFG.aggro
+	local want = reach * (0.60 + 0.55 * (aggro / 100))
+	if effStyle() == "kicks" then
 		-- stand where the legs reach and the arms do not; safeKicks then has a
 		-- band it can actually use instead of kicking in the pocket. if the
 		-- opponent out-ranges the kick, fall back to boxing range rather than
@@ -18981,6 +19315,17 @@ local function fightTick(m)
 		if kickWant <= reach * 1.28 then
 			want = kickWant
 		end
+	end
+	-- the adaptive counter's own range wins in the neutral state, then the
+	-- finish/retreat states take over so a hurt or gassed read cannot trap us
+	if tonumber(TUNE.range) then
+		want = reach * TUNE.range
+	end
+	if pressing then
+		want = reach * 0.52          -- walk onto the finish instead of trading at range
+	end
+	if gassed then
+		want = reach * 1.55          -- back out and breathe, let them walk onto a counter
 	end
 
 	local fwd, side = 0, 0
@@ -19004,14 +19349,30 @@ local function fightTick(m)
 		local move = pickStrike(m, dist, reach, threat)
 		if move and canThrow(p, move) then
 			lastTry = now()
-			strikeAt(m, move, CFG.aimZone)
+			local zone = move == "knee" and "head" or effAim()
+			strikeAt(m, move, zone)
 		end
 	end
 
-	if autoOn("autoTakedown") and now() - lastTakedown > 0.55 and p.stamina >= CFG.takedownStamina then
+	local tdOn = TUNE.takedown
+	if tdOn == nil then tdOn = autoOn("autoTakedown") end
+	local tdStam = tonumber(TUNE.takedownStamina) or CFG.takedownStamina
+	local tdGap = TUNE.counterShot and 0.35 or 0.55
+	if tdOn and now() - lastTakedown > tdGap and p.stamina >= tdStam then
 		local ok, can = pcall(function() return m:canShoot(p) end)
 		local shootRange = 3.4 * ((p.s or 1) + (o.s or 1)) / 2
-		local pressured = (o.rockedT or 0) > 0 or o.stamina < 35 or (o.hp.head < 35) or math.random() < 0.02
+		local incomingStep = READ.incoming == true
+		local counterWindow = false
+		if TUNE.counterShot == "kick" then
+			local leg = type(o.strikes) == "table" and o.strikes.leg or nil
+			local phase = leg and strikePhase(leg) or nil
+			counterWindow = (phase == "hold" or phase == "retract") and not o.shot
+		elseif TUNE.counterShot == "guard" then
+			counterWindow = (tonumber(o.blockAmt) or 0) > 0.45 and not o.shot
+		elseif TUNE.counterShot == "pressure" then
+			counterWindow = incomingStep and dist <= shootRange and not o.shot
+		end
+		local pressured = (o.rockedT or 0) > 0 or o.stamina < 35 or (o.hp.head < 35) or counterWindow or math.random() < 0.02
 		if ok and can and pressured and dist <= shootRange * 0.92 then
 			local ok2 = pcall(m.playerShoot, m)
 			if ok2 then
@@ -19871,6 +20232,23 @@ local function buildUI()
 		value = CFG.safeKicks,
 		callback = function(v) CFG.safeKicks = v end,
 	})
+	fightTab:CreateSection({ name = "OPPONENT READ  |  LIVE  |  COUNTER" })
+	ui.readCard = fightTab:CreateText({ name = "read  |  unknown", text = "no match captured" })
+	fightTab:CreateToggle({
+		name = "adaptive counter",
+		description = "watches the opponent's real strikes, guard time, movement and takedown attempts, labels their playstyle, and shifts range, aim, strike style and takedown timing to counter it. it only changes this panel's own settings; the server profile is never written. turn it off to keep the readout but fight with your own slider values.",
+		flag = "mma_adaptive",
+		value = CFG.adaptive,
+		callback = function(v) setAdaptive(v) end,
+	})
+	fightTab:CreateButton({
+		name = "reset opponent read",
+		description = "clears the sampled strikes, guard time and movement and starts reading this opponent again. the adaptive settings drop back to your slider values until a new read is confirmed.",
+		callback = function()
+			clearTune()
+			resetRead()
+		end,
+	})
 	fightTab:CreateSlider({
 		name = "aggression",
 		description = "how far in the auto fighter steps. low keeps a kicking range, high crowds the opponent.",
@@ -20363,10 +20741,16 @@ local function syncUI()
 			ui.card:Set(status)
 		end)
 	end
+	if ui.readCard then
+		pcall(function()
+			local txt = readSummary()
+			ui.readCard:SetTitle("read  |  " .. (match and string.upper(READ.read) or "idle"))
+			ui.readCard:Set(txt)
+		end)
+	end
 	if ui.groundCard then
 		pcall(function()
-			local g = match and match.gnd
-			local txt = "no match captured"
+			local g = match and match.gnd			local txt = "no match captured"
 			if match then
 				if match.drive then
 					txt = "drive  |  " .. (match.drive.att == match.player and "attacking" or "defending")
@@ -20474,6 +20858,7 @@ local function tick()
 			status = "match  |  " .. tostring(m.state) .. (m.controls and "" or "  |  waiting")
 		end
 		pcall(watch, m)
+		pcall(adaptTick, m)
 		pcall(rageTick, m)
 		if autoOn("autoFight") then pcall(fightTick, m) end
 		pcall(groundTick, m)
@@ -20547,9 +20932,37 @@ _G.RagdollMmaPanel = {
 	applyBest = applyBestCfg,
 	queue = queue,
 	strike = function(move)
-		if match then return strikeAt(match, move or "jab", CFG.aimZone) end
+		if match then return strikeAt(match, move or "jab", effAim()) end
 		return false
 	end,
+	adaptive = {
+		get = function()
+			return {
+				read = READ.read,
+				confidence = READ.confidence,
+				counter = READ.counter,
+				style = READ.style,
+				time = READ.time,
+				punches = READ.punches,
+				kicks = READ.kicks,
+				knees = READ.knees,
+				shots = READ.shots,
+				blockT = READ.blockT,
+				fwdT = READ.fwdT,
+				backT = READ.backT,
+				closeT = READ.closeT,
+				farT = READ.farT,
+				styleOverride = TUNE.strikeStyle,
+				aimZone = effAim(),
+			}
+		end,
+		set = setAdaptive,
+		reset = function()
+			clearTune()
+			resetRead()
+		end,
+		classify = function(s) return classifyStats(s) end,
+	},
 	combat = {
 		kickWindow = function(dist, opp)
 			local o = opp or (match and match.opp)
