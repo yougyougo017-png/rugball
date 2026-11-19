@@ -17598,6 +17598,8 @@ for k, v in pairs({
 	staminaFloor = 20,
 	strikeStyle = "smart",
 	fightStyle = "best owned",
+	spinCount = 10,
+	spinStopRare = true,
 	rageMode = false,
 	rageBoost = false,
 	rageDamage = 8,
@@ -17805,6 +17807,8 @@ local styleState = nil
 local styleStateAt = 0
 local styleError = nil
 local styleBusy = false
+local spinBusy = false
+local spinStop = false
 local styleOptionIds = {}
 local stylesTriedAt = 0
 
@@ -17961,13 +17965,49 @@ local function styleSummary()
 	return table.concat(bits, "  |  ")
 end
 
+local function spinCounts()
+	local state = styleState
+	if type(state) ~= "table" then return 0, 0, 0 end
+	return tonumber(state.sp) or 0, tonumber(state.lk) or 0, tonumber(state.p) or 0
+end
+
+local function spinSummary()
+	local sp, lk, pity = spinCounts()
+	local bits = {
+		tostring(sp) .. " normal",
+		tostring(lk) .. " lucky",
+		"pity " .. tostring(pity),
+	}
+	local mod = stylesModule()
+	local odds = mod and mod.ODDS
+	local lucky = type(odds) == "table" and odds.lucky or nil
+	if type(lucky) == "table" then
+		bits[#bits + 1] = string.format(
+			"lucky odds  rare %.1f  leg %.1f  god %.1f  sec %.1f",
+			tonumber(lucky.RARE) or 0,
+			tonumber(lucky.LEGENDARY) or 0,
+			tonumber(lucky.GODLY) or 0,
+			tonumber(lucky.SECRET) or 0
+		)
+	end
+	return table.concat(bits, "  |  ")
+end
+
 local function updateStyleCard()
-	if not ui.styleCard then return end
-	pcall(function()
-		local list = ownedStyles()
-		ui.styleCard:SetTitle("styles  |  " .. (type(styleState) == "table" and (tostring(#list) .. " owned") or "not loaded"))
-		ui.styleCard:Set(styleSummary())
-	end)
+	if ui.styleCard then
+		pcall(function()
+			local list = ownedStyles()
+			ui.styleCard:SetTitle("styles  |  " .. (type(styleState) == "table" and (tostring(#list) .. " owned") or "not loaded"))
+			ui.styleCard:Set(styleSummary())
+		end)
+	end
+	if ui.spinCard then
+		pcall(function()
+			local sp, lk = spinCounts()
+			ui.spinCard:SetTitle(string.format("spins  |  %d normal  |  %d lucky", sp, lk))
+			ui.spinCard:Set(spinSummary())
+		end)
+	end
 end
 
 local function refreshStyleDropdown()
@@ -18134,6 +18174,103 @@ local function equipBestOwned()
 			notify("equip failed: " .. tostring(err))
 		end
 	end)
+end
+
+local function spinOnce(lucky)
+	local remote = stylesRemoteFn()
+	if not remote then
+		styleError = "Styles remote not found"
+		return nil, styleError
+	end
+	local ok, res = pcall(function()
+		return remote:InvokeServer("spin", { lucky = lucky and true or false })
+	end)
+	if not ok then return nil, tostring(res) end
+	if type(res) ~= "table" then return nil, "spin returned " .. type(res) end
+	if type(res.state) == "table" then
+		styleState = res.state
+		styleStateAt = now()
+		styleError = nil
+	end
+	if res.err then return nil, tostring(res.err) end
+	if res.need then
+		if res.need == "lucky" then return nil, "no lucky spins" end
+		if res.need == "spins" then return nil, "no normal spins" end
+		return nil, tostring(res.need)
+	end
+	local style = res.style
+	local info = style and styleById(style) or nil
+	return { info = info, id = style }, nil
+end
+
+local function spinMany(lucky, count)
+	if spinBusy then
+		notify("a spin run is already active")
+		return false
+	end
+	spinBusy = true
+	spinStop = false
+	task.spawn(function()
+		refreshStyleState()
+		local sp, lk = spinCounts()
+		local have = lucky and lk or sp
+		if have < 1 then
+			spinBusy = false
+			updateStyleCard()
+			notify(lucky and "no lucky spins - the game's style shop sells them" or "no normal spins - win career or hard fights to earn more")
+			return
+		end
+		local want = math.clamp(tonumber(count) or 1, 1, have)
+		local got = 0
+		for i = 1, want do
+			if spinStop or dead then break end
+			local res, err = spinOnce(lucky)
+			if not res and err == "slow" then
+				task.wait(1)
+				res, err = spinOnce(lucky)
+			end
+			if not res then
+				notify("spin stopped: " .. tostring(err))
+				break
+			end
+			got = got + 1
+			local info = res.info
+			local name = info and info.name or tostring(res.id or "?")
+			local rarity = info and info.rarity or "?"
+			local line = string.format(
+				"%s %d/%d: %s (%s)",
+				lucky and "lucky" or "normal", i, want, name, rarity
+			)
+			print("[MMA spins] " .. line)
+			pushLog(line)
+			if rarity == "GODLY" or rarity == "SECRET" or rarity == "UNIQUE" or rarity == "ADMIN" then
+				notify("SPIN HIT: " .. name .. " (" .. rarity .. ")")
+			end
+			updateStyleCard()
+			if CFG.spinStopRare and (rarity == "GODLY" or rarity == "SECRET") then
+				notify("stopped on " .. rarity .. ": " .. name)
+				break
+			end
+			if i < want then task.wait(0.2) end
+		end
+		local sp2, lk2 = spinCounts()
+		spinBusy = false
+		if dead then return end
+		refreshStyleState()
+		refreshStyleDropdown()
+		updateStyleCard()
+		notify(string.format("spin run done: %d spun  |  %d normal, %d lucky left", got, sp2, lk2))
+	end)
+	return true
+end
+
+local function stopSpins()
+	if not spinBusy then
+		notify("no spin run active")
+		return
+	end
+	spinStop = true
+	notify("stopping after the current spin")
 end
 
 --// ranked automation -----------------------------------------------------------
@@ -18404,6 +18541,8 @@ local function pushFlags()
 		ui.window:Set("mma_autoSub", CFG.autoSub)
 		ui.window:Set("mma_autoSprawl", CFG.autoSprawl)
 		ui.window:Set("mma_fightStyle", CFG.fightStyle)
+		ui.window:Set("mma_spinCount", CFG.spinCount)
+		ui.window:Set("mma_spinStopRare", CFG.spinStopRare)
 	end)
 end
 
@@ -19734,6 +19873,44 @@ local function buildUI()
 		description = "calls Styles:equip for the selected owned slot. this is a real profile change: both clients build the next fight from it. finish the current fight first; it lands on the next one.",
 		callback = function() equipSelected() end,
 	})
+	styleTab:CreateSection({ name = "SPINS  |  SERVER PROFILE  |  FAST" })
+	ui.spinCard = styleTab:CreateText({ name = "spins  |  not loaded", text = "press scan styles" })
+	styleTab:CreateSlider({
+		name = "spin count",
+		description = "how many spins one click runs. the run stops when your spins run out or you press stop.",
+		flag = "mma_spinCount",
+		range = { 1, 100 },
+		increment = 1,
+		value = CFG.spinCount,
+		suffix = "x",
+		callback = function(v) CFG.spinCount = v end,
+	})
+	styleTab:CreateToggle({
+		name = "stop on godly / secret",
+		description = "ends a bulk run when a GODLY or SECRET style appears.",
+		flag = "mma_spinStopRare",
+		value = CFG.spinStopRare,
+		callback = function(v) CFG.spinStopRare = v end,
+	})
+	styleTab:CreateButton({
+		name = "FAST SPIN  |  normal  (skip reel)",
+		description = "calls the game's own Styles:spin in a loop. it skips the client reel, not the server roll: the style is added to your real profile with the game's own odds. it cannot add spins.",
+		callback = function() spinMany(false, CFG.spinCount) end,
+	})
+	styleTab:CreateButton({
+		name = "FAST SPIN  |  lucky  (skip reel)",
+		description = "same as normal, but spends lucky spins for the better GODLY / SECRET odds. you must already own the lucky spins; the profile is server-owned.",
+		callback = function() spinMany(true, CFG.spinCount) end,
+	})
+	styleTab:CreateButton({
+		name = "stop spinning",
+		description = "stops the current bulk spin after the spin in flight.",
+		callback = function() stopSpins() end,
+	})
+	styleTab:CreateText({
+		name = "spin note",
+		text = "fast spin resolves the server roll from this panel and prints the result, so the reel never plays. close and reopen the game's own STYLES screen to see new slots there. if your style slots are full, the game replaces one; buy more slots in the style shop to keep more. this does not grant spins or luck.",
+	})
 	styleTab:CreateText({
 		name = "why a live style edit does nothing",
 		text = "the game builds each fighter from the equipped style on the server. in PvP your opponent's client throws and resolves your strikes with the style id the server gave it, so changing your local Fighter cannot change the damage that player takes. the game's AntiCheat also snapshots player.fstyle at the bell and reverts a live edit within 0.5s, then cuts power to 30% and speed to 40% for the rest of the fight. equip on the server instead.",
@@ -20050,6 +20227,7 @@ local function panic()
 	CFG.rageStamina = false
 	CFG.rageSpeed = false
 	CFG.rageFreeze = false
+	spinStop = true
 	restoreRage()
 	if match then
 		pcall(function()
@@ -20069,6 +20247,7 @@ local shutdown
 shutdown = function()
 	if dead then return end
 	dead = true
+	spinStop = true
 	restoreRage()
 	if match then
 		pcall(function() match.debugMove = nil end)
@@ -20289,6 +20468,12 @@ _G.RagdollMmaPanel = {
 		equipBest = equipBestOwned,
 		equipSelected = equipSelected,
 		resolve = styleEntryForChoice,
+		spin = spinMany,
+		stopSpin = stopSpins,
+		spins = function()
+			local sp, lk, pity = spinCounts()
+			return { normal = sp, lucky = lk, pity = pity }
+		end,
 		state = function() return styleState end,
 	},
 	raging = function()
