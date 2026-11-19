@@ -19129,7 +19129,7 @@ local function adaptTick(m)
 		end
 	end
 
-	local shot = o.shot ~= nil
+	local shot = o.shot ~= nil and o.shot ~= false
 	if shot and not READ.lastShot then READ.shots = READ.shots + 1 end
 	READ.lastShot = shot
 
