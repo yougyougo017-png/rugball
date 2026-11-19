@@ -19128,9 +19128,10 @@ local function incomingStrike(m)
 	return false, nil
 end
 
--- seconds until the opponent's next live strike reaches its extend phase.
--- 0 means one is extending right now, nil means nothing is coming.
-local function strikeImpactIn(m)
+-- the opponent's live strike closest to landing: where it is aimed, what kind
+-- it is, and how long until it reaches extend. left == 0 means it is extending
+-- right now; nil means nothing is coming.
+local function liveStrike(m)
 	local o = m and m.opp
 	if not o then return nil end
 	local ok, strikes = pcall(function() return o.strikes end)
@@ -19150,8 +19151,12 @@ local function strikeImpactIn(m)
 				elseif t < windup + extend + 0.02 then
 					left = 0
 				end
-				if left and (best == nil or left < best) then
-					best = left
+				if left and (best == nil or left < best.left) then
+					best = {
+						left = left,
+						kind = def.kind,
+						zone = st.aimZone or (def.kind == "kick" and "leg" or "head"),
+					}
 				end
 			end
 		end
@@ -19550,38 +19555,53 @@ local function fightTick(m)
 		local pocket = dist <= armReach(o) + 0.6 * (tonumber(o.s) or 1)
 		local ready = o.mode == "fight" and not o.down and not o.shot and not o.clinch
 			and (tonumber(o.stamina) or 100) >= 8
-		local impact = strikeImpactIn(m)
-
-		if guardPulse > 0 then
-			if impact == 0 then
-				-- a strike reached its extend while the guard was down: abort
-				-- the reset and start ramping blockAmt for the next one.
-				guardPulse = 0
-				setBlock(true)
-				guardHeld = 0.9
-			else
-				guardPulse = guardPulse - 1
+		local live = liveStrike(m)
+		local impact = live and live.left
+		-- the game has a separate low guard (Touch.lowBlock): body shots and
+		-- takedowns. the AI aims body 65% of the time while blockAmt is above
+		-- 0.5, and lowAmt is immune to blockHold, so switch to it while a body
+		-- strike is live. a live shot also gets it: Grapple.contact stuffs the
+		-- takedown outright when the defender is low and gassed.
+		local shot = o.shot ~= nil and o.shot ~= false
+		if (live and live.zone == "body" and threat) or shot then
+			guardPulse = 0
+			guardHeld = 0
+			Touch.lowBlock = true
+			setBlock(false)
+		else
+			Touch.lowBlock = false
+			if guardPulse > 0 then
+				if impact == 0 then
+					-- a strike reached its extend while the guard was down: abort
+					-- the reset and start ramping blockAmt for the next one.
+					guardPulse = 0
+					setBlock(true)
+					guardHeld = 0.9
+				else
+					guardPulse = guardPulse - 1
+					setBlock(false)
+					guardHeld = 0
+				end
+			elseif guardHeld >= 1.25 and (impact == nil or impact > 0.13) then
+				-- the game punishes a held guard: blockHold past 1.5 s drags the
+				-- block roll from 0.78 toward 0.23. three ticks below the 0.55
+				-- threshold reset it, so only drop it when nothing is landing.
+				guardPulse = 3
 				setBlock(false)
 				guardHeld = 0
-			end
-		elseif guardHeld >= 1.25 and (impact == nil or impact > 0.13) then
-			-- the game punishes a held guard: blockHold past 1.5 s drags the
-			-- block roll from 0.78 toward 0.23. three ticks below the 0.55
-			-- threshold reset it, so only drop it when nothing is landing.
-			guardPulse = 3
-			setBlock(false)
-			guardHeld = 0
-		else
-			local up = (not pressing) and ((threat ~= false) or (pocket and ready))
-			setBlock(up)
-			if up then
-				guardHeld = guardHeld + dt
 			else
-				guardHeld = 0
+				local up = (not pressing) and ((threat ~= false) or (pocket and ready))
+				setBlock(up)
+				if up then
+					guardHeld = guardHeld + dt
+				else
+					guardHeld = 0
+				end
 			end
 		end
 	else
 		guardHeld, guardPulse, guardT = 0, 0, 0
+		if Touch.lowBlock then Touch.lowBlock = false end
 	end
 
 	local allowStrike = pressing or (not autoOn("autoBlock")) or (not threat) or (not autoOn("autoCounter"))
@@ -20516,7 +20536,7 @@ local function buildUI()
 	})
 	fightTab:CreateToggle({
 		name = "auto block",
-		description = "holds Touch.block (the game's own guard) while the opponent is inside punching range, through every windup and extend, and drops it for three ticks between strikes to reset the game's guard fatigue. a reactive block is too late for 1.3x-speed hands.",
+		description = "holds the game's own guard: Touch.block inside punching range through every windup and extend, dropped for three ticks between strikes to reset guard fatigue, and Touch.lowBlock whenever a body strike is aimed at you or a takedown is live. a reactive block is too late for 1.3x-speed hands.",
 		flag = "mma_autoBlock",
 		value = CFG.autoBlock,
 		callback = function(v) CFG.autoBlock = v end,
@@ -20962,7 +20982,7 @@ local function panic()
 			match.debugMove = nil
 		end)
 	end
-	pcall(function() Touch.block = false end)
+	pcall(function() Touch.block = false; Touch.lowBlock = false end)
 	for _, flag in ipairs({ "mma_autoFight", "mma_autoAim", "mma_autoBlock", "mma_autoCounter", "mma_autoTakedown", "mma_autoGround", "mma_autoSub", "mma_autoSprawl", "mma_autoQueue", "mma_autoBest", "mma_autoContinue", "mma_rageMode", "mma_rageBoost", "mma_rageOnePunch", "mma_rageGod", "mma_rageStamina", "mma_rageSpeed", "mma_rageFreeze", "mma_acBypass" }) do
 		if ui.window then pcall(function() ui.window:Set(flag, false) end) end
 	end
@@ -20984,7 +21004,7 @@ shutdown = function()
 	if match then
 		pcall(function() match.debugMove = nil end)
 	end
-	pcall(function() Touch.block = false end)
+	pcall(function() Touch.block = false; Touch.lowBlock = false end)
 	if Match.new == hookNew then
 		Match.new = oldNew
 	end
@@ -21138,8 +21158,8 @@ local function tick()
 				if m.debugMove then m.debugMove = nil end
 			end)
 		end
-		if not CFG.autoBlock then
-			pcall(function() Touch.block = false end)
+		if not CFG.autoBlock or m.finish or m.state ~= "fight" then
+			pcall(function() Touch.block = false; Touch.lowBlock = false end)
 		end
 	end
 	pcall(skipTick)
