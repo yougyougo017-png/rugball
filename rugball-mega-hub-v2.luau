@@ -22970,7 +22970,10 @@ Hub.SUITE.criminal = function()
 	            remote, auto escape to the hideout on nearby police, auto door opening,
 	            prompt sniper for the game's own "Rob ..." and "Open" proximity prompts,
 	            travel buttons for truck, sell box, chop shop, hideout, shop computer
-	            and job board.
+	            and job board, plus a stealth / anti-detect section that fires the
+	            game's own Sneak remote near npcs, reads the game's Sight<userId>
+	            attribute and draws estimated npc sight cones. it silences walking
+	            noise; it does not make you invisible to server-side sight or cameras.
 	  players : esp, player list, teleport.
 	  movement: walk speed, speed guard (safe cap + ramp), infinite stamina, jump power,
 	            infinite jump, noclip, client-side fly.
@@ -23029,6 +23032,11 @@ for k, v in pairs({
 	autoEscapeRadius = 60,
 	autoDoors = false,
 	autoDoorsRadius = 60,
+	antiDetect = false,
+	antiDetectRadius = 45,
+	sightCones = false,
+	sightConeRange = 55,
+	sightWarn = true,
 	fly = false,
 	flySpeed = 80,
 	npcEsp = false,
@@ -23146,6 +23154,17 @@ local knockoutCurrent = nil
 local lastKnockoutNotice = 0
 local failedKnockAt = setmetatable({}, { __mode = "k" })
 local escaping = false
+-- one table keeps the main chunk under luau's 200-local register limit.
+local stealth = {
+	owned = false,
+	auto = false,
+	lastNear = 0,
+	lastSent = 0,
+	lastScan = 0,
+	lastSightNotice = 0,
+	frame = 0,
+	cones = {},
+}
 
 local function now()
 	return os.clock()
@@ -25069,6 +25088,249 @@ local function knockoutTargets(radius)
 	return rows
 end
 
+--// stealth / anti-detect --------------------------------------------------------
+
+function stealth.serverSneaking()
+	local char = LP.Character
+	return char ~= nil and char:GetAttribute("Sneaking") == true
+end
+
+function stealth.sendSneak(on, auto)
+	if dead then return false, "panel unloaded" end
+	on = on and true or false
+	auto = auto and true or false
+	local scripts = LP:FindFirstChild("PlayerScripts")
+	local sc = scripts and scripts:FindFirstChild("SprintClient")
+	local toggle = sc and sc:FindFirstChild("Toggle")
+
+	-- preferred: use the game's own Toggle bindable. SprintClient then updates
+	-- its internal state and fires the real Sneak remote itself, so it cannot
+	-- immediately fight us with the old state.
+	if toggle and toggle:IsA("BindableEvent") then
+		local isOn = sc:GetAttribute("Sneak") == true
+		if isOn ~= on then
+			toggle:Fire("Sneak")
+			stealth.owned = on
+			stealth.auto = on and auto or false
+			stealth.lastSent = now()
+			return true
+		end
+		if on then
+			if not stealth.serverSneaking() then
+				stealth.owned = true
+				stealth.auto = auto
+			elseif stealth.owned and auto then
+				stealth.auto = true
+			end
+		else
+			stealth.owned = false
+			stealth.auto = false
+			if stealth.serverSneaking() then
+				local remote = Remotes and Remotes:FindFirstChild("Sneak")
+				if remote then pcall(function() remote:FireServer(false) end) end
+				pcall(function() sc:SetAttribute("Crouching", false) end)
+			end
+		end
+		stealth.lastSent = now()
+		return true
+	end
+
+	-- fallback: direct remote (works, but SprintClient may fight the state if
+	-- its own internal toggle disagrees).
+	local remote = Remotes and Remotes:FindFirstChild("Sneak")
+	if not remote then return false, "sneak remote not found" end
+	if on and not stealth.serverSneaking() then
+		stealth.owned = true
+		stealth.auto = auto
+	end
+	pcall(function() remote:FireServer(on) end)
+	if sc then
+		pcall(function() sc:SetAttribute("Crouching", on) end)
+	end
+	stealth.lastSent = now()
+	if not on then
+		stealth.owned = false
+		stealth.auto = false
+	end
+	return true
+end
+
+function stealth.currentSight()
+	local uid = tostring(LP.UserId)
+	local root = charRoot()
+	if not root then return 0, nil, nil end
+	local myPos = root.Position
+	local best, bestModel, bestDist = 0, nil, nil
+	for _, folderName in ipairs({ "Npcs", "Guards", "Police", "Dogs" }) do
+		local folder = workspace:FindFirstChild(folderName)
+		if folder then
+			for _, model in ipairs(folder:GetChildren()) do
+				if model:IsA("Model") then
+					local v = tonumber(model:GetAttribute("Sight" .. uid))
+					if v and v > best then
+						local hum = model:FindFirstChildOfClass("Humanoid")
+						local part = model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart
+						if part and (not hum or hum.Health > 0) then
+							best = v
+							bestModel = model
+							bestDist = (part.Position - myPos).Magnitude
+						end
+					end
+				end
+			end
+		end
+	end
+	return best, bestModel, bestDist
+end
+
+-- the game's own crouch makes no walking noise (loading tip). This only fires
+-- the game's Sneak remote while a live npc is close or already noticing you.
+-- it does not hide you from server-side sight checks or cameras.
+function stealth.sneakTick()
+	if dead then return end
+	if not CFG.antiDetect then
+		if stealth.auto and now() - stealth.lastSent > 0.5 then
+			stealth.sendSneak(false)
+		end
+		return
+	end
+	if now() - stealth.lastScan < 0.2 then return end
+	stealth.lastScan = now()
+
+	local radius = math.clamp(tonumber(CFG.antiDetectRadius) or 45, 5, 200)
+	local near = knockoutTargets(radius)[1]
+	local sight = stealth.currentSight()
+	local threatened = near ~= nil or sight > 0.01
+	if threatened then
+		stealth.lastNear = now()
+		if not stealth.serverSneaking() and now() - stealth.lastSent > 0.8 then
+			stealth.sendSneak(true, true)
+		end
+	elseif stealth.owned and now() - stealth.lastNear > 2 then
+		stealth.sendSneak(false)
+	end
+end
+
+function stealth.coneFor(model)
+	local e = stealth.cones[model]
+	if e then return e end
+	e = {
+		left = newLine(Color3.fromRGB(110, 220, 140), 0.6, 1.5),
+		right = newLine(Color3.fromRGB(110, 220, 140), 0.6, 1.5),
+	}
+	stealth.cones[model] = e
+	return e
+end
+
+function stealth.hideCone(e)
+	if not e then return end
+	if e.left then e.left.Visible = false end
+	if e.right then e.right.Visible = false end
+end
+
+function stealth.dropCone(model)
+	local e = stealth.cones[model]
+	if not e then return end
+	removeDrawing(e.left)
+	removeDrawing(e.right)
+	stealth.cones[model] = nil
+end
+
+function stealth.project(cam, p)
+	local v, onScreen = cam:WorldToViewportPoint(p)
+	if not onScreen or v.Z <= 0 then return nil end
+	return Vector2.new(v.X, v.Y)
+end
+
+function stealth.yaw(v, a)
+	local c, s = math.cos(a), math.sin(a)
+	return Vector3.new(v.X * c - v.Z * s, 0, v.X * s + v.Z * c)
+end
+
+function stealth.sightConeTick()
+	stealth.frame = stealth.frame + 1
+	local frame = stealth.frame
+	if not CFG.sightCones then
+		for _, e in pairs(stealth.cones) do stealth.hideCone(e) end
+		return
+	end
+	local cam = workspace.CurrentCamera
+	local root = charRoot()
+	if not cam or not root then return end
+	local myPos = root.Position
+	local uid = tostring(LP.UserId)
+	local range = math.clamp(tonumber(CFG.sightConeRange) or 55, 10, 200)
+	local half = math.rad(35)
+
+	for _, group in ipairs({ "Npcs", "Guards", "Police" }) do
+		local folder = workspace:FindFirstChild(group)
+		if folder and npcEnabled(group) then
+			for _, model in ipairs(folder:GetChildren()) do
+				if model:IsA("Model") then
+					local hum = model:FindFirstChildOfClass("Humanoid")
+					local hrp = model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart
+					local head = model:FindFirstChild("Head") or hrp
+					if hum and hrp and head and hum.Health > 0 then
+						local dist = (hrp.Position - myPos).Magnitude
+						if dist <= 220 then
+							local e = stealth.coneFor(model)
+							local look = head.CFrame.LookVector
+							local flat = Vector3.new(look.X, 0, look.Z)
+							if flat.Magnitude < 0.1 then
+								look = hrp.CFrame.LookVector
+								flat = Vector3.new(look.X, 0, look.Z)
+							end
+							if flat.Magnitude < 0.1 then flat = Vector3.new(0, 0, 1) end
+							flat = flat.Unit
+							local origin = head.Position
+							local p0 = stealth.project(cam, origin)
+							local pl = stealth.project(cam, origin + stealth.yaw(flat, -half) * range)
+							local pr = stealth.project(cam, origin + stealth.yaw(flat, half) * range)
+							local sight = tonumber(model:GetAttribute("Sight" .. uid)) or 0
+							local color = sight >= 0.5 and Color3.fromRGB(255, 70, 70)
+								or (sight > 0.01 and Color3.fromRGB(255, 205, 90)
+								or Color3.fromRGB(110, 220, 140))
+							if p0 and pl and pr then
+								e.left.From, e.left.To = p0, pl
+								e.right.From, e.right.To = p0, pr
+								e.left.Color, e.right.Color = color, color
+								e.left.Transparency, e.right.Transparency = 0.55, 0.55
+								e.left.Thickness, e.right.Thickness = 1.5, 1.5
+								e.left.Visible, e.right.Visible = true, true
+								e.lastFrame = frame
+							else
+								stealth.hideCone(e)
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+
+	for model, e in pairs(stealth.cones) do
+		if not model.Parent then
+			stealth.dropCone(model)
+		elseif not e.lastFrame or e.lastFrame ~= frame then
+			stealth.hideCone(e)
+		end
+	end
+end
+
+function stealth.toggleSneakNow()
+	if stealth.serverSneaking() then
+		local ok, err = stealth.sendSneak(false)
+		if ok then notify("sneak off") else notify("sneak: " .. tostring(err)) end
+		return
+	end
+	local ok, err = stealth.sendSneak(true)
+	if ok then
+		notify("sneak on - footsteps silent")
+	else
+		notify("sneak: " .. tostring(err))
+	end
+end
+
 local function knockoutStand(model, part)
 	local rootPart = model:FindFirstChild("HumanoidRootPart") or part
 	local pos = part.Position
@@ -25413,6 +25675,11 @@ local function maxMode()
 	CFG.autoEscapeRadius = 50
 	CFG.autoDoors = true
 	CFG.autoDoorsRadius = 60
+	CFG.antiDetect = true
+	CFG.antiDetectRadius = 50
+	CFG.sightCones = true
+	CFG.sightConeRange = 55
+	CFG.sightWarn = true
 	CFG.customSpeed = true
 	CFG.walkSpeed = 60
 	CFG.speedGuard = true
@@ -25428,6 +25695,7 @@ local function maxMode()
 		for _, flag in ipairs({
 			"crim_lootesp", "crim_autograb", "crim_autoload",
 			"crim_autohaul", "crim_autoknock", "crim_autoescape", "crim_autodoors",
+			"crim_antidetect", "crim_sightcones", "crim_sightwarn",
 			"crim_speed", "crim_infstam", "crim_noclip",
 			"crim_fullbright", "crim_nofog", "crim_fovon",
 		}) do
@@ -25441,6 +25709,8 @@ local function maxMode()
 			crim_knockpunches = 6,
 			crim_escaperadius = 50,
 			crim_doorradius = 60,
+			crim_antidetectradius = 50,
+			crim_sightrange = 55,
 			crim_ws = 60,
 			crim_fov = 90,
 		}) do
@@ -25454,7 +25724,7 @@ local function maxMode()
 	pcall(staminaTick)
 	local cam = workspace.CurrentCamera
 	if cam then cam.FieldOfView = 90 end
-	notify("MAX MODE: loot esp, auto grab/load, auto haul (25 max, 250m), auto knockout, auto escape, auto doors, speed 60, stamina, noclip, fullbright, no fog, fov 90. fly stays as-is.")
+	notify("MAX MODE: loot esp, auto grab/load, auto haul (25 max, 250m), auto knockout, auto escape, auto doors, anti-detect sneak + sight cones, speed 60, stamina, noclip, fullbright, no fog, fov 90. fly stays as-is.")
 end
 
 --// panic / shutdown ------------------------------------------------------------
@@ -25469,6 +25739,7 @@ local panic
 
 local function shutdown()
 	if dead then return end
+	if stealth.owned then stealth.sendSneak(false) end
 	dead = true
 	haulStop = true
 	knockoutStop = true
@@ -25485,6 +25756,7 @@ local function shutdown()
 	restoreNoclip()
 	restoreVisuals()
 	clearDrawings()
+	stealth.cones = {}
 	npcDetailTeardown()
 	lootPool = {}
 	playerPool = {}
@@ -25505,6 +25777,11 @@ panic = function()
 	CFG.autoKnockout = false
 	CFG.autoEscape = false
 	CFG.autoDoors = false
+	CFG.antiDetect = false
+	CFG.sightCones = false
+	CFG.sightWarn = false
+	if stealth.owned then stealth.sendSneak(false) end
+	for _, e in pairs(stealth.cones) do stealth.hideCone(e) end
 	CFG.fly = false
 	CFG.autoRob = false
 	CFG.npcEsp = false
@@ -25533,6 +25810,7 @@ panic = function()
 		for _, flag in ipairs({
 			"crim_lootesp", "crim_autograb", "crim_autoload", "crim_autorb",
 			"crim_autohaul", "crim_autoknock", "crim_autoescape", "crim_autodoors",
+			"crim_antidetect", "crim_sightcones", "crim_sightwarn",
 			"crim_npcesp", "crim_npctags", "crim_npcdetails", "crim_pesp",
 			"crim_speed", "crim_infstam",
 			"crim_speednocap", "crim_jump",
@@ -25988,6 +26266,65 @@ local function buildUI()
 	})
 	ui.escapeInfo = worldTab:CreateText({ Name = "escape status", Text = "off" })
 
+	worldTab:CreateSection({ Name = "STEALTH / ANTI-DETECT" })
+	worldTab:CreateText({
+		Name = "stealth note",
+		Text = "auto sneak uses the game's own Sneak remote. the game's own loading tip says crouching makes no walking noise, so this silences footsteps while a live npc is close. it does not make you invisible: server-side sight checks and cameras can still see you. sight cones are a rough 70-degree guess from each npc's head, not the server's exact check.",
+	})
+	worldTab:CreateToggle({
+		Name = "anti-detect  (auto sneak)",
+		Description = "fires the game's Sneak remote near live npcs and stands you back up after 2 s clear. no cash, no invisibility.",
+		Flag = "crim_antidetect",
+		Value = CFG.antiDetect,
+		Callback = function(v)
+			CFG.antiDetect = v
+			if not v and stealth.auto then stealth.sendSneak(false) end
+		end,
+	})
+	worldTab:CreateSlider({
+		Name = "anti-detect radius",
+		Range = { 5, 120 },
+		Increment = 5,
+		Value = CFG.antiDetectRadius,
+		Suffix = " m",
+		Flag = "crim_antidetectradius",
+		Callback = function(v) CFG.antiDetectRadius = v end,
+	})
+	worldTab:CreateToggle({
+		Name = "show npc sight cones",
+		Description = "draws an estimated view wedge from each npc's head. green = clear, yellow = noticing, red = high sight.",
+		Flag = "crim_sightcones",
+		Value = CFG.sightCones,
+		Callback = function(v)
+			CFG.sightCones = v
+			if not v then
+				for _, e in pairs(stealth.cones) do stealth.hideCone(e) end
+			end
+		end,
+	})
+	worldTab:CreateSlider({
+		Name = "sight cone length",
+		Range = { 15, 150 },
+		Increment = 5,
+		Value = CFG.sightConeRange,
+		Suffix = " m",
+		Flag = "crim_sightrange",
+		Callback = function(v) CFG.sightConeRange = v end,
+	})
+	worldTab:CreateToggle({
+		Name = "sight warning",
+		Description = "reads the game's own Sight<userId> attribute and warns when an npc is noticing you.",
+		Flag = "crim_sightwarn",
+		Value = CFG.sightWarn,
+		Callback = function(v) CFG.sightWarn = v end,
+	})
+	worldTab:CreateButton({
+		Name = "sneak / stand now",
+		Description = "toggles the game's own Sneak remote once. auto-detect can re-enable it while an npc is still close.",
+		Callback = function() stealth.toggleSneakNow() end,
+	})
+	ui.sightInfo = worldTab:CreateText({ Name = "stealth status", Text = "off" })
+
 	worldTab:CreateSection({ Name = "PROMPT SNIPER" })
 	worldTab:CreateText({
 		Name = "how it works",
@@ -26409,6 +26746,9 @@ local function tick()
 		for _, e in pairs(npcPool) do hideHumanoidEsp(e) end
 	end
 
+	pcall(stealth.sneakTick)
+	pcall(stealth.sightConeTick)
+
 	if CFG.npcDetails then
 		pcall(npcDetailTick)
 	elseif npcDetailFrame then
@@ -26487,6 +26827,35 @@ local function tick()
 					or "off")
 			end)
 		end
+		if ui.sightInfo then
+			local sight, sightModel, sightDist = stealth.currentSight()
+			local text
+			if not CFG.sightWarn then
+				text = "warning off"
+			elseif sight <= 0 then
+				text = "clear - no npc has noticed you"
+			else
+				text = string.format(
+					"%d%% noticed by %s @ %dm",
+					math.floor(sight * 100 + 0.5),
+					sightModel and tostring(sightModel:GetAttribute("DisplayName") or sightModel.Name) or "npc",
+					math.floor((sightDist or 0) + 0.5)
+				)
+			end
+			if CFG.antiDetect then
+				text = text .. "  |  sneak " .. (stealth.serverSneaking() and "ON" or "waiting")
+			end
+			pcall(function() ui.sightInfo:Set(text) end)
+			if CFG.sightWarn and sight >= 0.85 and now() - stealth.lastSightNotice > 8 then
+				stealth.lastSightNotice = now()
+				notify(string.format(
+					"spotted %d%% by %s @ %dm - break line of sight",
+					math.floor(sight * 100 + 0.5),
+					sightModel and tostring(sightModel:GetAttribute("DisplayName") or sightModel.Name) or "npc",
+					math.floor((sightDist or 0) + 0.5)
+				))
+			end
+		end
 		if ui.flyInfo then
 			pcall(function()
 				ui.flyInfo:Set(CFG.fly
@@ -26538,6 +26907,11 @@ ui.charConn = LP.CharacterAdded:Connect(function()
 	baseJump = nil
 	baseUseJumpPower = nil
 	noclipSaved = {}
+	stealth.owned = false
+	stealth.auto = false
+	stealth.lastNear = 0
+	stealth.lastSent = 0
+	stealth.lastScan = 0
 	task.wait(0.5)
 	if CFG.customSpeed then startSpeed() end
 	if CFG.customJump then startJump() end
@@ -26661,6 +27035,21 @@ _G.CriminalPanel = {
 	knockoutCount = function() return #knockoutTargets(tonumber(CFG.knockoutRadius) or 25) end,
 	escape = escapeToHideout,
 	sell = sellNow,
+	antiDetect = function(on)
+		CFG.antiDetect = on and true or false
+		if not CFG.antiDetect and stealth.auto then stealth.sendSneak(false) end
+		return CFG.antiDetect
+	end,
+	sneak = stealth.sendSneak,
+	sneakNow = stealth.toggleSneakNow,
+	sight = stealth.currentSight,
+	sightConeCount = function()
+		local n = 0
+		for _, e in pairs(stealth.cones) do
+			if e.left and e.left.Visible then n = n + 1 end
+		end
+		return n
+	end,
 	maxMode = maxMode,
 	flyOn = startFly,
 	flyOff = stopFly,
@@ -26673,7 +27062,7 @@ _G.CriminalPanel = {
 	npcDump = npcDetailDump,
 }
 
-print("[CRIMINAL] panel loaded - loot esp, haul to truck, auto knockout, auto escape, fly, npc details, prompt sniper, stamina, speed guard, movement")
+print("[CRIMINAL] panel loaded - loot esp, haul to truck, auto knockout, auto escape, anti-detect sneak/sight, fly, npc details, prompt sniper, stamina, speed guard, movement")
 end
 
 --// dispatch -------------------------------------------------------------------
