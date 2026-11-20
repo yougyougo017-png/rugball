@@ -18919,6 +18919,133 @@ local function hookStoppage(self, winner, method, detail, kind)
 end
 Match.stoppage = hookStoppage
 
+--// hit reach -> contact test ----------------------------------------------------
+-- Combat.resolve tests the strike point against per-zone radii: head
+-- 0.5*s+0.32, body 0.62*rig.W*s+0.32, shins 0.36*s+0.32 / 0.28*s+0.3. the hit
+-- reach slider used to only change when the auto fighter swings, so a value past
+-- the real radius still whiffed. this replaces that local test with one scaled
+-- by the slider. it is gated on the defender being this match's opponent, so
+-- incoming strikes still use the game's real hitbox.
+--
+-- the whole patch lives in a do block: this suite is already at the top-level
+-- register limit, so its locals are scoped and the four handles live on ui.
+
+ui.hitbox = {
+	installed = function() return false end,
+	mult = function() return math.clamp(tonumber(CFG.hitReach) or 1.30, 0.80, 1.60) end,
+	hasOriginal = function() return false end,
+	restore = function() end,
+}
+
+do
+local Combat = tryRequire("Combat")
+local hitboxInstalled = false
+local hitboxOldResolve = nil
+local hitboxOldTable = nil
+local hitboxNewResolve = nil
+local hitboxNewTable = nil
+
+local function hitboxMult()
+	return math.clamp(tonumber(CFG.hitReach) or 1.30, 0.80, 1.60)
+end
+
+local function hitboxExpanded(defender, point, zone)
+	local m = match
+	if not m or m.closed or m.finish or m.state ~= "fight" then return nil end
+	if defender ~= m.opp then return nil end
+	local mult = hitboxMult()
+	if mult <= 1 then return nil end
+	if typeof(point) ~= "Vector3" or not defender.rig or not defender.rig.bones then return nil end
+	local s = tonumber(defender.s) or 1
+	local rig = defender.rig
+	local w = tonumber(rig.W) or 1
+	local best, bestN, want = nil, nil, nil
+	local function consider(z, n, calf)
+		if n <= mult then
+			local rec = { zone = z, n = math.min(n, 1), calf = calf }
+			if z == zone then want = want or rec end
+			if not bestN or n < bestN then best, bestN = rec, n end
+		end
+	end
+	local head = rig:point("head")
+	if head then consider("head", (point - head).Magnitude / (0.5 * s + 0.32)) end
+	local pelvis, chest = rig:point("pelvis"), rig:point("chest")
+	if pelvis and chest then
+		consider("body", Util.pointSegDist(point, pelvis + Vector3.new(0, 0.35 * s, 0), chest) / (0.62 * w * s + 0.32))
+	end
+	for _, side in ipairs({ "L", "R" }) do
+		local thigh, shin, foot = rig.bones["Thigh" .. side], rig.bones["Shin" .. side], rig.bones["Foot" .. side]
+		if thigh and shin and foot then
+			local n1 = Util.pointSegDist(point, thigh.world.Position, shin.world.Position) / (0.36 * s + 0.32)
+			local n2 = Util.pointSegDist(point, shin.world.Position, foot.world.Position) / (0.28 * s + 0.3)
+			consider("leg" .. side, math.min(n1, n2), n2 < n1)
+		end
+	end
+	return want or best
+end
+
+local function hitboxZone(original)
+	return function(defender, point, zone)
+		local hit = original(defender, point, zone)
+		if hit then
+			local m = match
+			if not m or m.closed or m.finish or m.state ~= "fight" or defender ~= m.opp then return hit end
+			local mult = hitboxMult()
+			if mult < 1 and (hit.n or 0) > mult then return nil end
+			return hit
+		end
+		return hitboxExpanded(defender, point, zone)
+	end
+end
+
+local function restoreHitbox()
+	if not hitboxInstalled then return end
+	pcall(function()
+		if Combat and type(Combat.resolve) == "function" then
+			local info = debug.getinfo(Combat.resolve)
+			for i = 1, info.nups do
+				if debug.getupvalue(Combat.resolve, i) == hitboxNewResolve then
+					debug.setupvalue(Combat.resolve, i, hitboxOldResolve)
+				end
+			end
+		end
+		if Combat and Combat.zoneHit == hitboxNewTable then
+			Combat.zoneHit = hitboxOldTable
+		end
+	end)
+	hitboxInstalled = false
+end
+
+local function installHitbox()
+	if hitboxInstalled or not Combat or type(Combat.resolve) ~= "function" or type(Combat.zoneHit) ~= "function" then return end
+	local info = debug.getinfo(Combat.resolve)
+	if not info or not info.nups then return end
+	for i = 1, info.nups do
+		local v = debug.getupvalue(Combat.resolve, i)
+		if v == Combat.zoneHit then
+			hitboxOldResolve = v
+			hitboxOldTable = Combat.zoneHit
+			hitboxNewResolve = hitboxZone(hitboxOldResolve)
+			hitboxNewTable = hitboxZone(hitboxOldTable)
+			debug.setupvalue(Combat.resolve, i, hitboxNewResolve)
+			Combat.zoneHit = hitboxNewTable
+			hitboxInstalled = true
+			pushLog("hit reach  |  contact test x" .. tostring(hitboxMult()))
+			return
+		end
+	end
+end
+
+pcall(installHitbox)
+
+ui.hitbox = {
+	installed = function() return hitboxInstalled end,
+	mult = hitboxMult,
+	hasOriginal = function() return hitboxOldResolve ~= nil end,
+	restore = restoreHitbox,
+}
+end
+
 --// aim -------------------------------------------------------------------------
 
 local function aimPoint(m, zone)
@@ -19071,8 +19198,8 @@ local function pickStrike(m, dist, reach, threat)
 	if CFG.safeKicks then
 		safeKick = (not threat) and kickWindow(m, dist)
 	end
-	-- hit reach is spacing only: the game resolves the hit from the limb's real
-	-- position, so a value past the real contact range throws a whiff.
+	-- hit reach also scales the contact test (see the hit-reach patch), so the
+	-- auto fighter can start a strike at the edge of the expanded hitbox.
 	local hitReach = math.clamp(tonumber(CFG.hitReach) or 1.30, 0.80, 1.60)
 	local canKick = safeKick and dist <= reach * hitReach
 
@@ -20651,7 +20778,7 @@ local function buildUI()
 	})
 	fightTab:CreateSlider({
 		name = "hit reach",
-		description = "how far out the auto fighter starts a strike, as a multiple of the game's own reach. 1.30x is the edge the panel already used; lower it to only strike closer, raise it to throw earlier. this changes when the panel swings, not the game's hitbox: a value past the real contact range throws a whiff.",
+		description = "scales the game's contact test as well as the auto fighter's spacing. 1.30x makes the per-zone hit radii (head, body, shins) 30% larger for your strikes, so a swing that stops just short still counts; lower it to shrink the contact test. only your strikes on the opponent are affected - incoming strikes keep the real hitbox. the animation can look like a near-miss because the limb itself is not stretched.",
 		flag = "mma_hitReach",
 		range = { 0.80, 1.60 },
 		increment = 0.05,
@@ -21180,6 +21307,7 @@ shutdown = function()
 	dead = true
 	spinStop = true
 	restoreRage()
+	pcall(ui.hitbox.restore)
 	if AntiCheat and type(acAttachOriginal) == "function" then
 		pcall(function() AntiCheat.attach = acAttachOriginal end)
 	end
@@ -21422,7 +21550,7 @@ task.spawn(function()
 end)
 
 _G.RagdollMmaPanel = {
-	build = "ironknuckles-2g",
+	build = "ironknuckles-2h",
 	cfg = CFG,
 	guard = guardTick,
 	guardState = function()
@@ -21456,6 +21584,9 @@ _G.RagdollMmaPanel = {
 	hud = hud,
 	drawings = drawings,
 	getMatch = function() return match end,
+	hitbox = function()
+		return { installed = ui.hitbox.installed(), mult = ui.hitbox.mult(), original = ui.hitbox.hasOriginal() }
+	end,
 	scan = scanForMatch,
 	aim = aimAt,
 	applyBest = applyBestCfg,
