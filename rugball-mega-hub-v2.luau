@@ -19500,6 +19500,13 @@ local counterSpent = false
 local guardHeld = 0
 local guardPulse = 0
 local guardT = 0
+-- why the guard did or did not run. tick() used to swallow guard errors, so a
+-- nil field on one live fighter meant the guard silently did nothing all fight.
+local GUARD = {
+	calls = 0, noFighter = 0, notFight = 0, noControls = 0,
+	down = 0, ground = 0, off = 0, high = 0, low = 0,
+	err = "",
+}
 local function setMove(vec)
 	match.debugMove = vec
 	nextMoveClear = now() + 0.25
@@ -19514,11 +19521,13 @@ end
 -- the guard is its own job so `auto block` keeps working when `auto fight` is
 -- off: it writes only the game's two guard inputs, never movement or strikes.
 local function guardTick(m, dist, pressing, threat)
+	GUARD.calls = GUARD.calls + 1
 	local p, o = m.player, m.opp
-	if not (p and o and p.rig and o.rig) then return end
-	if m.state ~= "fight" or m.finish or not m.controls then return end
-	if p.down or o.down or p.rig.ragdolled or o.rig.ragdolled then return end
-	if m.gnd or m.drive then return end
+	if not (p and o and p.rig and o.rig) then GUARD.noFighter = GUARD.noFighter + 1 return end
+	if m.state ~= "fight" or m.finish then GUARD.notFight = GUARD.notFight + 1 return end
+	if not m.controls then GUARD.noControls = GUARD.noControls + 1 return end
+	if p.down or o.down or p.rig.ragdolled or o.rig.ragdolled then GUARD.down = GUARD.down + 1 return end
+	if m.gnd or m.drive then GUARD.ground = GUARD.ground + 1 return end
 	if threat == nil then threat = incomingStrike(m) end
 	if not dist then dist = flat(o.pos - p.pos).Magnitude end
 	pressing = pressing == true
@@ -19531,11 +19540,14 @@ local function guardTick(m, dist, pressing, threat)
 		-- hold the guard before the strike instead of after it: inside their
 		-- arm reach a fast jab winds up in two frames, and blockAmt only
 		-- counts above 0.55, which takes about three frames to ramp.
-		local pocket = dist <= armReach(o) + 0.6 * (tonumber(o.s) or 1)
+		-- pre-raise only just inside punching range. holding it across the whole
+		-- kick range costs 40% walk speed (Fighter multiplies speed by
+		-- 1 - max(blockAmt, lowAmt) * 0.4), which is exactly how a pressure
+		-- fighter corners you and lands the uppercut.
+		local pocket = dist <= armReach(o) + 0.30 * (tonumber(o.s) or 1)
 		local ready = o.mode == "fight" and not o.down and not o.shot and not o.clinch
 			and (tonumber(o.stamina) or 100) >= 8
 		local live = liveStrike(m)
-		local impact = live and live.left
 		-- the game has a separate low guard (Touch.lowBlock): body shots and
 		-- takedowns. the AI aims body 65% of the time while blockAmt is above
 		-- 0.5, and lowAmt is immune to blockHold, so switch to it while a body
@@ -19545,40 +19557,26 @@ local function guardTick(m, dist, pressing, threat)
 		if (live and live.zone == "body" and threat) or shot then
 			guardPulse = 0
 			guardHeld = 0
+			GUARD.low = GUARD.low + 1
 			Touch.lowBlock = true
 			setBlock(false)
 		else
 			Touch.lowBlock = false
-			if guardPulse > 0 then
-				if impact == 0 then
-					-- a strike reached its extend while the guard was down: abort
-					-- the reset and start ramping blockAmt for the next one.
-					guardPulse = 0
-					setBlock(true)
-					guardHeld = 0.9
-				else
-					guardPulse = guardPulse - 1
-					setBlock(false)
-					guardHeld = 0
-				end
-			elseif guardHeld >= 1.25 and (impact == nil or impact > 0.13) then
-				-- the game punishes a held guard: blockHold past 1.5 s drags the
-				-- block roll from 0.78 toward 0.23. three ticks below the 0.55
-				-- threshold reset it, so only drop it when nothing is landing.
-				guardPulse = 3
-				setBlock(false)
-				guardHeld = 0
+			-- do not pulse the guard down in the pocket to reset blockHold: a
+			-- 1.3x jab winds up in ~0.04 s, so a deliberate 3-tick hole is a
+			-- clean hit every time. it resets naturally when we leave the pocket
+			-- or throw our own strike (isStriking zeroes blockAmt).
+			local up = (not pressing) and ((threat ~= false) or (pocket and ready))
+			if up then GUARD.high = GUARD.high + 1 end
+			setBlock(up)
+			if up then
+				guardHeld = guardHeld + dt
 			else
-				local up = (not pressing) and ((threat ~= false) or (pocket and ready))
-				setBlock(up)
-				if up then
-					guardHeld = guardHeld + dt
-				else
-					guardHeld = 0
-				end
+				guardHeld = 0
 			end
 		end
 	else
+		GUARD.off = GUARD.off + 1
 		guardHeld, guardPulse, guardT = 0, 0, 0
 		if Touch.lowBlock then Touch.lowBlock = false end
 	end
@@ -21157,6 +21155,21 @@ end
 local lastSync = 0
 local lastHudWarn = 0
 local lastSave = 0
+local lastAutoWarn = 0
+
+-- pcall alone hides the exact error and the guard then does nothing for the
+-- whole fight. surface it once per 5 s and keep the message in GUARD.err.
+local function runAuto(name, fn, m)
+	local ok, err = pcall(fn, m)
+	if not ok then
+		GUARD.err = name .. ": " .. tostring(err)
+		local t = now()
+		if t - lastAutoWarn > 5 then
+			lastAutoWarn = t
+			warn("[MMA] " .. name .. " error: " .. tostring(err))
+		end
+	end
+end
 
 local function tick()
 	if dead then return end
@@ -21191,10 +21204,10 @@ local function tick()
 		pcall(adaptTick, m)
 		pcall(rageTick, m)
 		if autoOn("autoFight") then
-			pcall(fightTick, m)
+			runAuto("fight", fightTick, m)
 		elseif autoOn("autoBlock") then
 			-- block is its own switch: keep guarding even when auto fight is off
-			pcall(guardTick, m)
+			runAuto("guard", guardTick, m)
 		end
 		pcall(groundTick, m)
 		pcall(driveTick, m)
@@ -21254,7 +21267,7 @@ task.spawn(function()
 end)
 
 _G.RagdollMmaPanel = {
-	build = "ironknuckles-1",
+	build = "ironknuckles-2",
 	cfg = CFG,
 	guard = guardTick,
 	guardState = function()
@@ -21266,6 +21279,12 @@ _G.RagdollMmaPanel = {
 			touchLow = Touch.lowBlock == true,
 			autoBlock = CFG.autoBlock,
 			autoFight = CFG.autoFight,
+			fp = match and match.fp == true,
+			controls = match and match.controls == true,
+			state = match and match.state,
+			gnd = match and match.gnd ~= nil,
+			drive = match and match.drive ~= nil,
+			diag = GUARD,
 		}
 	end,
 	window = ui.window,
