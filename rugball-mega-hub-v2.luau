@@ -17605,6 +17605,8 @@ for k, v in pairs({
 	fightStyle = "best owned",
 	spinCount = 10,
 	spinStopRare = true,
+	replayRecord = true,
+	replaySeconds = 45,
 	rageMode = false,
 	rageBoost = false,
 	rageDamage = 8,
@@ -20705,6 +20707,7 @@ local function buildUI()
 	end)
 
 	local fightTab = w:CreateTab({ name = "FIGHT" })
+	local replayTab = w:CreateTab({ name = "REPLAY" })
 	local styleTab = w:CreateTab({ name = "STYLE" })
 	local rageTab = w:CreateTab({ name = "RAGE" })
 	local groundTab = w:CreateTab({ name = "GROUND" })
@@ -21257,6 +21260,443 @@ local function buildUI()
 	})
 	sysTab:CreateSection({ name = "STATE" })
 	ui.diag = sysTab:CreateText({ name = "diag", text = "match: none" })
+
+	-- REPLAY
+	ui.replayCard = replayTab:CreateText({ name = "replay  |  idle", text = "no fight recorded yet" })
+	replayTab:CreateToggle({
+		name = "record fights",
+		description = "records both fighters' body poses at 10 Hz in memory while a round is live. the last N seconds are kept and can be played back after the fight. visual only: it sends no remotes and changes no health, stamina or match state.",
+		flag = "mma_replayRecord",
+		value = CFG.replayRecord,
+		callback = function(v)
+			CFG.replayRecord = v
+			if not v and ui.replay then pcall(ui.replay.finish) end
+		end,
+	})
+	replayTab:CreateSlider({
+		name = "replay length",
+		description = "how many seconds of the fight stay in memory. shorter is lighter; 45 s covers about two rounds.",
+		flag = "mma_replaySeconds",
+		range = { 10, 120 },
+		increment = 5,
+		value = CFG.replaySeconds,
+		suffix = "s",
+		callback = function(v) CFG.replaySeconds = math.clamp(tonumber(v) or 45, 10, 120) end,
+	})
+	replayTab:CreateButton({
+		name = "replay last fight",
+		description = "plays the recorded poses on clones at the original arena position. the camera is scripted while it plays and restored after. unavailable while a bout is live.",
+		callback = function()
+			if ui.replay then pcall(ui.replay.play) end
+		end,
+	})
+	replayTab:CreateButton({
+		name = "stop replay",
+		description = "ends playback and restores the camera.",
+		callback = function()
+			if ui.replay then pcall(ui.replay.stop) end
+		end,
+	})
+	replayTab:CreateSection({ name = "INFO" })
+	replayTab:CreateText({
+		name = "how it works",
+		text = "this is a local pose recording, not a video. the panel clones both rigs when the round starts, samples every visible part ten times a second and moves the clones through those frames. the game keeps ownership of damage, stamina, health and the result. the last recording stays available until the next fight replaces it or the panel unloads.",
+	})
+end
+
+--// replay -----------------------------------------------------------------------
+-- pose recorder + clone playback. this never sends a remote or writes match
+-- state: it samples the visible parts of both rigs at 10 Hz, keeps the last N
+-- seconds, and moves cloned rigs through those frames after the bout.
+
+do
+	local function installReplay()
+	local REC_DT = 0.1
+	local MAX_PARTS = 4000
+
+	local recording = nil
+	local lastReplay = nil
+	local playback = nil
+	local retryAt = 0
+	local cardAt = 0
+
+	local function replaySeconds()
+		return math.clamp(tonumber(CFG.replaySeconds) or 45, 10, 120)
+	end
+
+	local function collectParts(model)
+		local out = {}
+		local function walk(inst)
+			for _, child in ipairs(inst:GetChildren()) do
+				if child:IsA("BasePart") then out[#out + 1] = child end
+				walk(child)
+			end
+		end
+		if model then walk(model) end
+		return out
+	end
+
+	local function snapshot(parts)
+		local cframes = table.create(#parts)
+		for i = 1, #parts do cframes[i] = parts[i].CFrame end
+		return cframes
+	end
+
+	local function focusIndex(parts)
+		for i = 1, #parts do
+			local part = parts[i]
+			if part.Name == "Pelvis" and part.Transparency >= 0.99 then return i end
+		end
+		for i = 1, #parts do
+			if parts[i].Name == "Pelvis" then return i end
+		end
+		return #parts > 0 and 1 or nil
+	end
+
+	local function makeTemplate(model)
+		if not model then return nil end
+		local old = model.Archivable
+		model.Archivable = true
+		local clone = model:Clone()
+		model.Archivable = old
+		if not clone then return nil end
+		clone.Name = "SLIMHUB_REPLAY_TEMPLATE"
+		clone.Archivable = true
+		for _, part in ipairs(collectParts(clone)) do
+			part.Anchored = true
+			part.CanCollide = false
+			part.CanTouch = false
+			part.CanQuery = false
+		end
+		return clone
+	end
+
+	local function destroyModel(model)
+		if model then pcall(function() model:Destroy() end) end
+	end
+
+	local function buffered(rec)
+		if not rec or #rec.frames == 0 then return 0 end
+		return rec.frames[#rec.frames].t - rec.frames[1].t
+	end
+
+	local function updateCard()
+		if not ui.replayCard then return end
+		local title, text
+		if playback then
+			title = "replay  |  playing"
+			text = string.format("%.1fs / %.1fs  |  %d frames", playback.t - playback.firstT, playback.duration, #playback.frames)
+		elseif recording then
+			title = "replay  |  recording"
+			text = string.format("%.1fs buffered  |  %d frames  |  max %ds", buffered(recording), #recording.frames, replaySeconds())
+		elseif lastReplay then
+			title = "replay  |  ready"
+			text = string.format("last fight %.1fs  |  %d frames  |  %s", lastReplay.duration, #lastReplay.frames, lastReplay.label or "fight")
+		else
+			title = "replay  |  idle"
+			text = CFG.replayRecord and "no fight recorded yet - starts at the next live round" or "recording is off"
+		end
+		pcall(function()
+			ui.replayCard:SetTitle(title)
+			ui.replayCard:Set(text)
+		end)
+	end
+
+	local function stopPlayback()
+		if not playback then return end
+		local pb = playback
+		playback = nil
+		if pb.conn then pcall(function() pb.conn:Disconnect() end) end
+		if pb.folder then pcall(function() pb.folder:Destroy() end) end
+		if pb.cam then
+			pcall(function()
+				pb.cam.CameraType = pb.camType
+				pb.cam.CFrame = pb.camCFrame
+				if pb.camSubject then pb.cam.CameraSubject = pb.camSubject end
+			end)
+		end
+		updateCard()
+	end
+
+	local function abort()
+		local rec = recording
+		recording = nil
+		if rec then
+			destroyModel(rec.playerTemplate)
+			destroyModel(rec.oppTemplate)
+		end
+		updateCard()
+	end
+
+	local function finalize()
+		local rec = recording
+		if not rec then return nil end
+		recording = nil
+		if #rec.frames < 5 or buffered(rec) < 0.4 then
+			destroyModel(rec.playerTemplate)
+			destroyModel(rec.oppTemplate)
+			updateCard()
+			return nil
+		end
+		rec.duration = buffered(rec)
+		rec.playerParts = nil
+		rec.oppParts = nil
+		if lastReplay then
+			destroyModel(lastReplay.playerTemplate)
+			destroyModel(lastReplay.oppTemplate)
+		end
+		lastReplay = rec
+		pushLog(string.format("replay saved: %.1fs  |  %d frames", rec.duration, #rec.frames))
+		updateCard()
+		return rec
+	end
+
+	local function append(rec)
+		if not rec or #rec.playerParts == 0 or #rec.oppParts == 0 then return end
+		local okA, a = pcall(snapshot, rec.playerParts)
+		local okB, b = pcall(snapshot, rec.oppParts)
+		if not okA or not okB then return end
+		rec.frames[#rec.frames + 1] = { t = rec.t, a = a, b = b }
+		local maxFrames = math.max(50, math.floor(replaySeconds() * 10))
+		while #rec.frames > maxFrames do table.remove(rec.frames, 1) end
+	end
+
+	local function start(m)
+		local playerModel = m.player and m.player.rig and m.player.rig.model
+		local oppModel = m.opp and m.opp.rig and m.opp.rig.model
+		if not playerModel or not oppModel then return end
+		local playerParts = collectParts(playerModel)
+		local oppParts = collectParts(oppModel)
+		if #playerParts == 0 or #oppParts == 0 or #playerParts > MAX_PARTS or #oppParts > MAX_PARTS then return end
+		local playerTemplate = makeTemplate(playerModel)
+		local oppTemplate = makeTemplate(oppModel)
+		if not playerTemplate or not oppTemplate then
+			destroyModel(playerTemplate)
+			destroyModel(oppTemplate)
+			return
+		end
+		if #collectParts(playerTemplate) ~= #playerParts or #collectParts(oppTemplate) ~= #oppParts then
+			destroyModel(playerTemplate)
+			destroyModel(oppTemplate)
+			return
+		end
+		local label = m.ranked and "ranked" or "fight"
+		if m.opp and type(m.opp.name) == "string" and m.opp.name ~= "" then
+			label = label .. " vs " .. m.opp.name
+		end
+		recording = {
+			match = m,
+			playerParts = playerParts,
+			oppParts = oppParts,
+			playerTemplate = playerTemplate,
+			oppTemplate = oppTemplate,
+			playerFocus = focusIndex(playerParts),
+			oppFocus = focusIndex(oppParts),
+			frames = {},
+			t = 0,
+			acc = 0,
+			label = label,
+		}
+		append(recording)
+		updateCard()
+		pushLog("replay  |  recording started")
+	end
+
+	local function play()
+		local m = match
+		if m and not m.finish and (m.state == "fight" or m.state == "break" or m.state == "setup") then
+			notify("replay: finish the current fight first")
+			return false
+		end
+		if recording then finalize() end
+		if not lastReplay then
+			notify("replay: no fight recorded yet")
+			return false
+		end
+		stopPlayback()
+		local rec = lastReplay
+		if #rec.frames < 2 then return false end
+		local playerModel = rec.playerTemplate:Clone()
+		local oppModel = rec.oppTemplate:Clone()
+		if not playerModel or not oppModel then
+			destroyModel(playerModel)
+			destroyModel(oppModel)
+			notify("replay: could not clone the recorded rigs")
+			return false
+		end
+		local playerParts = collectParts(playerModel)
+		local oppParts = collectParts(oppModel)
+		local first = rec.frames[1]
+		if #playerParts ~= #first.a or #oppParts ~= #first.b then
+			destroyModel(playerModel)
+			destroyModel(oppModel)
+			notify("replay: recorded rig no longer matches")
+			return false
+		end
+		for _, part in ipairs(playerParts) do
+			part.Anchored = true
+			part.CanCollide = false
+			part.CanTouch = false
+			part.CanQuery = false
+		end
+		for _, part in ipairs(oppParts) do
+			part.Anchored = true
+			part.CanCollide = false
+			part.CanTouch = false
+			part.CanQuery = false
+		end
+		for i = 1, #playerParts do playerParts[i].CFrame = first.a[i] end
+		for i = 1, #oppParts do oppParts[i].CFrame = first.b[i] end
+		local folder = Instance.new("Folder")
+		folder.Name = "SLIMHUB_REPLAY"
+		playerModel.Parent = folder
+		oppModel.Parent = folder
+		folder.Parent = workspace
+		local cam = workspace.CurrentCamera
+		playback = {
+			frames = rec.frames,
+			playerParts = playerParts,
+			oppParts = oppParts,
+			playerFocus = rec.playerFocus or 1,
+			oppFocus = rec.oppFocus or 1,
+			t = first.t,
+			firstT = first.t,
+			duration = rec.duration,
+			index = 1,
+			cam = cam,
+			camType = cam and cam.CameraType,
+			camCFrame = cam and cam.CFrame,
+			camSubject = cam and cam.CameraSubject,
+			folder = folder,
+			lastCard = 0,
+			holdUntil = nil,
+			a = table.create(#playerParts),
+			b = table.create(#oppParts),
+		}
+		if cam then cam.CameraType = Enum.CameraType.Scriptable end
+		playback.conn = RunService.RenderStepped:Connect(function(dt)
+			local pb = playback
+			if not pb then return end
+			pb.t += dt
+			local frames = pb.frames
+			local last = frames[#frames]
+			local playT = pb.t
+			if playT >= last.t then
+				playT = last.t
+				pb.holdUntil = pb.holdUntil or (os.clock() + 0.5)
+				if os.clock() > pb.holdUntil then
+					stopPlayback()
+					return
+				end
+			end
+			local index = pb.index
+			while index < #frames and frames[index + 1].t <= playT do index = index + 1 end
+			pb.index = index
+			local f1 = frames[index]
+			local f2 = frames[math.min(index + 1, #frames)]
+			local alpha = 0
+			if f2.t > f1.t then alpha = math.clamp((playT - f1.t) / (f2.t - f1.t), 0, 1) end
+			for i = 1, #pb.playerParts do pb.a[i] = f1.a[i]:Lerp(f2.a[i], alpha) end
+			for i = 1, #pb.oppParts do pb.b[i] = f1.b[i]:Lerp(f2.b[i], alpha) end
+			local ok = pcall(function()
+				workspace:BulkMoveTo(pb.playerParts, pb.a, Enum.BulkMoveMode.FireCFrameChanged)
+				workspace:BulkMoveTo(pb.oppParts, pb.b, Enum.BulkMoveMode.FireCFrameChanged)
+			end)
+			if not ok then
+				stopPlayback()
+				return
+			end
+			if cam then
+				local p1 = pb.a[pb.playerFocus] and pb.a[pb.playerFocus].Position or Vector3.new()
+				local p2 = pb.b[pb.oppFocus] and pb.b[pb.oppFocus].Position or Vector3.new()
+				local mid = (p1 + p2) * 0.5
+				local dist = math.clamp((p1 - p2).Magnitude, 2.5, 14)
+				cam.CFrame = CFrame.lookAt(mid + Vector3.new(0, 2.4, dist * 0.85 + 2.2), mid + Vector3.new(0, 0.5, 0))
+			end
+			local t = os.clock()
+			if t - pb.lastCard > 0.25 then
+				pb.lastCard = t
+				updateCard()
+			end
+		end)
+		notify("replay: playing last fight")
+		updateCard()
+		return true
+	end
+
+	local function tick(dt)
+		if dead then return end
+		if playback then
+			local m = match
+			if m and not m.finish and (m.state == "fight" or m.state == "break" or m.state == "setup") then
+				stopPlayback()
+			end
+			return
+		end
+		local rec = recording
+		local m = match
+		if rec then
+			if not m or m ~= rec.match or m.closed or m.finish or m.state == "ended" then
+				append(rec)
+				finalize()
+				return
+			end
+			if m.state == "fight" and not m.finish then
+				dt = math.clamp(dt, 0, 0.25)
+				rec.t += dt
+				rec.acc += dt
+				if rec.acc >= REC_DT then
+					rec.acc = 0
+					append(rec)
+					local t = os.clock()
+					if t - cardAt > 0.5 then
+						cardAt = t
+						updateCard()
+					end
+				end
+			end
+			return
+		end
+		if not CFG.replayRecord then return end
+		if not m or m.closed or m.finish or m.state ~= "fight" or not m.controls then return end
+		if os.clock() < retryAt then return end
+		start(m)
+		if not recording then retryAt = os.clock() + 5 end
+	end
+
+	ui.replay = {
+		play = play,
+		stop = stopPlayback,
+		finish = finalize,
+		abort = abort,
+		state = function()
+			return {
+				recording = recording ~= nil,
+				frames = recording and #recording.frames or (lastReplay and #lastReplay.frames) or 0,
+				duration = lastReplay and lastReplay.duration or (recording and buffered(recording)) or 0,
+				playing = playback ~= nil,
+				record = CFG.replayRecord == true,
+				hasLast = lastReplay ~= nil,
+			}
+		end,
+		shutdown = function()
+			stopPlayback()
+			abort()
+			if lastReplay then
+				destroyModel(lastReplay.playerTemplate)
+				destroyModel(lastReplay.oppTemplate)
+				lastReplay = nil
+			end
+			if ui.replay and ui.replay.conn then
+				pcall(function() ui.replay.conn:Disconnect() end)
+				ui.replay.conn = nil
+			end
+		end,
+	}
+	ui.replay.conn = RunService.Heartbeat:Connect(tick)
+	updateCard()
+	end
+	installReplay()
 end
 
 --// loop ------------------------------------------------------------------------
@@ -21284,8 +21724,13 @@ local function panic()
 	CFG.rageSpeed = false
 	CFG.rageFreeze = false
 	CFG.acBypass = false
+	CFG.replayRecord = false
 	spinStop = true
 	restoreRage()
+	if ui.replay then
+		pcall(ui.replay.stop)
+		pcall(ui.replay.abort)
+	end
 	pcall(setAcShield, false)
 	if match then
 		pcall(function()
@@ -21293,7 +21738,7 @@ local function panic()
 		end)
 	end
 	pcall(function() Touch.block = false; Touch.lowBlock = false end)
-	for _, flag in ipairs({ "mma_autoFight", "mma_autoAim", "mma_autoBlock", "mma_autoCounter", "mma_autoLegKick", "mma_autoTakedown", "mma_autoGround", "mma_autoSub", "mma_autoSprawl", "mma_autoQueue", "mma_autoBest", "mma_autoContinue", "mma_rageMode", "mma_rageBoost", "mma_rageOnePunch", "mma_antiKO", "mma_rageGod", "mma_rageStamina", "mma_rageSpeed", "mma_rageFreeze", "mma_acBypass" }) do
+	for _, flag in ipairs({ "mma_autoFight", "mma_autoAim", "mma_autoBlock", "mma_autoCounter", "mma_autoLegKick", "mma_autoTakedown", "mma_autoGround", "mma_autoSub", "mma_autoSprawl", "mma_autoQueue", "mma_autoBest", "mma_autoContinue", "mma_rageMode", "mma_rageBoost", "mma_rageOnePunch", "mma_antiKO", "mma_rageGod", "mma_rageStamina", "mma_rageSpeed", "mma_rageFreeze", "mma_acBypass", "mma_replayRecord" }) do
 		if ui.window then pcall(function() ui.window:Set(flag, false) end) end
 	end
 	status = "panic  |  automation off"
@@ -21322,6 +21767,7 @@ shutdown = function()
 	if Match.stoppage == hookStoppage then
 		Match.stoppage = oldStoppage
 	end
+	if ui.replay then pcall(ui.replay.shutdown) end
 	clearHud()
 	if ui.keyConn then pcall(function() ui.keyConn:Disconnect() end) end
 	if ui.loopConn then pcall(function() ui.loopConn:Disconnect() end) end
@@ -21550,7 +21996,7 @@ task.spawn(function()
 end)
 
 _G.RagdollMmaPanel = {
-	build = "ironknuckles-2h",
+	build = "ironknuckles-2i",
 	cfg = CFG,
 	guard = guardTick,
 	guardState = function()
@@ -21586,6 +22032,15 @@ _G.RagdollMmaPanel = {
 	getMatch = function() return match end,
 	hitbox = function()
 		return { installed = ui.hitbox.installed(), mult = ui.hitbox.mult(), original = ui.hitbox.hasOriginal() }
+	end,
+	replay = function()
+		return ui.replay and ui.replay.state() or nil
+	end,
+	replayPlay = function()
+		return ui.replay and ui.replay.play() or false
+	end,
+	replayStop = function()
+		if ui.replay then ui.replay.stop() end
 	end,
 	scan = scanForMatch,
 	aim = aimAt,
