@@ -19504,7 +19504,7 @@ local guardT = 0
 -- nil field on one live fighter meant the guard silently did nothing all fight.
 local GUARD = {
 	calls = 0, noFighter = 0, notFight = 0, noControls = 0,
-	down = 0, ground = 0, off = 0, high = 0, low = 0,
+	down = 0, ground = 0, off = 0, high = 0, low = 0, reset = 0,
 	err = "",
 }
 local function setMove(vec)
@@ -19537,43 +19537,41 @@ local function guardTick(m, dist, pressing, threat)
 		local dt = math.max(0, math.min(0.1, tnow - (guardT > 0 and guardT or tnow)))
 		guardT = tnow
 
-		-- hold the guard before the strike instead of after it: inside their
-		-- arm reach a fast jab winds up in two frames, and blockAmt only
-		-- counts above 0.55, which takes about three frames to ramp.
-		-- pre-raise only just inside punching range. holding it across the whole
-		-- kick range costs 40% walk speed (Fighter multiplies speed by
-		-- 1 - max(blockAmt, lowAmt) * 0.4), which is exactly how a pressure
-		-- fighter corners you and lands the uppercut.
-		local pocket = dist <= armReach(o) + 0.30 * (tonumber(o.s) or 1)
-		local ready = o.mode == "fight" and not o.down and not o.shot and not o.clinch
-			and (tonumber(o.stamina) or 100) >= 8
 		local live = liveStrike(m)
-		-- the game has a separate low guard (Touch.lowBlock): body shots and
-		-- takedowns. the AI aims body 65% of the time while blockAmt is above
-		-- 0.5, and lowAmt is immune to blockHold, so switch to it while a body
-		-- strike is live. a live shot also gets it: Grapple.contact stuffs the
-		-- takedown outright when the defender is low and gassed.
+		local zone = live and tostring(live.zone or "") or ""
+		local legKick = zone == "leg" or string.sub(zone, 1, 3) == "leg"
 		local shot = o.shot ~= nil and o.shot ~= false
-		if (live and live.zone == "body" and threat) or shot then
+		-- the game's guard is a roll, not a wall, and blockHold grows every
+		-- frame blockAmt is above 0.55: the block chance slides from 0.78 to
+		-- 0.23 on punches and 0.58 to 0.10 on kicks. holding it across a whole
+		-- round, which is what `pocket and ready` did, therefore made the guard
+		-- *worse* the longer the exchange ran. raise it only while a strike is
+		-- actually in flight: impact fires at the end of extend, about 0.12 s
+		-- after the first windup frame, and blockAmt crosses 0.55 in ~0.05 s,
+		-- so the block still counts. the gap after each strike then falls below
+		-- 0.55 on its own and the game zeroes blockHold before the next exchange.
+		-- leg kicks are not blockable (Match only predicts a block for non-leg
+		-- zones and Combat runs its own checkSkill roll), so raising for one
+		-- spends blockHold and still eats the kick: let those pass.
+		if (live and zone == "body") or shot then
 			guardPulse = 0
 			guardHeld = 0
 			GUARD.low = GUARD.low + 1
 			Touch.lowBlock = true
 			setBlock(false)
-		else
+		elseif live and not legKick then
 			Touch.lowBlock = false
-			-- do not pulse the guard down in the pocket to reset blockHold: a
-			-- 1.3x jab winds up in ~0.04 s, so a deliberate 3-tick hole is a
-			-- clean hit every time. it resets naturally when we leave the pocket
-			-- or throw our own strike (isStriking zeroes blockAmt).
-			local up = (not pressing) and ((threat ~= false) or (pocket and ready))
-			if up then GUARD.high = GUARD.high + 1 end
-			setBlock(up)
-			if up then
-				guardHeld = guardHeld + dt
-			else
-				guardHeld = 0
-			end
+			guardPulse = 0
+			GUARD.high = GUARD.high + 1
+			setBlock(true)
+			guardHeld = guardHeld + dt
+		else
+			-- nothing blockable in flight: drop both guards so blockAmt falls
+			-- under 0.55 and blockHold resets before the next strike.
+			Touch.lowBlock = false
+			GUARD.reset = GUARD.reset + 1
+			setBlock(false)
+			guardHeld = 0
 		end
 	else
 		GUARD.off = GUARD.off + 1
@@ -20574,7 +20572,7 @@ local function buildUI()
 	})
 	fightTab:CreateToggle({
 		name = "auto block",
-		description = "holds the game's own guard: Touch.block inside punching range through every windup and extend, dropped for three ticks between strikes to reset guard fatigue, and Touch.lowBlock whenever a body strike is aimed at you or a takedown is live. a reactive block is too late for 1.3x-speed hands. runs with auto fight off: the guard only writes the game's two guard inputs, never movement or strikes.",
+		description = "holds the game's own guard: Touch.block while an opponent strike is in windup or extend, Touch.lowBlock whenever a body strike is aimed at you or a takedown is live, and nothing in the gaps. blockHold grows every frame blockAmt is over 0.55 and drags the block roll from 0.78 toward 0.23, so a guard held across the round gets worse the longer it is up; dropping it between strikes resets that. leg kicks are skipped because the game cannot block them. runs with auto fight off: the guard only writes the game's two guard inputs, never movement or strikes.",
 		flag = "mma_autoBlock",
 		value = CFG.autoBlock,
 		callback = function(v) CFG.autoBlock = v end,
@@ -21267,7 +21265,7 @@ task.spawn(function()
 end)
 
 _G.RagdollMmaPanel = {
-	build = "ironknuckles-2",
+	build = "ironknuckles-2b",
 	cfg = CFG,
 	guard = guardTick,
 	guardState = function()
@@ -21277,6 +21275,13 @@ _G.RagdollMmaPanel = {
 			t = guardT,
 			touchBlock = Touch.block == true,
 			touchLow = Touch.lowBlock == true,
+			blockAmt = match and match.player and match.player.blockAmt,
+			blockHold = match and match.player and match.player.blockHold,
+			lowAmt = match and match.player and match.player.lowAmt,
+			liveZone = (function()
+				local live = match and liveStrike(match)
+				return live and live.zone or nil
+			end)(),
 			autoBlock = CFG.autoBlock,
 			autoFight = CFG.autoFight,
 			fp = match and match.fp == true,
