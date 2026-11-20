@@ -18946,7 +18946,8 @@ local function canThrow(f, move)
 	if (f.slipT or -1) >= 0 then return false end
 	if (f.bodyHurtT or 0) > 0.3 then return false end
 	if f.time < (f.shotRecover or -1) then return false end
-	if f.stamina < math.max(1, CFG.staminaFloor) then return false end
+	local floor = math.max(1, tonumber(TUNE.staminaFloor) or CFG.staminaFloor)
+	if f.stamina < floor then return false end
 	local def = strikeDef(move)
 	if not def then return false end
 	if f.stamina < def.stamina then return false end
@@ -19084,7 +19085,10 @@ local function pickStrike(m, dist, reach, threat)
 
 	if style == "kicks" then
 		if stamina >= 8 and canKick and dist > reach * 0.7 then
-			local pool = { "lkick", "rkick", "lkick", "jab" }
+			-- at real kick range a jab cannot reach; do not waste the turn
+			local pool = dist > reach * 0.95
+				and { "lkick", "rkick", "lkick", "rkick" }
+				or { "lkick", "rkick", "lkick", "jab" }
 			return pool[math.random(1, #pool)]
 		end
 		if dist <= reach then
@@ -19214,6 +19218,13 @@ local COUNTERS = {
 		takedown = true, takedownStamina = 28, finishPush = true,
 		counterShot = "kick", ground = "sub",
 	},
+	ironknuckles = {
+		label = "peek-a-boo: stay at kick range, chop the legs, shoot the hips, sub him",
+		aggro = 62, range = 1.18, retreatAt = 0.82, staminaFloor = 18,
+		strikeStyle = "kicks", aimZone = "legs",
+		takedown = true, takedownStamina = 34, finishPush = false,
+		counterShot = "pressure", ground = "sub",
+	},
 	boxer = {
 		label = "stay off the pocket, kick the lead leg, reset",
 		strikeStyle = "kicks", aimZone = "legs", takedown = false,
@@ -19294,15 +19305,26 @@ local function adaptTick(m)
 	READ.lastT = t
 	READ.time = READ.time + dt
 
-	if READ.prior == "" and m.oppStyle then
-		local s = tostring(m.oppStyle)
-		if GRAPPLERS[s] then
+	if READ.prior == "" then
+		local s = tostring(m.oppStyle or (o.fstyle and o.fstyle.id) or "")
+		if s == "ironknuckles" then
+			READ.prior = "ironknuckles"
+		elseif GRAPPLERS[s] then
 			READ.prior = "wrestler"
 		elseif KICKERS[s] then
 			READ.prior = "kicker"
 		elseif SLUGGERS[s] then
 			READ.prior = "pressure"
 		end
+	end
+	-- the style is server-owned and known at the bell, so no 2.5 s / five-punch
+	-- wait: by then an uppercut has already landed. peek-a-boo is F in kicks,
+	-- ground and subs, so the plan is kick range, leg kicks, then the mat.
+	if READ.prior == "ironknuckles" and READ.read ~= "ironknuckles" then
+		READ.read = "ironknuckles"
+		READ.confidence = 100
+		READ.changedAt = t
+		applyCounter("ironknuckles")
 	end
 
 	local strikes = o.strikes
@@ -19365,6 +19387,9 @@ local function adaptTick(m)
 	READ.lastClass = t
 
 	local kind, conf = classifyStats(READ)
+	if READ.prior == "ironknuckles" then
+		kind, conf = "ironknuckles", 1
+	end
 	READ.confidence = math.floor((conf or 0) * 100 + 0.5)
 	if kind == "unknown" then return end
 
@@ -19608,7 +19633,7 @@ local function fightTick(m)
 	local fwd, side = 0, 0
 	if dist > want + 0.05 then
 		fwd = -1
-	elseif dist < want * 0.6 then
+	elseif dist < want * (tonumber(TUNE.retreatAt) or 0.6) then
 		fwd = 0.8
 	end
 	-- small orbit so the AI cannot just line us up, and so we stay off the fence
@@ -21229,7 +21254,20 @@ task.spawn(function()
 end)
 
 _G.RagdollMmaPanel = {
+	build = "ironknuckles-1",
 	cfg = CFG,
+	guard = guardTick,
+	guardState = function()
+		return {
+			held = guardHeld,
+			pulse = guardPulse,
+			t = guardT,
+			touchBlock = Touch.block == true,
+			touchLow = Touch.lowBlock == true,
+			autoBlock = CFG.autoBlock,
+			autoFight = CFG.autoFight,
+		}
+	end,
 	window = ui.window,
 	stop = shutdown,
 	panic = panic,
@@ -21249,6 +21287,7 @@ _G.RagdollMmaPanel = {
 		get = function()
 			return {
 				read = READ.read,
+				prior = READ.prior,
 				confidence = READ.confidence,
 				counter = READ.counter,
 				style = READ.style,
@@ -21264,9 +21303,13 @@ _G.RagdollMmaPanel = {
 				farT = READ.farT,
 				styleOverride = TUNE.strikeStyle,
 				aimZone = effAim(),
+				range = TUNE.range,
+				retreatAt = TUNE.retreatAt,
+				staminaFloor = TUNE.staminaFloor,
 				takedown = TUNE.takedown,
 				counterShot = TUNE.counterShot,
 				takedownStamina = TUNE.takedownStamina,
+				ground = TUNE.ground,
 			}
 		end,
 		set = setAdaptive,
