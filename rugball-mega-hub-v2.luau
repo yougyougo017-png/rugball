@@ -19726,8 +19726,9 @@ end
 
 -- auto leg kick is its own switch: with auto fight off it still throws the one
 -- action, but it never moves or guards. safe kicks and auto counter still gate it.
--- stored on GUARD so the suite stays inside Luau's 200-local limit.
-GUARD.legKickTick = function(m)
+-- stored on READ so the suite stays inside Luau's 200-local limit and GUARD
+-- diagnostics stay plain numbers.
+READ.legKickTick = function(m)
 	local p = m and m.player
 	local o = m and m.opp
 	if not (p and o and p.rig and o.rig) then return end
@@ -21293,7 +21294,7 @@ local function tick()
 				runAuto("guard", guardTick, m)
 			end
 			if autoOn("autoLegKick") then
-				runAuto("legkick", GUARD.legKickTick, m)
+				runAuto("legkick", READ.legKickTick, m)
 			end
 		end
 		pcall(groundTick, m)
