@@ -17593,12 +17593,15 @@ for k, v in pairs({
 	autoSkip = true,
 	autoQueue = false,
 	autoContinue = true,
+	autoCareer = false,
+	careerMode = "normal",
 	queueDelay = 6,
 	autoBest = false,
 	autoExec = false,
 	aggro = 60,
 	staminaFloor = 20,
 	strikeStyle = "smart",
+	styleMastery = true,
 	safeKicks = true,
 	adaptive = true,
 	acBypass = true,
@@ -17673,6 +17676,9 @@ end
 -- in-memory table overwrite the file with defaults.
 if not prev or (type(prev.cfg) == "table" and prev.cfg.autoQueue == nil) then
 	pcall(loadCfg)
+end
+if CFG.careerMode ~= "normal" and CFG.careerMode ~= "hard" and CFG.careerMode ~= "ask" then
+	CFG.careerMode = "normal"
 end
 
 if prev and prev.stop then
@@ -17811,6 +17817,11 @@ local function resetAdapt()
 	READ.prior = ""
 	READ.confidence = 0
 	READ.changedAt = 0
+	READ.comboStyle = nil
+	READ.comboSeq = nil
+	READ.comboIdx = 0
+	READ.comboAt = 0
+	READ.styleKickZone = nil
 end
 
 local function fmtTime(t)
@@ -18129,6 +18140,227 @@ local function equippedStyle()
 	return styleById(id), id
 end
 
+--// style mastery ---------------------------------------------------------------
+-- the equipped style is a server profile value. the game builds its own AI from
+-- style.ai (Styles.REAL_AI is folded into that table at require time), so the
+-- same plan is mirrored here: gameplan, range, kick/knee weight, shoot weight,
+-- guard and the style's own combo book. this is a bias on the FIGHT tab, not a
+-- second brain: user switches, the adaptive counter, safe kicks and the stamina
+-- floor all still gate every action. no style data is written.
+
+ui.stylePlan = (function()
+local PLAN_GAMEPLANS = { strike = true, grapple = true, balanced = true }
+local PLAN_BASE = {
+	strike = { kicks = 0.30, shoot = 0.35, knees = 1.0 },
+	grapple = { kicks = 0.12, shoot = 2.2, knees = 0.5 },
+	balanced = { kicks = 0.25, shoot = 1.0, knees = 1.0 },
+}
+local PLAN_COMBO = {
+	strike = {
+		{ w = 1.0, s = { "jab", "cross" } },
+		{ w = 0.8, s = { "jab", "cross", "lhook" } },
+		{ w = 0.7, s = { "jab", "rkick" } },
+		{ w = 0.5, s = { "cross", "rhook" } },
+		{ w = 0.4, s = { "jab" } },
+	},
+	grapple = {
+		{ w = 1.0, s = { "jab" } },
+		{ w = 0.8, s = { "jab", "cross" } },
+		{ w = 0.6, s = { "cross" } },
+		{ w = 0.5, s = { "knee" } },
+		{ w = 0.4, s = { "jab", "knee" } },
+	},
+	balanced = {
+		{ w = 1.0, s = { "jab", "cross" } },
+		{ w = 0.8, s = { "jab", "rkick" } },
+		{ w = 0.6, s = { "cross", "lhook" } },
+		{ w = 0.5, s = { "jab" } },
+		{ w = 0.4, s = { "rkick" } },
+	},
+}
+local PLAN_MOVES = {
+	jab = true, cross = true, lhook = true, rhook = true,
+	lkick = true, rkick = true, knee = true,
+}
+local planCache = nil
+local planState = nil
+local planId = nil
+local planMastery = nil
+
+local function planNum(v, lo, hi, default)
+	v = tonumber(v)
+	if v == nil or v ~= v then return default end
+	return math.clamp(v, lo, hi)
+end
+
+local function planGrade(style, key)
+	local grades = type(style) == "table" and style.grades or nil
+	local g = type(grades) == "table" and grades[key] or nil
+	return GRADE_SCORE[string.upper(tostring(g or ""))] or 0
+end
+
+local function planCombos(ai, gameplan)
+	local src = type(ai) == "table" and ai.combos or nil
+	if type(src) ~= "table" or #src == 0 then
+		src = PLAN_COMBO[gameplan] or PLAN_COMBO.balanced
+	end
+	local out = {}
+	for _, entry in ipairs(src) do
+		local seq, weight = entry, 1
+		if type(entry) == "table" and type(entry.s) == "table" then
+			seq, weight = entry.s, planNum(entry.w, 0, 20, 1)
+		end
+		if type(seq) == "table" then
+			local moves = {}
+			for _, mv in ipairs(seq) do
+				if type(mv) == "string" and PLAN_MOVES[mv] then moves[#moves + 1] = mv end
+			end
+			if #moves > 0 then
+				out[#out + 1] = { w = math.max(0.01, weight), s = moves }
+			end
+		end
+	end
+	if #out == 0 then out = PLAN_COMBO.balanced end
+	return out
+end
+
+local function planFromGrades(style)
+	local strike = planGrade(style, "STRIKING") + planGrade(style, "POWER")
+		+ planGrade(style, "SPEED") + planGrade(style, "KICKS")
+	local grapple = planGrade(style, "WRESTLING") + planGrade(style, "GROUND")
+		+ planGrade(style, "SUBS") + planGrade(style, "TD DEFENCE")
+	local gameplan = "balanced"
+	if grapple > strike + 3 then
+		gameplan = "grapple"
+	elseif strike > grapple + 3 then
+		gameplan = "strike"
+	end
+	local base = PLAN_BASE[gameplan]
+	local mods = type(style.mods) == "table" and style.mods or {}
+	local punch = planNum(mods.punch, 0, 3, 1)
+	local kick = planNum(mods.kick, 0, 3, 1)
+	local td = planNum(mods.td, 0, 3, 1)
+	local grip = planNum(mods.grapple, 0, 3, 1)
+	local cardio = planNum(mods.cardio, 0, 3, 1)
+	local chin = planNum(mods.chin, 0, 3, 1)
+	local kicks = planNum(planGrade(style, "KICKS") / 14 + (kick - punch) * 0.25, 0, 1, base.kicks)
+	local aggression = planNum(
+		(planGrade(style, "POWER") + planGrade(style, "SPEED") - planGrade(style, "DEFENCE")) / 24
+			+ (1 - cardio) * 0.3,
+		-0.2, 0.35, 0.05
+	)
+	local block = planNum(
+		(planGrade(style, "DEFENCE") - 7) * 0.03 + (1 - chin) * 0.25,
+		-0.2, 0.3, 0.05
+	)
+	local shoot = planNum(base.shoot + (td - 1) * 1.2 + (grip - 1) * 0.8, 0, 6, base.shoot)
+	local knees = planNum(base.knees + (grip - 1) * 0.8, 0, 5, base.knees)
+	return {
+		gameplan = gameplan,
+		range = 0,
+		kicks = kicks,
+		aggression = aggression,
+		block = block,
+		shoot = shoot,
+		knees = knees,
+		lowKicks = planNum(0.35 + kicks * 0.45, 0, 1, 0.45),
+		aim = gameplan == "grapple" and "body" or "head",
+		source = "grades",
+	}
+end
+
+local function planFromStyle(style)
+	local ai = type(style.ai) == "table" and style.ai or nil
+	if not ai then
+		local p = planFromGrades(style)
+		p.combos = planCombos(nil, p.gameplan)
+		return p
+	end
+	local gameplan = PLAN_GAMEPLANS[ai.gameplan] and ai.gameplan or "balanced"
+	local base = PLAN_BASE[gameplan]
+	local kicks = planNum(ai.kicks, 0, 1, base.kicks)
+	local low = planNum(ai.lowKicks, 0, 1, 0.45)
+	local aim = gameplan == "grapple" and "body" or "head"
+	return {
+		gameplan = gameplan,
+		range = planNum(ai.range, -1.5, 2.5, 0),
+		kicks = kicks,
+		aggression = planNum(ai.aggression, -0.5, 0.6, 0),
+		block = planNum(ai.block, -0.5, 0.5, 0),
+		shoot = planNum(ai.shoot, 0, 6, base.shoot),
+		knees = planNum(ai.knees, 0, 5, base.knees),
+		lowKicks = low,
+		aim = aim,
+		source = "style ai",
+		combos = planCombos(ai, gameplan),
+	}
+end
+
+local function planSummary(p)
+	if not p or not p.id then
+		return "no equipped style  |  scan styles, then equip one"
+	end
+	local line1 = string.format(
+		"%s  |  %s (%s)  |  %s",
+		p.active and "ON" or "off", tostring(p.name), tostring(p.id), tostring(p.gameplan)
+	)
+	local line2 = string.format(
+		"aggro %+d%%  |  range %+.2f  |  kicks %d%%  |  shoot %.1f  |  knees %.1f  |  aim %s",
+		math.floor((p.aggression or 0) * 100 + 0.5),
+		p.range or 0,
+		math.floor((p.kicks or 0) * 100 + 0.5),
+		p.shoot or 0,
+		p.knees or 0,
+		tostring(p.aim)
+	)
+	local line3 = string.format(
+		"source %s  |  %d combos  |  low kicks %d%%  |  guard %+d%%",
+		tostring(p.source), #(p.combos or {}),
+		math.floor((p.lowKicks or 0) * 100 + 0.5),
+		math.floor((p.block or 0) * 100 + 0.5)
+	)
+	return line1 .. "\n" .. line2 .. "\n" .. line3
+end
+
+local stylePlan = {}
+stylePlan.refresh = function(force)
+	local state = styleState
+	local slots = type(state) == "table" and type(state.sl) == "table" and state.sl or {}
+	local id = type(state) == "table" and slots[tonumber(state.eq) or 1] or nil
+	if type(id) ~= "string" or id == "" then id = nil end
+	if not force and planCache and planState == state and planId == id and planMastery == CFG.styleMastery then
+		return planCache
+	end
+	local style = id and styleById(id) or nil
+	local p
+	if style then
+		p = planFromStyle(style)
+		p.id = id
+		p.name = style.name or id
+		p.rarity = style.rarity or "?"
+	else
+		p = {
+			id = nil, name = "no style", rarity = "?", gameplan = "balanced",
+			range = 0, kicks = 0, aggression = 0, block = 0, shoot = 0,
+			knees = 0, lowKicks = 0, aim = "head", combos = {}, source = "none",
+		}
+	end
+	p.active = style ~= nil and CFG.styleMastery == true
+	p.summary = planSummary(p)
+	planCache, planState, planId, planMastery = p, state, id, CFG.styleMastery
+	return p
+end
+stylePlan.get = function() return stylePlan.refresh() end
+stylePlan.aim = function()
+	if not CFG.styleMastery then return nil end
+	local p = stylePlan.refresh()
+	if p and p.active then return p.aim end
+	return nil
+end
+stylePlan.text = function() return planSummary(stylePlan.refresh()) end
+return stylePlan
+end)()
+
 local function buildStyleOptions()
 	styleOptionIds = {}
 	local options = { "best owned" }
@@ -18227,6 +18459,13 @@ local function updateStyleCard()
 			local sp, lk = spinCounts()
 			ui.spinCard:SetTitle(string.format("spins  |  %d normal  |  %d lucky", sp, lk))
 			ui.spinCard:Set(spinSummary())
+		end)
+	end
+	if ui.stylePlanCard and ui.stylePlan then
+		pcall(function()
+			local p = ui.stylePlan.get()
+			ui.stylePlanCard:SetTitle("style plan  |  " .. (p.active and "mastery on" or "mastery off"))
+			ui.stylePlanCard:Set(p.summary)
 		end)
 	end
 end
@@ -18585,11 +18824,15 @@ local CONTINUE_TEXT = { "CONTINUE" }
 local RANKED_NAMES = { "Btn_RANKED", "Btn_Ranked", "Btn_RANKEDMODE" }
 local RANKED_TEXT = { "RANKED" }
 
-local queue = { last = "idle  |  auto queue off", nextTry = 0, nextNav = 0, pressedAt = 0, tries = 0, rankedAt = 0, endedAt = 0 }
+local queue = { last = "idle  |  auto queue off", nextTry = 0, nextNav = 0, pressedAt = 0, tries = 0, rankedAt = 0, endedAt = 0, careerHold = 0 }
 
 local function queueTick()
 	if dead or not CFG.autoQueue then
 		queue.last = "idle  |  auto queue off"
+		return
+	end
+	if queue.careerHold and queue.careerHold > now() then
+		queue.last = "career active"
 		return
 	end
 	local t = now()
@@ -18700,6 +18943,211 @@ local function queueTick()
 	end
 	queue.last = "idle  |  no ranked screen"
 end
+
+--// career automation -----------------------------------------------------------
+-- career is ordinary UI: main menu Btn_CAREER -> hub Btn_FIGHT -> result
+-- Btn_CONTINUE -> hub. the panel only calls the handler those buttons already
+-- have. it never invokes a career remote, saves a result or writes career data;
+-- the game's own onEnd / showCareerHub path stays in charge.
+
+ui.career = (function()
+local career = {
+	last = "idle  |  auto career off",
+	nextAt = 0,
+	fightAt = 0,
+	awaiting = 0,
+	sawCareer = false,
+	hubAt = 0,
+	fights = 0,
+	continues = 0,
+}
+queue.career = career
+
+local function exactButton(name)
+	for _, b in ipairs(buttons()) do
+		if b.Name == name then return b end
+	end
+	return nil
+end
+
+-- career results carry the careerNote line, which ends in "AROUND THE DIVISION".
+-- this is only a fallback for enabling the loop while a result is already up;
+-- the normal path tracks the bout the loop started itself.
+local function careerResultText()
+	local pg = LP:FindFirstChild("PlayerGui")
+	local root = pg and (pg:FindFirstChild("ROFC_UI") or pg)
+	if not root then return false end
+	for _, d in ipairs(root:GetDescendants()) do
+		if d:IsA("TextLabel") and d.Text ~= "" and onScreen(d) then
+			local upper = string.upper(d.Text)
+			if string.find(upper, "AROUND THE DIVISION", 1, true) then return true end
+		end
+	end
+	return false
+end
+
+local function careerPress(btn, text, t)
+	local ok, err = press(btn)
+	career.last = ok and text or (text .. " failed  |  " .. tostring(err))
+	career.nextAt = t + (ok and 2.5 or 1.2)
+	queue.careerHold = t + 2
+	if ok then pushLog(text) end
+	return ok
+end
+
+local function careerReset()
+	career.fightAt = 0
+	career.awaiting = 0
+	career.nextAt = 0
+	career.last = CFG.autoCareer and "armed  |  looking for career" or "idle  |  auto career off"
+end
+
+local function careerTick()
+	if dead then return end
+	if not CFG.autoCareer then
+		career.last = "idle  |  auto career off"
+		return
+	end
+	local t = now()
+	if t < career.nextAt then return end
+	career.nextAt = t + 0.4
+
+	local m = match
+	local live = m and not m.closed and not m.finish and m.state ~= "ended"
+	if live then
+		if career.awaiting == 0 and career.sawCareer then career.awaiting = t end
+		career.fightAt = 0
+		queue.careerHold = t + 2
+		career.last = "in match  |  round " .. tostring(m.round or 1)
+		return
+	end
+
+	-- the game's CAREER MODE screen sits between the main menu and either
+	-- career hub. which career to play is the user's choice, so it is an
+	-- explicit setting; "ask" leaves the screen untouched.
+	local modeNormal = exactButton("Btn_ModeNormal")
+	local modeHard = exactButton("Btn_ModeHard")
+	if modeNormal or modeHard then
+		local mode = CFG.careerMode
+		if mode ~= "hard" and mode ~= "ask" then mode = "normal" end
+		if mode == "ask" then
+			career.last = "career mode  |  pick normal or hard in the game"
+			career.nextAt = t + 1.5
+			return
+		end
+		local pick = nil
+		if mode == "hard" then
+			pick = modeHard
+		else
+			pick = modeNormal
+		end
+		if not pick then
+			career.last = "career mode  |  " .. tostring(mode) .. " card missing"
+			career.nextAt = t + 1.5
+			return
+		end
+		local modeText = string.upper(labelOf(pick))
+		if string.find(modeText, "LOCKED", 1, true) or string.find(modeText, "WINS TO UNLOCK", 1, true) then
+			career.last = tostring(mode) .. " career locked  |  " .. (modeText ~= "" and modeText or "unlock it in the game")
+			career.nextAt = t + 2
+			return
+		end
+		if string.find(modeText, "LOADING", 1, true) then
+			career.last = "career mode loading  |  " .. tostring(mode)
+			career.nextAt = t + 1
+			return
+		end
+		career.sawCareer = true
+		career.awaiting = 0
+		career.fightAt = 0
+		career.hubAt = 0
+		careerPress(pick, "career mode " .. tostring(mode), t)
+		return
+	end
+
+	-- division / contract questions are the one place the loop must not choose
+	-- for the user. "decide later" is the game's own defer button; if only the
+	-- choice buttons are up, stop and let the user answer them.
+	local later = exactButton("Btn_DECIDELATER")
+	if later then
+		careerPress(later, "career prompt deferred", t)
+		return
+	end
+	if exactButton("Btn_STAYATMIDDLEWEIGHT") or exactButton("Btn_MoveUp") or exactButton("Btn_MoveDown") then
+		career.last = "career prompt open  |  answer it in the game"
+		career.nextAt = t + 1.5
+		return
+	end
+
+	-- the career hub is the only screen that has both of these exact buttons.
+	local hubFight = exactButton("Btn_FIGHT")
+	if hubFight and exactButton("Btn_EDITFIGHTER") then
+		career.sawCareer = true
+		career.hubAt = t
+		queue.careerHold = t + 2
+		if career.fightAt > 0 and t - career.fightAt < 6 then
+			career.last = "career hub  |  fight starting"
+			career.nextAt = t + 0.6
+			return
+		end
+		career.awaiting = t
+		career.fights = career.fights + 1
+		career.fightAt = t
+		careerPress(hubFight, "career fight started", t)
+		return
+	end
+
+	-- any result screen blocks the career path, so clear it first. this also
+	-- recovers when the loop is switched on while a career result is already up.
+	local cont = exactButton("Btn_CONTINUE")
+	if cont then
+		local knownCareer = career.awaiting > 0 or career.sawCareer or careerResultText()
+		career.awaiting = 0
+		career.fightAt = 0
+		career.continues = career.continues + 1
+		careerPress(cont, knownCareer and "career result continued" or "result continued", t)
+		career.nextAt = t + 1.5
+		return
+	end
+
+	-- main menu: enter career
+	local entry = exactButton("Btn_CAREER")
+	if entry then
+		career.sawCareer = true
+		careerPress(entry, "opened career", t)
+		return
+	end
+
+	-- a career sub-page (edit fighter, rankings): step back to the hub. only
+	-- after the hub has actually been seen, so the main menu is never bounced.
+	if career.sawCareer and career.hubAt > 0 and t - career.hubAt < 180 then
+		local back = exactButton("Btn_BACK")
+		if back then
+			careerPress(back, "career back", t)
+			return
+		end
+	end
+
+	career.last = "looking for career  |  no career button"
+end
+
+career.tick = careerTick
+career.reset = careerReset
+career.status = function()
+	return string.format("%s  |  %d started  |  %d continued", career.last, career.fights, career.continues)
+end
+career.state = function()
+	return {
+		enabled = CFG.autoCareer == true,
+		last = career.last,
+		fights = career.fights,
+		continues = career.continues,
+		awaiting = career.awaiting > 0,
+		sawCareer = career.sawCareer,
+	}
+end
+return career
+end)()
 
 --// best config -----------------------------------------------------------------
 -- one preset that plays the whole match: pressure without gassing, head hunting,
@@ -19153,7 +19601,10 @@ local function effStyle()
 end
 
 local function effAim()
-	return TUNE.aimZone or CFG.aimZone
+	if TUNE.aimZone then return TUNE.aimZone end
+	local styleAim = ui.stylePlan and ui.stylePlan.aim and ui.stylePlan.aim()
+	if styleAim then return styleAim end
+	return CFG.aimZone
 end
 
 local function effFinishPush()
@@ -19217,6 +19668,82 @@ local function pickStrike(m, dist, reach, threat)
 	-- auto fighter can start a strike at the edge of the expanded hitbox.
 	local hitReach = math.clamp(tonumber(CFG.hitReach) or 1.30, 0.80, 1.60)
 	local canKick = safeKick and dist <= reach * hitReach
+
+	-- style mastery: the equipped style's own ai combos and kick / knee weights.
+	-- a started combo is followed to the end; new ones and the weighted kick or
+	-- knee choice only take ~60% of decisions, so the FIGHT tab's strike style
+	-- still shapes the fighter instead of being replaced.
+	READ.styleKickZone = nil
+	local plan = ui.stylePlan and ui.stylePlan.get() or nil
+	if plan and plan.active and stamina >= 6.5
+		and not CFG.autoLegKick and not (o.shot or o.clinch)
+	then
+		local t = now()
+		if READ.comboStyle ~= plan.id or t - (READ.comboAt or 0) > 1.15 then
+			READ.comboStyle, READ.comboSeq, READ.comboIdx = plan.id, nil, 0
+		end
+		local function nextCombo(force)
+			if not force and math.random() > 0.62 then return nil end
+			local seq = READ.comboSeq
+			if not seq then
+				local total = 0
+				for _, c in ipairs(plan.combos or {}) do total = total + (tonumber(c.w) or 1) end
+				if total <= 0 then return nil end
+				local roll = math.random() * total
+				local chosen = nil
+				for _, c in ipairs(plan.combos or {}) do
+					roll = roll - (tonumber(c.w) or 1)
+					if roll <= 0 then
+						chosen = c
+						break
+					end
+				end
+				if not chosen or type(chosen.s) ~= "table" then return nil end
+				seq = chosen.s
+				READ.comboSeq, READ.comboIdx = seq, 0
+			end
+			for _ = 1, #seq do
+				local idx = (READ.comboIdx or 0) + 1
+				local move = seq[idx]
+				if not move then
+					READ.comboSeq, READ.comboIdx = nil, 0
+					return nil
+				end
+				local kick = move == "lkick" or move == "rkick"
+				local knee = move == "knee"
+				if (not kick or canKick)
+					and (not knee or (dist < reach * 0.62 and stamina >= 20))
+					and canThrow(p, move)
+				then
+					READ.comboIdx, READ.comboAt = idx, t
+					return move
+				end
+				READ.comboIdx = idx
+			end
+			READ.comboSeq, READ.comboIdx = nil, 0
+			return nil
+		end
+		local move = nextCombo(READ.comboSeq ~= nil)
+		if move then return move end
+		if canKick and dist > reach * 0.62 and math.random() < math.max(0.12, plan.kicks) then
+			local km
+			if math.random() < (plan.lowKicks or 0) then
+				READ.legKickSide = not READ.legKickSide
+				km = READ.legKickSide and "rkick" or "lkick"
+				READ.styleKickZone = READ.legKickSide and "legR" or "legL"
+			else
+				km = math.random() < 0.5 and "rkick" or "lkick"
+				READ.styleKickZone = plan.aim == "body" and "body" or "head"
+			end
+			if canThrow(p, km) then return km end
+			READ.styleKickZone = nil
+		end
+		if dist < reach * 0.55 and stamina >= 20
+			and math.random() < math.min(0.65, (plan.knees or 0) * 0.3)
+		then
+			if canThrow(p, "knee") then return "knee" end
+		end
+	end
 
 	-- a shot or a clinch locks the opponent out of starting a strike, so this is
 	-- the cleanest counter window in the game: knee the level change or kick the
@@ -19802,7 +20329,12 @@ local function fightTick(m)
 	local finishPush = effFinishPush()
 	local pressing = finishPush and hurt and not gassed
 
+	local plan = ui.stylePlan and ui.stylePlan.get() or nil
+	local planOn = plan and plan.active == true
 	local aggro = tonumber(TUNE.aggro) or CFG.aggro
+	if planOn and not tonumber(TUNE.aggro) then
+		aggro = math.clamp(aggro + (tonumber(plan.aggression) or 0) * 55, 5, 100)
+	end
 	local want = reach * (0.60 + 0.55 * (aggro / 100))
 	if effStyle() == "kicks" then
 		-- stand where the legs reach and the arms do not; safeKicks then has a
@@ -19812,6 +20344,14 @@ local function fightTick(m)
 		local kickWant = math.max(want, armReach(o) + 0.55 * (o.s or 1))
 		if kickWant <= reach * 1.28 then
 			want = kickWant
+		end
+	end
+	-- the equipped style's distance: positive is a rangier fighter, negative
+	-- crowds the pocket. a grapple plan never stands outside arm's length.
+	if planOn then
+		want = math.clamp(want + (tonumber(plan.range) or 0), reach * 0.45, reach * 1.55)
+		if plan.gameplan == "grapple" then
+			want = math.min(want, reach * 0.86)
 		end
 	end
 	-- the adaptive counter's own range wins in the neutral state, then the
@@ -19854,10 +20394,12 @@ local function fightTick(m)
 			local zone
 			if move == "knee" then
 				zone = "head"
-			elseif CFG.autoLegKick and move == "lkick" then
+			elseif move == "lkick" and CFG.autoLegKick then
 				zone = "legL"
-			elseif CFG.autoLegKick and move == "rkick" then
+			elseif move == "rkick" and CFG.autoLegKick then
 				zone = "legR"
+			elseif READ.styleKickZone then
+				zone = READ.styleKickZone
 			else
 				zone = effAim()
 			end
@@ -19886,8 +20428,14 @@ local function fightTick(m)
 			counterWindow = incomingStep and dist <= shootRange and not o.shot
 		end
 		if not counterWindow then counterSpent = false end
+		-- a grapple style looks for the shot even when the opponent is healthy.
+		-- this only widens the existing auto-takedown gate; it never turns the
+		-- user's switch on by itself.
+		local styleShot = planOn and (tonumber(plan.shoot) or 0) >= 1.2
+			and plan.gameplan ~= "strike"
 		local pressured = (o.rockedT or 0) > 0 or o.stamina < 35 or (o.hp.head < 35)
 			or (counterWindow and not counterSpent) or math.random() < 0.02
+			or (styleShot and math.random() < 0.10)
 		if ok and can and pressured and dist <= shootRange * 0.92 then
 			local ok2 = pcall(m.playerShoot, m)
 			if ok2 then
@@ -20918,6 +21466,31 @@ local function buildUI()
 		description = "calls Styles:equip for the selected owned slot. this is a real profile change: both clients build the next fight from it. finish the current fight first; it lands on the next one.",
 		callback = function() equipSelected() end,
 	})
+	styleTab:CreateSection({ name = "STYLE MASTERY  |  EQUIPPED STYLE" })
+	styleTab:CreateToggle({
+		name = "style mastery",
+		description = "reads the equipped style's own ai plan (the same table the game's Hard AI uses) and biases auto fight toward it: gameplan, distance, kick and knee weight, the style's combo book, guard shape and aim. with no ai table it derives the plan from the style's letter grades and mods. it never turns on a switch you left off, never shoots unless auto takedown is already on, and safe kicks / the adaptive counter / the stamina floor still gate every action. no profile data is written.",
+		flag = "mma_styleMastery",
+		value = CFG.styleMastery,
+		callback = function(v)
+			CFG.styleMastery = v
+			if ui.stylePlan then ui.stylePlan.refresh(true) end
+			updateStyleCard()
+		end,
+	})
+	ui.stylePlanCard = styleTab:CreateText({ name = "style plan  |  mastery off", text = "scan styles to read the equipped style" })
+	styleTab:CreateButton({
+		name = "refresh style plan",
+		description = "re-reads the equipped slot and prints the plan the auto fighter will follow.",
+		callback = function()
+			if ui.stylePlan then
+				ui.stylePlan.refresh(true)
+				local p = ui.stylePlan.get()
+				notify(string.format("%s  |  %s  |  %s", p.name or "no style", p.gameplan or "?", p.source or "?"))
+			end
+			updateStyleCard()
+		end,
+	})
 	styleTab:CreateSection({ name = "SPINS  |  SERVER PROFILE  |  FAST" })
 	ui.spinCard = styleTab:CreateText({ name = "spins  |  not loaded", text = "press scan styles" })
 	styleTab:CreateSlider({
@@ -21248,6 +21821,42 @@ local function buildUI()
 		description = "one GetCareer invoke, read-only.",
 		callback = function()
 			refreshCareer()
+		end,
+	})
+	careerTab:CreateSection({ name = "AUTO CAREER  |  GAME UI  |  LOOP" })
+	careerTab:CreateDropdown({
+		name = "career mode",
+		description = "which career the loop enters on the game's CAREER MODE screen. normal is the ROFC career; hard is the school -> BYFL -> TFC -> ROFC story and must be unlocked in the game. ask stops at that screen and leaves the choice to you. no mode is picked unless it is the one set here.",
+		flag = "mma_careerMode",
+		options = { "normal", "hard", "ask" },
+		value = CFG.careerMode,
+		callback = function(v) CFG.careerMode = tostring(v) end,
+	})
+	careerTab:CreateToggle({
+		name = "auto career fight loop",
+		description = "presses the game's own CAREER button, the career mode's CONTINUE card, then the career hub's FIGHT button, and CONTINUE on the career result, starting the next fight as soon as the hub returns. if the game opens a division or contract question it presses the game's DECIDE LATER button only; it never picks a division. it only calls the click handlers those buttons already have; it never invokes a career remote, writes a result or fakes a server event. it waits for a live bout to end before touching anything. turn it off or press P to stop.",
+		flag = "mma_autoCareer",
+		value = CFG.autoCareer,
+		callback = function(v)
+			CFG.autoCareer = v
+			if ui.career then ui.career.reset() end
+			if v then
+				if _G.RagdollMmaPanel then _G.RagdollMmaPanel.career = ui.career end
+				notify("auto career armed  |  uses CAREER -> mode -> FIGHT -> CONTINUE")
+			end
+		end,
+	})
+	ui.careerCard = careerTab:CreateText({ name = "auto career  |  idle", text = "off" })
+	careerTab:CreateButton({
+		name = "stop auto career",
+		description = "turns the loop off and leaves the current screen alone.",
+		callback = function()
+			CFG.autoCareer = false
+			if ui.window then pcall(function() ui.window:Set("mma_autoCareer", false) end) end
+			if ui.career then ui.career.reset() end
+			if ui.careerCard then
+				pcall(function() ui.careerCard:Set("stopped  |  current screen untouched") end)
+			end
 		end,
 	})
 	careerTab:CreateSection({ name = "INFO" })
@@ -21732,8 +22341,10 @@ local function panic()
 	CFG.autoSub = false
 	CFG.autoSprawl = false
 	CFG.autoQueue = false
+	CFG.autoCareer = false
 	CFG.autoBest = false
 	CFG.autoContinue = false
+	CFG.styleMastery = false
 	CFG.rageMode = false
 	CFG.rageBoost = false
 	CFG.rageOnePunch = false
@@ -21745,6 +22356,8 @@ local function panic()
 	CFG.acBypass = false
 	CFG.replayRecord = false
 	spinStop = true
+	if ui.career then pcall(ui.career.reset) end
+	if ui.stylePlan then pcall(ui.stylePlan.refresh, true) end
 	restoreRage()
 	if ui.replay then
 		pcall(ui.replay.stop)
@@ -21757,7 +22370,7 @@ local function panic()
 		end)
 	end
 	pcall(function() Touch.block = false; Touch.lowBlock = false end)
-	for _, flag in ipairs({ "mma_autoFight", "mma_autoAim", "mma_autoBlock", "mma_autoCounter", "mma_autoLegKick", "mma_autoTakedown", "mma_autoGround", "mma_autoSub", "mma_autoSprawl", "mma_autoQueue", "mma_autoBest", "mma_autoContinue", "mma_rageMode", "mma_rageBoost", "mma_rageOnePunch", "mma_antiKO", "mma_rageGod", "mma_rageStamina", "mma_rageSpeed", "mma_rageFreeze", "mma_acBypass", "mma_replayRecord" }) do
+	for _, flag in ipairs({ "mma_autoFight", "mma_autoAim", "mma_autoBlock", "mma_autoCounter", "mma_autoLegKick", "mma_autoTakedown", "mma_autoGround", "mma_autoSub", "mma_autoSprawl", "mma_autoQueue", "mma_autoCareer", "mma_autoBest", "mma_autoContinue", "mma_styleMastery", "mma_rageMode", "mma_rageBoost", "mma_rageOnePunch", "mma_antiKO", "mma_rageGod", "mma_rageStamina", "mma_rageSpeed", "mma_rageFreeze", "mma_acBypass", "mma_replayRecord" }) do
 		if ui.window then pcall(function() ui.window:Set(flag, false) end) end
 	end
 	status = "panic  |  automation off"
@@ -21834,6 +22447,13 @@ local function syncUI()
 				txt = txt .. "  |  tries " .. queue.tries
 			end
 			ui.queueCard:Set(txt)
+		end)
+	end
+	if ui.careerCard and ui.career then
+		pcall(function()
+			local st = ui.career.state()
+			ui.careerCard:SetTitle("auto career  |  " .. (st.enabled and "armed" or "off"))
+			ui.careerCard:Set(ui.career.status())
 		end)
 	end
 	if ui.rageCard then
@@ -21969,6 +22589,7 @@ local function tick()
 		end
 	end
 	pcall(skipTick)
+	if ui.career then pcall(ui.career.tick) end
 	pcall(queueTick)
 	local okHud, hudErr = pcall(hudTick)
 	if not okHud and now() - lastHudWarn > 5 then
@@ -22015,7 +22636,7 @@ task.spawn(function()
 end)
 
 _G.RagdollMmaPanel = {
-	build = "ironknuckles-2j",
+	build = "ironknuckles-2l",
 	cfg = CFG,
 	guard = guardTick,
 	guardState = function()
@@ -22154,7 +22775,19 @@ _G.RagdollMmaPanel = {
 			return { normal = sp, lucky = lk, pity = pity }
 		end,
 		state = function() return styleState end,
+		plan = function()
+			local p = ui.stylePlan and ui.stylePlan.get()
+			if not p then return nil end
+			return {
+				active = p.active, id = p.id, name = p.name, gameplan = p.gameplan,
+				range = p.range, kicks = p.kicks, aggression = p.aggression,
+				block = p.block, shoot = p.shoot, knees = p.knees,
+				lowKicks = p.lowKicks, aim = p.aim, source = p.source,
+			}
+		end,
 	},
+	career = ui.career,
+	stylePlan = ui.stylePlan,
 	raging = function()
 		return CFG.rageMode
 	end,
