@@ -20811,12 +20811,12 @@ local function buildUI()
 		callback = function(v) CFG.rageDamage = v end,
 	})
 	rageTab:CreateText({
-		name = "ranked damage  |  local only",
-		text = "ranked / pvp: the opponent's client resolves your hits and power is not sent. the multiplier does nothing there; use endless stamina and your equipped style.",
+		name = "damage multiplier  |  local only",
+		text = "the slider above scales your local fighter's power. ranked / pvp resolves your strikes on the opponent's client and does not send power, so it does nothing there. one punch is separate: it uses the match's own knockdown path and works in ranked.",
 	})
 	rageTab:CreateToggle({
 		name = "one punch",
-		description = "the first time the opponent's head takes damage they are handed to the game's own knockdown path: one clean head shot drops them and the referee waves it off a moment later.",
+		description = "the first time the opponent's head takes damage they are handed to the game's own knockdown path: one clean head shot drops them and the referee waves it off a moment later. this works in ranked because it drives the match's own knockdown state; the damage multiplier above only changes local power and is not sent in pvp.",
 		flag = "mma_rageOnePunch",
 		value = CFG.rageOnePunch,
 		callback = function(v) CFG.rageOnePunch = v end,
@@ -21365,7 +21365,7 @@ task.spawn(function()
 end)
 
 _G.RagdollMmaPanel = {
-	build = "ironknuckles-2e",
+	build = "ironknuckles-2f",
 	cfg = CFG,
 	guard = guardTick,
 	guardState = function()
