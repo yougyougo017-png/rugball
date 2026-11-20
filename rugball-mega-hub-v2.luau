@@ -19920,7 +19920,13 @@ local function rageTick(m)
 	local pb = rememberFighter(p)
 	local ob = rememberFighter(o)
 
-	p.power = (pb.power or 1) * (boost and mult or 1)
+	-- ranked and player-vs-player matches resolve each strike on the receiver's
+	-- client from its own copy of the attacker's power. power is not in the
+	-- strike packet (only speed and stamina factor are), so writing it here
+	-- cannot change the damage the other player takes and only gives the local
+	-- anti-cheat something to revert. keep the base value in network fights.
+	local networkFight = m.pvp ~= nil
+	p.power = (pb.power or 1) * (boost and not networkFight and mult or 1)
 	p.speedMul = (pb.speedMul or 1) * (fast and wantSpeed or 1)
 	p.strikeSpeed = (pb.strikeSpeed or 1) * (fast and wantSpeed or 1)
 	o.koHP = punch and 100 or ob.koHP
@@ -20789,20 +20795,24 @@ local function buildUI()
 	})
 	rageTab:CreateToggle({
 		name = "damage boost",
-		description = "applies the damage multiplier to everything this fighter throws. off by default so the panel can sit loaded without changing a normal match.",
+		description = "applies the damage multiplier in fights your client simulates (casual vs AI). in ranked or PvP the opponent's client resolves your strikes with its own copy of your fighter; power is not sent, so this does not increase the damage they take there. it is skipped in network fights so it cannot trip the local anti-cheat for no gain. off by default.",
 		flag = "mma_rageBoost",
 		value = CFG.rageBoost,
 		callback = function(v) CFG.rageBoost = v end,
 	})
 	rageTab:CreateSlider({
 		name = "damage multiplier",
-		description = "scales the fighter's power, which is the first term in every strike the game resolves. 8x turns a clean head shot from chip damage into a knockout in a couple of touches.",
+		description = "scales the fighter's power in local/AI fights. the strike packet carries speed and stamina factor, not power, and the receiver caps the stamina factor at 1, so this cannot raise ranked/PvP damage. ranked damage comes from the server-equipped style and from throwing at full stamina.",
 		flag = "mma_rageDamage",
 		range = { 1, 50 },
 		increment = 1,
 		value = CFG.rageDamage,
 		suffix = "x",
 		callback = function(v) CFG.rageDamage = v end,
+	})
+	rageTab:CreateText({
+		name = "ranked damage  |  local only",
+		text = "ranked / pvp: the opponent's client resolves your hits and power is not sent. the multiplier does nothing there; use endless stamina and your equipped style.",
 	})
 	rageTab:CreateToggle({
 		name = "one punch",
@@ -20820,7 +20830,7 @@ local function buildUI()
 	})
 	rageTab:CreateToggle({
 		name = "endless stamina",
-		description = "pins the stamina bar at full every frame, so fatigue never builds and every throw comes off a fresh tank.",
+		description = "pins the stamina bar at full every frame, so fatigue never builds and every throw comes off a fresh tank. in ranked PvP this is the damage-relevant rage switch: the strike packet does carry stamina factor, and full stamina keeps it at its 1.0 cap.",
 		flag = "mma_rageStamina",
 		value = CFG.rageStamina,
 		callback = function(v) CFG.rageStamina = v end,
@@ -21355,7 +21365,7 @@ task.spawn(function()
 end)
 
 _G.RagdollMmaPanel = {
-	build = "ironknuckles-2d",
+	build = "ironknuckles-2e",
 	cfg = CFG,
 	guard = guardTick,
 	guardState = function()
