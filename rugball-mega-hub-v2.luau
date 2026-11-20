@@ -19271,14 +19271,18 @@ local function applyCounter(kind)
 		return
 	end
 	READ.style = c.strikeStyle or ""
-	if not CFG.adaptive then
+	-- the Iron Knuckles plan is a fixed, server-style response, not a guess: the
+	-- style id is in the match at the bell. the user can leave the adaptive read
+	-- off and still get this one plan, because losing that matchup was the whole
+	-- complaint. every other counter still needs `adaptive`.
+	if not CFG.adaptive and kind ~= "ironknuckles" then
 		READ.counter = "read only  |  adaptive is off"
 		return
 	end
 	for k, v in pairs(c) do
 		if k ~= "label" then TUNE[k] = v end
 	end
-	READ.counter = c.label
+	READ.counter = (not CFG.adaptive and "ironknuckles plan  |  adaptive off  |  " or "") .. c.label
 end
 
 local function setAdaptive(on)
@@ -19287,7 +19291,11 @@ local function setAdaptive(on)
 		applyCounter(READ.read)
 	else
 		clearTune()
-		READ.counter = "adaptive off"
+		if READ.read == "ironknuckles" or READ.prior == "ironknuckles" then
+			applyCounter("ironknuckles")
+		else
+			READ.counter = "adaptive off"
+		end
 	end
 end
 
@@ -20537,7 +20545,7 @@ local function buildUI()
 	ui.readCard = fightTab:CreateText({ name = "read  |  unknown", text = "no match captured" })
 	fightTab:CreateToggle({
 		name = "adaptive counter",
-		description = "watches the opponent's real strikes, guard time, movement and takedown attempts, labels their playstyle, and shifts range, aim, strike style and takedown timing to counter it. it only changes this panel's own settings; the server profile is never written. turn it off to keep the readout but fight with your own slider values.",
+		description = "watches the opponent's real strikes, guard time, movement and takedown attempts, labels their playstyle, and shifts range, aim, strike style and takedown timing to counter it. it only changes this panel's own settings; the server profile is never written. turn it off to keep the readout but fight with your own slider values - the Iron Knuckles plan still applies when his server style id is in the match, because that matchup is fixed and known at the bell.",
 		flag = "mma_adaptive",
 		value = CFG.adaptive,
 		callback = function(v) setAdaptive(v) end,
@@ -21265,7 +21273,7 @@ task.spawn(function()
 end)
 
 _G.RagdollMmaPanel = {
-	build = "ironknuckles-2b",
+	build = "ironknuckles-2c",
 	cfg = CFG,
 	guard = guardTick,
 	guardState = function()
