@@ -18443,13 +18443,26 @@ local function spinMany(lucky, count)
 		end
 		local want = math.clamp(tonumber(count) or 1, 1, have)
 		local got = 0
+		local gap = 0.35
+		local slowNotified = false
 		for i = 1, want do
 			if spinStop or dead then break end
 			local res, err = spinOnce(lucky)
 			if not res and err == "slow" then
-				task.wait(1)
-				res, err = spinOnce(lucky)
+				if not slowNotified then
+					slowNotified = true
+					notify("spin rate limited - backing off, run continues")
+				end
+				local tries = 0
+				while tries < 3 and not spinStop and not dead do
+					tries += 1
+					gap = math.min(gap + 0.4, 1.6)
+					task.wait(0.7 * tries + 0.3)
+					res, err = spinOnce(lucky)
+					if res or err ~= "slow" then break end
+				end
 			end
+			if spinStop or dead then break end
 			if not res then
 				notify("spin stopped: " .. tostring(err))
 				break
@@ -18472,7 +18485,7 @@ local function spinMany(lucky, count)
 				notify("stopped on " .. rarity .. ": " .. name)
 				break
 			end
-			if i < want then task.wait(0.2) end
+			if i < want then task.wait(gap) end
 		end
 		local sp2, lk2 = spinCounts()
 		spinBusy = false
@@ -21458,7 +21471,10 @@ do
 		if not okA or not okB then return end
 		rec.frames[#rec.frames + 1] = { t = rec.t, a = a, b = b }
 		local maxFrames = math.max(50, math.floor(replaySeconds() * 10))
-		while #rec.frames > maxFrames do table.remove(rec.frames, 1) end
+		local maxAge = replaySeconds()
+		while #rec.frames > 2 and (#rec.frames > maxFrames or (rec.frames[#rec.frames].t - rec.frames[1].t) > maxAge) do
+			table.remove(rec.frames, 1)
+		end
 	end
 
 	local function start(m)
@@ -21630,6 +21646,7 @@ do
 			local m = match
 			if m and not m.finish and (m.state == "fight" or m.state == "break" or m.state == "setup") then
 				stopPlayback()
+				notify("replay stopped: a new fight started")
 			end
 			return
 		end
@@ -21670,13 +21687,15 @@ do
 		finish = finalize,
 		abort = abort,
 		state = function()
+			local rec = recording
+			local last = lastReplay
 			return {
-				recording = recording ~= nil,
-				frames = recording and #recording.frames or (lastReplay and #lastReplay.frames) or 0,
-				duration = lastReplay and lastReplay.duration or (recording and buffered(recording)) or 0,
+				recording = rec ~= nil,
+				frames = rec and #rec.frames or (last and #last.frames) or 0,
+				duration = rec and buffered(rec) or (last and last.duration) or 0,
 				playing = playback ~= nil,
 				record = CFG.replayRecord == true,
-				hasLast = lastReplay ~= nil,
+				hasLast = last ~= nil,
 			}
 		end,
 		shutdown = function()
@@ -21996,7 +22015,7 @@ task.spawn(function()
 end)
 
 _G.RagdollMmaPanel = {
-	build = "ironknuckles-2i",
+	build = "ironknuckles-2j",
 	cfg = CFG,
 	guard = guardTick,
 	guardState = function()
