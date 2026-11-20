@@ -17580,8 +17580,10 @@ for k, v in pairs({
 	autoFight = false,
 	autoAim = true,
 	aimZone = "head",
+	hitReach = 1.30,
 	autoBlock = true,
 	autoCounter = true,
+	autoLegKick = false,
 	autoTakedown = false,
 	takedownStamina = 40,
 	autoGround = true,
@@ -18744,6 +18746,8 @@ local function pushFlags()
 		ui.window:Set("mma_aimZone", CFG.aimZone)
 		ui.window:Set("mma_strikeStyle", CFG.strikeStyle)
 		ui.window:Set("mma_safeKicks", CFG.safeKicks)
+		ui.window:Set("mma_hitReach", CFG.hitReach)
+		ui.window:Set("mma_autoLegKick", CFG.autoLegKick)
 		ui.window:Set("mma_adaptive", CFG.adaptive)
 		ui.window:Set("mma_aggro", CFG.aggro)
 		ui.window:Set("mma_staminaFloor", CFG.staminaFloor)
@@ -18890,8 +18894,10 @@ local function aimPoint(m, zone)
 	local ok, p = pcall(function()
 		if zone == "body" then
 			return o.rig:point("body")
-		elseif zone == "legs" then
+		elseif zone == "legs" or zone == "legL" then
 			return o.rig.bones.ShinL.world.Position
+		elseif zone == "legR" then
+			return o.rig.bones.ShinR.world.Position
 		end
 		return o.rig:point("head")
 	end)
@@ -19032,7 +19038,10 @@ local function pickStrike(m, dist, reach, threat)
 	if CFG.safeKicks then
 		safeKick = (not threat) and kickWindow(m, dist)
 	end
-	local canKick = safeKick and dist <= reach * 1.30
+	-- hit reach is spacing only: the game resolves the hit from the limb's real
+	-- position, so a value past the real contact range throws a whiff.
+	local hitReach = math.clamp(tonumber(CFG.hitReach) or 1.30, 0.80, 1.60)
+	local canKick = safeKick and dist <= reach * hitReach
 
 	-- a shot or a clinch locks the opponent out of starting a strike, so this is
 	-- the cleanest counter window in the game: knee the level change or kick the
@@ -19043,6 +19052,13 @@ local function pickStrike(m, dist, reach, threat)
 			if stamina >= 8 then return "rkick" end
 		end
 		return nil
+	end
+
+	-- explicit leg-kick switch: at kick range, take the leg instead of waiting
+	-- for a kick style. sides alternate so the same shin is not kicked forever.
+	if CFG.autoLegKick and canKick and stamina >= 6.5 and dist > reach * 0.55 then
+		READ.legKickSide = not READ.legKickSide
+		return READ.legKickSide and "rkick" or "lkick"
 	end
 
 	if style == "jab" then
@@ -19602,6 +19618,7 @@ local function fightTick(m)
 	local delta = flat(o.pos - p.pos)
 	local dist = delta.Magnitude
 	local reach = (p.d and p.d.reach or 2.27) + 0.75 * (p.s or 1) + (tonumber(p.reachBonus) or 0)
+	local hr = math.clamp(tonumber(CFG.hitReach) or 1.30, 0.80, 1.60)
 
 	-- read the fight: are they hurt enough to press, or are we too tired to trade
 	local headHp = (o.hp and o.hp.head) or 100
@@ -19627,6 +19644,12 @@ local function fightTick(m)
 	if tonumber(TUNE.range) then
 		want = reach * TUNE.range
 	end
+	-- a lower hit-reach must also pull the standing distance in, or the fighter
+	-- would hold a range it refuses to strike from. raising it leaves aggression
+	-- in charge; only the strike gate moves.
+	if hr < 1.30 then
+		want = math.min(want, reach * hr * 0.96)
+	end
 	if pressing then
 		want = reach * 0.52          -- walk onto the finish instead of trading at range
 	end
@@ -19649,11 +19672,20 @@ local function fightTick(m)
 	guardTick(m, dist, pressing, threat)
 
 	local allowStrike = pressing or (not autoOn("autoBlock")) or (not threat) or (not autoOn("autoCounter"))
-	if allowStrike and not gassed and dist <= reach * 1.30 and now() - lastTry > 0.09 then
+	if allowStrike and not gassed and dist <= reach * hr and now() - lastTry > 0.09 then
 		local move = pickStrike(m, dist, reach, threat)
 		if move and canThrow(p, move) then
 			lastTry = now()
-			local zone = move == "knee" and "head" or effAim()
+			local zone
+			if move == "knee" then
+				zone = "head"
+			elseif CFG.autoLegKick and move == "lkick" then
+				zone = "legL"
+			elseif CFG.autoLegKick and move == "rkick" then
+				zone = "legR"
+			else
+				zone = effAim()
+			end
 			strikeAt(m, move, zone)
 		end
 	end
@@ -19690,6 +19722,31 @@ local function fightTick(m)
 			end
 		end
 	end
+end
+
+-- auto leg kick is its own switch: with auto fight off it still throws the one
+-- action, but it never moves or guards. safe kicks and auto counter still gate it.
+-- stored on GUARD so the suite stays inside Luau's 200-local limit.
+GUARD.legKickTick = function(m)
+	local p = m and m.player
+	local o = m and m.opp
+	if not (p and o and p.rig and o.rig) then return end
+	if m.state ~= "fight" or m.finish or not m.controls then return end
+	if p.down or o.down or p.rig.ragdolled or o.rig.ragdolled then return end
+	if m.gnd or m.drive then return end
+	local t = now()
+	if t - lastTry < 0.45 then return end
+	local dist = flat(o.pos - p.pos).Magnitude
+	local reach = (p.d and p.d.reach or 2.27) + 0.75 * (p.s or 1) + (tonumber(p.reachBonus) or 0)
+	local hr = math.clamp(tonumber(CFG.hitReach) or 1.30, 0.80, 1.60)
+	if dist > reach * hr or dist < reach * 0.45 then return end
+	if autoOn("autoCounter") and incomingStrike(m) then return end
+	if CFG.safeKicks and not kickWindow(m, dist) then return end
+	READ.legKickSide = not READ.legKickSide
+	local move = READ.legKickSide and "rkick" or "lkick"
+	if not canThrow(p, move) then return end
+	lastTry = t
+	strikeAt(m, move, move == "rkick" and "legR" or "legL")
 end
 
 local function groundTick(m)
@@ -20541,6 +20598,23 @@ local function buildUI()
 		value = CFG.safeKicks,
 		callback = function(v) CFG.safeKicks = v end,
 	})
+	fightTab:CreateSlider({
+		name = "hit reach",
+		description = "how far out the auto fighter starts a strike, as a multiple of the game's own reach. 1.30x is the edge the panel already used; lower it to only strike closer, raise it to throw earlier. this changes when the panel swings, not the game's hitbox: a value past the real contact range throws a whiff.",
+		flag = "mma_hitReach",
+		range = { 0.80, 1.60 },
+		increment = 0.05,
+		value = CFG.hitReach,
+		suffix = "x",
+		callback = function(v) CFG.hitReach = tonumber(v) or 1.30 end,
+	})
+	fightTab:CreateToggle({
+		name = "auto kick leg",
+		description = "throws leg kicks at kick range, alternating sides and aiming at the shin, instead of waiting for a kick style. the game's upper guard cannot block leg kicks, but they do less damage than head shots and the opponent can still check them. works with auto fight off: it only throws the kick, never moves or guards. safe kicks and auto counter still gate it.",
+		flag = "mma_autoLegKick",
+		value = CFG.autoLegKick,
+		callback = function(v) CFG.autoLegKick = v end,
+	})
 	fightTab:CreateSection({ name = "OPPONENT READ  |  LIVE  |  COUNTER" })
 	ui.readCard = fightTab:CreateText({ name = "read  |  unknown", text = "no match captured" })
 	fightTab:CreateToggle({
@@ -21003,6 +21077,7 @@ local function panic()
 	CFG.autoAim = false
 	CFG.autoBlock = false
 	CFG.autoCounter = false
+	CFG.autoLegKick = false
 	CFG.autoTakedown = false
 	CFG.autoGround = false
 	CFG.autoSub = false
@@ -21027,7 +21102,7 @@ local function panic()
 		end)
 	end
 	pcall(function() Touch.block = false; Touch.lowBlock = false end)
-	for _, flag in ipairs({ "mma_autoFight", "mma_autoAim", "mma_autoBlock", "mma_autoCounter", "mma_autoTakedown", "mma_autoGround", "mma_autoSub", "mma_autoSprawl", "mma_autoQueue", "mma_autoBest", "mma_autoContinue", "mma_rageMode", "mma_rageBoost", "mma_rageOnePunch", "mma_rageGod", "mma_rageStamina", "mma_rageSpeed", "mma_rageFreeze", "mma_acBypass" }) do
+	for _, flag in ipairs({ "mma_autoFight", "mma_autoAim", "mma_autoBlock", "mma_autoCounter", "mma_autoLegKick", "mma_autoTakedown", "mma_autoGround", "mma_autoSub", "mma_autoSprawl", "mma_autoQueue", "mma_autoBest", "mma_autoContinue", "mma_rageMode", "mma_rageBoost", "mma_rageOnePunch", "mma_rageGod", "mma_rageStamina", "mma_rageSpeed", "mma_rageFreeze", "mma_acBypass" }) do
 		if ui.window then pcall(function() ui.window:Set(flag, false) end) end
 	end
 	status = "panic  |  automation off"
@@ -21211,9 +21286,15 @@ local function tick()
 		pcall(rageTick, m)
 		if autoOn("autoFight") then
 			runAuto("fight", fightTick, m)
-		elseif autoOn("autoBlock") then
-			-- block is its own switch: keep guarding even when auto fight is off
-			runAuto("guard", guardTick, m)
+		else
+			-- block and leg kicks are their own switches: keep them running even
+			-- when auto fight is off
+			if autoOn("autoBlock") then
+				runAuto("guard", guardTick, m)
+			end
+			if autoOn("autoLegKick") then
+				runAuto("legkick", GUARD.legKickTick, m)
+			end
 		end
 		pcall(groundTick, m)
 		pcall(driveTick, m)
@@ -21273,7 +21354,7 @@ task.spawn(function()
 end)
 
 _G.RagdollMmaPanel = {
-	build = "ironknuckles-2c",
+	build = "ironknuckles-2d",
 	cfg = CFG,
 	guard = guardTick,
 	guardState = function()
@@ -21335,6 +21416,8 @@ _G.RagdollMmaPanel = {
 				farT = READ.farT,
 				styleOverride = TUNE.strikeStyle,
 				aimZone = effAim(),
+				hitReach = math.clamp(tonumber(CFG.hitReach) or 1.30, 0.80, 1.60),
+				autoLegKick = CFG.autoLegKick,
 				range = TUNE.range,
 				retreatAt = TUNE.retreatAt,
 				staminaFloor = TUNE.staminaFloor,
