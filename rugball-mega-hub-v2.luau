@@ -17609,6 +17609,7 @@ for k, v in pairs({
 	rageBoost = false,
 	rageDamage = 8,
 	rageOnePunch = false,
+	antiKO = false,
 	rageGod = false,
 	rageStamina = false,
 	rageSpeed = false,
@@ -18886,6 +18887,38 @@ local hookNew = function(cfg)
 end
 Match.new = hookNew
 
+--// anti-knockout ----------------------------------------------------------------
+-- a ranked knockout is conceded by the client that owns the losing fighter: the
+-- KO branch calls stoppage(winner) with the winner set to the opponent, and in
+-- pvp that turns into a finish packet for the other player. the winner's own
+-- client refuses to declare itself the winner, so a refusal here keeps the bout
+-- alive and the opponent never receives the win. decisions and submissions are
+-- deliberately left alone.
+
+local lastAntiKoLog = 0
+local oldStoppage = Match.stoppage
+local function hookStoppage(self, winner, method, detail, kind)
+	if CFG.antiKO and not dead and self and self.player and winner == self.opp then
+		local k = tostring(kind or ""):lower()
+		if k ~= "sub" and k ~= "submission" and k ~= "forfeit" and k ~= "nocontest" then
+			local p = self.player
+			if p and p.hp then
+				if (p.hp.head or 0) < 2 then p.hp.head = 2 end
+				if (p.hp.body or 0) < 2 then p.hp.body = 2 end
+			end
+			if p and (p.knockdowns or 0) >= 3 then p.knockdowns = 2 end
+			local t = os.clock()
+			if t - lastAntiKoLog > 3 then
+				lastAntiKoLog = t
+				pushLog("anti-ko  |  blocked " .. (k ~= "" and k or tostring(method or "stoppage")))
+			end
+			return
+		end
+	end
+	return oldStoppage(self, winner, method, detail, kind)
+end
+Match.stoppage = hookStoppage
+
 --// aim -------------------------------------------------------------------------
 
 local function aimPoint(m, zone)
@@ -19971,6 +20004,17 @@ local function rageTick(m)
 		p.stun = 0
 		p.rockedT = 0
 	end
+
+	if CFG.antiKO then
+		-- the stoppage hook refuses the loss; this keeps the sim and the HUD from
+		-- sitting on a zeroed head while the round plays on. knockdowns are held
+		-- below the count the KO branch reads so a count-out cannot stack up.
+		if p.hp then
+			if (p.hp.head or 0) < 2 then p.hp.head = 2 end
+			if (p.hp.body or 0) < 2 then p.hp.body = 2 end
+		end
+		if (p.knockdowns or 0) >= 3 then p.knockdowns = 2 end
+	end
 end
 
 local function instantKO()
@@ -20829,6 +20873,13 @@ local function buildUI()
 		callback = function(v) CFG.rageGod = v end,
 	})
 	rageTab:CreateToggle({
+		name = "anti knockout",
+		description = "refuses any KO / TKO / injury / doctor stoppage that would award the opponent the win, and holds your head and body health just above zero each frame. ranked pvp is conceded by the losing fighter's own client, so this keeps the bout running; it does not stop a decision on points or a submission, and the server can still end the match. off by default.",
+		flag = "mma_antiKO",
+		value = CFG.antiKO,
+		callback = function(v) CFG.antiKO = v end,
+	})
+	rageTab:CreateToggle({
 		name = "endless stamina",
 		description = "pins the stamina bar at full every frame, so fatigue never builds and every throw comes off a fresh tank. in ranked PvP this is the damage-relevant rage switch: the strike packet does carry stamina factor, and full stamina keeps it at its 1.0 cap.",
 		flag = "mma_rageStamina",
@@ -20896,12 +20947,13 @@ local function buildUI()
 			CFG.rageMode = false
 			CFG.rageBoost = false
 			CFG.rageOnePunch = false
+			CFG.antiKO = false
 			CFG.rageGod = false
 			CFG.rageStamina = false
 			CFG.rageSpeed = false
 			CFG.rageFreeze = false
 			if ui.window then
-				for _, flag in ipairs({ "mma_rageMode", "mma_rageBoost", "mma_rageOnePunch", "mma_rageGod", "mma_rageStamina", "mma_rageSpeed", "mma_rageFreeze" }) do
+				for _, flag in ipairs({ "mma_rageMode", "mma_rageBoost", "mma_rageOnePunch", "mma_antiKO", "mma_rageGod", "mma_rageStamina", "mma_rageSpeed", "mma_rageFreeze" }) do
 					pcall(function() ui.window:Set(flag, false) end)
 				end
 			end
@@ -21099,6 +21151,7 @@ local function panic()
 	CFG.rageMode = false
 	CFG.rageBoost = false
 	CFG.rageOnePunch = false
+	CFG.antiKO = false
 	CFG.rageGod = false
 	CFG.rageStamina = false
 	CFG.rageSpeed = false
@@ -21113,7 +21166,7 @@ local function panic()
 		end)
 	end
 	pcall(function() Touch.block = false; Touch.lowBlock = false end)
-	for _, flag in ipairs({ "mma_autoFight", "mma_autoAim", "mma_autoBlock", "mma_autoCounter", "mma_autoLegKick", "mma_autoTakedown", "mma_autoGround", "mma_autoSub", "mma_autoSprawl", "mma_autoQueue", "mma_autoBest", "mma_autoContinue", "mma_rageMode", "mma_rageBoost", "mma_rageOnePunch", "mma_rageGod", "mma_rageStamina", "mma_rageSpeed", "mma_rageFreeze", "mma_acBypass" }) do
+	for _, flag in ipairs({ "mma_autoFight", "mma_autoAim", "mma_autoBlock", "mma_autoCounter", "mma_autoLegKick", "mma_autoTakedown", "mma_autoGround", "mma_autoSub", "mma_autoSprawl", "mma_autoQueue", "mma_autoBest", "mma_autoContinue", "mma_rageMode", "mma_rageBoost", "mma_rageOnePunch", "mma_antiKO", "mma_rageGod", "mma_rageStamina", "mma_rageSpeed", "mma_rageFreeze", "mma_acBypass" }) do
 		if ui.window then pcall(function() ui.window:Set(flag, false) end) end
 	end
 	status = "panic  |  automation off"
@@ -21137,6 +21190,9 @@ shutdown = function()
 	pcall(function() Touch.block = false; Touch.lowBlock = false end)
 	if Match.new == hookNew then
 		Match.new = oldNew
+	end
+	if Match.stoppage == hookStoppage then
+		Match.stoppage = oldStoppage
 	end
 	clearHud()
 	if ui.keyConn then pcall(function() ui.keyConn:Disconnect() end) end
@@ -21193,6 +21249,7 @@ local function syncUI()
 			if CFG.rageMode then bits[#bits + 1] = "MASTER" end
 			if rageOn("rageBoost") then bits[#bits + 1] = tostring(CFG.rageDamage) .. "x power" end
 			if rageOn("rageOnePunch") then bits[#bits + 1] = "one punch" end
+			if CFG.antiKO then bits[#bits + 1] = "anti-ko" end
 			if rageOn("rageGod") then bits[#bits + 1] = "armour" end
 			if rageOn("rageStamina") then bits[#bits + 1] = "endless stamina" end
 			if rageOn("rageSpeed") then bits[#bits + 1] = tostring(CFG.rageSpeedValue) .. "x hands" end
@@ -21365,7 +21422,7 @@ task.spawn(function()
 end)
 
 _G.RagdollMmaPanel = {
-	build = "ironknuckles-2f",
+	build = "ironknuckles-2g",
 	cfg = CFG,
 	guard = guardTick,
 	guardState = function()
