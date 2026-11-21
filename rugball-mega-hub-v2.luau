@@ -29626,6 +29626,7 @@ local Agent = requireModule("Agent")
 local NPC = requireModule("NPC")
 local Cam = requireModule("Cam")
 local World = requireModule("World")
+local Mission = requireModule("Mission")
 local Audio = requireModule("Audio")
 
 if not (Game and Config and Agent and NPC) then
@@ -29733,6 +29734,10 @@ local state = {
     campaignIndex = 0,
     campaignTotal = 0,
     campaignCurrent = nil,
+    campaignFast = false,
+    campaignOptional = true,
+    autoChallenges = false,
+    campaignBusy = false,
 
     dead = false,
 }
@@ -29847,6 +29852,24 @@ local function installHooks()
             return original.shake(...)
         end
     end
+
+    -- Challenges are evaluated only on a successful finish. Returning the
+    -- whole def.challenges list here makes the game's own result path save
+    -- every challenge id for the current map; the checks and the profile write
+    -- still stay inside Mission and Boot.
+    if Mission and Mission.challengesEarned and not original.challengesEarned then
+        original.challengesEarned = Mission.challengesEarned
+        Mission.challengesEarned = function(self, result)
+            if state.autoChallenges then
+                local earned = {}
+                for _, challenge in ipairs(self.def and self.def.challenges or {}) do
+                    table.insert(earned, challenge)
+                end
+                return earned
+            end
+            return original.challengesEarned(self, result)
+        end
+    end
 end
 
 local function restoreHooks()
@@ -29869,6 +29892,10 @@ local function restoreHooks()
     if Cam and original.shake then
         Cam.shake = original.shake
         original.shake = nil
+    end
+    if Mission and original.challengesEarned then
+        Mission.challengesEarned = original.challengesEarned
+        original.challengesEarned = nil
     end
 end
 
@@ -31453,6 +31480,13 @@ local campaignGuidePart = nil
 local campaignGuideBillboard = nil
 local campaignGuideLabel = nil
 local campaignGuideHint = nil
+local campaignArrowGui = nil
+local campaignArrowGlyph = nil
+local campaignArrowText = nil
+local campaignArrowHint = nil
+local campaignGuideBeam = nil
+local campaignGuideBeamA0 = nil
+local campaignGuideBeamA1 = nil
 
 local function campaignEntryDef(id)
     return autoLoopFind(id)
@@ -31592,13 +31626,33 @@ local function campaignRoadmap()
 end
 
 local function clearCampaignGuide()
+    if campaignGuideBeam then
+        campaignGuideBeam.Parent = nil
+    end
+    if campaignGuideBeamA0 then
+        campaignGuideBeamA0.Parent = nil
+    end
+    if campaignGuideBeamA1 then
+        campaignGuideBeamA1.Parent = nil
+    end
     if campaignGuidePart then
         campaignGuidePart.Parent = nil
     end
+    if campaignArrowGui then
+        campaignArrowGui.Parent = nil
+    end
+
     campaignGuidePart = nil
     campaignGuideBillboard = nil
     campaignGuideLabel = nil
     campaignGuideHint = nil
+    campaignArrowGui = nil
+    campaignArrowGlyph = nil
+    campaignArrowText = nil
+    campaignArrowHint = nil
+    campaignGuideBeam = nil
+    campaignGuideBeamA0 = nil
+    campaignGuideBeamA1 = nil
 end
 
 local function ensureCampaignGuide()
@@ -31657,6 +31711,121 @@ local function ensureCampaignGuide()
     campaignGuideHint = hint
 end
 
+local function ensureCampaignArrow()
+    if campaignArrowGui and campaignArrowGui.Parent then
+        return
+    end
+
+    local parent = (type(gethui) == "function" and gethui()) or game:GetService("CoreGui")
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "HitBloxQuestArrow"
+    gui.IgnoreGuiInset = true
+    gui.ResetOnSpawn = false
+    gui.DisplayOrder = 1000
+    gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    gui.Parent = parent
+
+    local holder = Instance.new("Frame")
+    holder.Name = "Holder"
+    holder.AnchorPoint = Vector2.new(0.5, 0)
+    holder.Position = UDim2.new(0.5, 0, 0, 64)
+    holder.Size = UDim2.fromOffset(380, 154)
+    holder.BackgroundTransparency = 1
+    holder.Parent = gui
+
+    local glyph = Instance.new("TextLabel")
+    glyph.Name = "Arrow"
+    glyph.AnchorPoint = Vector2.new(0.5, 0.5)
+    glyph.Position = UDim2.new(0.5, 0, 0, 38)
+    glyph.Size = UDim2.fromOffset(84, 84)
+    glyph.BackgroundTransparency = 1
+    glyph.Font = Enum.Font.GothamBold
+    glyph.Text = "▲"
+    glyph.TextSize = 62
+    glyph.TextColor3 = Color3.fromRGB(255, 196, 96)
+    glyph.TextStrokeTransparency = 0.2
+    glyph.Parent = holder
+
+    local text = Instance.new("TextLabel")
+    text.Name = "Objective"
+    text.AnchorPoint = Vector2.new(0.5, 0)
+    text.Position = UDim2.new(0.5, 0, 0, 82)
+    text.Size = UDim2.fromOffset(380, 24)
+    text.BackgroundTransparency = 1
+    text.Font = Enum.Font.GothamBold
+    text.TextSize = 15
+    text.TextColor3 = Color3.fromRGB(255, 196, 96)
+    text.TextStrokeTransparency = 0.3
+    text.Text = ""
+    text.Parent = holder
+
+    local hint = Instance.new("TextLabel")
+    hint.Name = "Hint"
+    hint.AnchorPoint = Vector2.new(0.5, 0)
+    hint.Position = UDim2.new(0.5, 0, 0, 106)
+    hint.Size = UDim2.fromOffset(380, 44)
+    hint.BackgroundTransparency = 1
+    hint.Font = Enum.Font.Gotham
+    hint.TextSize = 13
+    hint.TextColor3 = Color3.fromRGB(235, 235, 235)
+    hint.TextStrokeTransparency = 0.4
+    hint.TextWrapped = true
+    hint.Text = ""
+    hint.Parent = holder
+
+    campaignArrowGui = gui
+    campaignArrowGlyph = glyph
+    campaignArrowText = text
+    campaignArrowHint = hint
+end
+
+local function ensureCampaignBeam(kind)
+    local agent = currentAgent()
+    local root = agent and agent.actor and agent.actor.root
+    if not (root and campaignGuidePart) then
+        if campaignGuideBeam then
+            campaignGuideBeam.Enabled = false
+        end
+        return
+    end
+
+    if not (campaignGuideBeam and campaignGuideBeam.Parent) then
+        local a0 = Instance.new("Attachment")
+        a0.Name = "HitBloxQuestBeamA"
+        a0.Parent = campaignGuidePart
+
+        local a1 = Instance.new("Attachment")
+        a1.Name = "HitBloxQuestBeamB"
+        a1.Parent = root
+
+        local beam = Instance.new("Beam")
+        beam.Name = "HitBloxQuestBeam"
+        beam.Attachment0 = a0
+        beam.Attachment1 = a1
+        beam.FaceCamera = true
+        beam.Width0 = 0.18
+        beam.Width1 = 0.18
+        beam.Transparency = NumberSequence.new(0.35)
+        beam.LightEmission = 1
+        beam.LightInfluence = 0
+        beam.Parent = campaignGuidePart
+
+        campaignGuideBeam = beam
+        campaignGuideBeamA0 = a0
+        campaignGuideBeamA1 = a1
+    elseif campaignGuideBeamA1 and campaignGuideBeamA1.Parent ~= root then
+        campaignGuideBeamA1.Parent = root
+        campaignGuideBeam.Attachment1 = campaignGuideBeamA1
+    end
+
+    campaignGuideBeam.Enabled = true
+    campaignGuideBeam.Color = ColorSequence.new(
+        kind == "target" and Color3.fromRGB(255, 96, 96)
+            or kind == "story" and Color3.fromRGB(255, 255, 255)
+            or Color3.fromRGB(255, 196, 96)
+    )
+end
+
 local function campaignHintFor(label)
     if not label then
         return nil
@@ -31687,6 +31856,20 @@ local function campaignHintFor(label)
     end
 
     return nil
+end
+
+local function campaignNearestExit(origin)
+    local best, bestDistance = nil, nil
+    for _, exit in ipairs(World and World.exits or {}) do
+        local position = exit and exit.pos
+        if typeof(position) == "Vector3" then
+            local distance = origin and (position - origin).Magnitude or 0
+            if not bestDistance or distance < bestDistance then
+                best, bestDistance = exit, distance
+            end
+        end
+    end
+    return best, bestDistance
 end
 
 local function campaignMarker()
@@ -31725,6 +31908,17 @@ local function campaignMarker()
                 end
             end
 
+            if objective.id == "exit" then
+                local agent = currentAgent()
+                local origin = agent and agent.actor and agent.actor.root
+                    and agent.actor.root.Position or nil
+                local bestExit = campaignNearestExit(origin)
+                if bestExit then
+                    return bestExit.pos, ("Exit: %s"):format(tostring(bestExit.id or "leave")),
+                        "story", bestExit.text or "Walk into the exit zone to leave."
+                end
+            end
+
             if typeof(at) == "Vector3" then
                 return at, objective.text, "objective", campaignHintFor(objective.text)
             end
@@ -31742,6 +31936,22 @@ local function campaignMarker()
     local agent = currentAgent()
     local origin = agent and agent.actor and agent.actor.root
         and agent.actor.root.Position or nil
+
+    local requiredLeft = false
+    for _, objective in ipairs(mission.objectives or {}) do
+        if not objective.optional and not objective.done
+            and not objective.hidden and not objective.failed then
+            requiredLeft = true
+        end
+    end
+    if not requiredLeft then
+        local bestExit = campaignNearestExit(origin)
+        if bestExit then
+            return bestExit.pos, ("Exit: %s"):format(tostring(bestExit.id or "leave")),
+                "story", bestExit.text or "Walk into the exit zone to leave."
+        end
+    end
+
     local best = nil
     local bestDistance = nil
 
@@ -31771,10 +31981,15 @@ local function campaignGuideStep()
     end
 
     ensureCampaignGuide()
+    ensureCampaignArrow()
 
     local position, label, kind, hint = campaignMarker()
     if not position then
         campaignGuideBillboard.Enabled = false
+        campaignArrowGui.Enabled = false
+        if campaignGuideBeam then
+            campaignGuideBeam.Enabled = false
+        end
         state.campaignGuideNote = "no active objective"
         return
     end
@@ -31788,7 +32003,7 @@ local function campaignGuideStep()
     local distance = origin and math.floor((position - origin).Magnitude + 0.5) or 0
     local title = label or "Objective"
 
-    campaignGuideLabel.Text = ("◆ %s   [%dm]"):format(title, distance)
+    campaignGuideLabel.Text = ("▼ %s   [%dm]"):format(title, distance)
     if kind == "target" then
         campaignGuideLabel.TextColor3 = Color3.fromRGB(255, 96, 96)
     elseif kind == "story" then
@@ -31797,6 +32012,29 @@ local function campaignGuideStep()
         campaignGuideLabel.TextColor3 = Color3.fromRGB(255, 196, 96)
     end
     campaignGuideHint.Text = hint or ""
+
+    campaignArrowGui.Enabled = true
+    local camera = workspace.CurrentCamera
+    if camera then
+        local localDirection = camera.CFrame:VectorToObjectSpace(position - camera.CFrame.Position)
+        local yaw = math.deg(math.atan2(localDirection.X, -localDirection.Z))
+        campaignArrowGlyph.Rotation = yaw
+    end
+
+    local color
+    if kind == "target" then
+        color = Color3.fromRGB(255, 96, 96)
+    elseif kind == "story" then
+        color = Color3.fromRGB(255, 255, 255)
+    else
+        color = Color3.fromRGB(255, 196, 96)
+    end
+
+    campaignArrowGlyph.TextColor3 = color
+    campaignArrowText.TextColor3 = color
+    campaignArrowText.Text = ("%s   [%dm]"):format(title, distance)
+    campaignArrowHint.Text = hint or ""
+    ensureCampaignBeam(kind)
 
     state.campaignGuideNote = ("guiding to %s (%dm)"):format(title, distance)
 end
@@ -31835,9 +32073,619 @@ local function campaignObjectiveSummary()
     )
 end
 
-local function campaignStartOnly(entry)
+local function campaignCharacter()
+    local agent = currentAgent()
+    local actor = agent and agent.actor
+    local model = actor and actor.model
+    local root = actor and actor.root
+    local humanoid = model and model:FindFirstChildOfClass("Humanoid")
+    return agent, model, root, humanoid
+end
+
+-- The game can replace an objective table when a multi-stage objective
+-- advances (pick up the combination, then open the safe). Always re-read the
+-- live table by id so the loop does not keep retrying a stale stage after the
+-- real objective has already completed.
+local function campaignObjectiveDone(objective)
+    if not objective then
+        return false
+    end
+
+    local mission = currentMission()
+    if not (mission and mission.running) then
+        return true
+    end
+
+    for _, current in ipairs(mission.objectives or {}) do
+        if current == objective then
+            return current.done == true
+        end
+        if objective.id and current.id == objective.id then
+            return current.done == true
+        end
+    end
+
+    return objective.done == true
+end
+
+local function campaignObjectivePosition(objective)
+    if not objective then
+        return nil
+    end
+
+    local mission = currentMission()
+    if not (mission and mission.running) then
+        return nil
+    end
+
+    if objective.id == "exit" and not objective.hidden then
+        local agent = currentAgent()
+        local origin = agent and agent.actor and agent.actor.root
+            and agent.actor.root.Position or nil
+        local exit = campaignNearestExit(origin)
+        if exit then
+            return exit.pos, ("Exit: %s"):format(tostring(exit.id or "leave")), "story"
+        end
+    end
+
+    local at = objective.at
+    if type(at) == "function" then
+        local key = objective.id or objective.text
+        if not campaignAtFailures[key] then
+            local ok, result = pcall(at, mission)
+            if ok then
+                at = result
+            else
+                campaignAtFailures[key] = true
+                at = nil
+            end
+        else
+            at = nil
+        end
+    end
+
+    if typeof(at) == "Vector3" then
+        return at, objective.text, "objective"
+    end
+
+    if type(at) == "string" and World and World.spots then
+        local spot = World.spots[at]
+        if spot and spot.cf then
+            return spot.cf.Position, objective.text, "objective"
+        end
+    end
+
+    local keyOk, keyPosition = pcall(function()
+        return mission:keyMarker()
+    end)
+    if keyOk and typeof(keyPosition) == "Vector3" then
+        return keyPosition, objective.text, "objective"
+    end
+
+    return nil
+end
+
+local function campaignUsePosition(entry)
+    if type(entry) ~= "table" then
+        return nil
+    end
+
+    local ok, position = pcall(World.usePos, entry)
+    if ok and typeof(position) == "Vector3" then
+        return position
+    end
+
+    if typeof(entry.pos) == "Vector3" then
+        return entry.pos
+    end
+
+    if typeof(entry.part) == "Instance" and entry.part:IsA("BasePart") then
+        return entry.part.Position
+    end
+
+    return nil
+end
+
+local function campaignUseCan(entry)
+    if type(entry) ~= "table" or type(entry.can) ~= "function" then
+        return true
+    end
+
+    local agent = currentAgent()
+    local ok, result = pcall(entry.can, agent)
+    return ok and result ~= false
+end
+
+local function campaignFindUse(position, objective, radius, exclude)
+    if not (position and World and World.uses) then
+        return nil, nil
+    end
+
+    local objectiveText = string.lower(tostring(objective and objective.text or ""))
+    local words = {}
+    for word in string.gmatch(objectiveText, "%a%a%a%a+") do
+        words[word] = true
+    end
+
+    local best, bestScore, bestPosition = nil, nil, nil
+
+    for _, entry in ipairs(World.uses) do
+        if type(entry) == "table" and type(entry.run) == "function"
+            and not (exclude and (exclude[entry] or 0) >= 3) then
+            local usePosition = campaignUsePosition(entry)
+            if usePosition and campaignUseCan(entry) then
+                local distance = (usePosition - position).Magnitude
+                if distance <= (radius or 10) then
+                    local score = distance
+                    local entryText = type(entry.text) == "string"
+                        and string.lower(entry.text) or ""
+                    local hits = 0
+                    for word in pairs(words) do
+                        if entryText:find(word, 1, true) then
+                            hits = hits + 1
+                        end
+                    end
+                    score = score - hits * 4
+                    if entryText ~= "" and entryText == objectiveText then
+                        score = score - 10
+                    end
+                    local hold = tonumber(entry.hold) or 0
+                    if hold > 12 then
+                        score = score + 16
+                    elseif hold > 6 then
+                        score = score + 4
+                    end
+                    if entryText:find("slow", 1, true) then
+                        score = score + 8
+                    end
+                    if not bestScore or score < bestScore then
+                        best = entry
+                        bestScore = score
+                        bestPosition = usePosition
+                    end
+                end
+            end
+        end
+    end
+
+    return best, bestPosition
+end
+
+local function campaignTravel(position, token, stopDistance, label)
+    local _, model, root, humanoid = campaignCharacter()
+    if not (position and root and humanoid) then
+        return false
+    end
+
+    if label then
+        state.campaignNote = ("moving: %s"):format(label)
+    end
+
+    stopDistance = stopDistance or 4
+    local savedWalkSpeed = humanoid.WalkSpeed
+    local savedJumpPower = humanoid.JumpPower
+    local savedSpeedOn = state.speedOn
+    local savedSpeed = state.speed
+
+    -- The game recomputes Humanoid.WalkSpeed from Agent.wantedSpeed every
+    -- frame, so drive the hub's speed hook instead of only setting WalkSpeed.
+    state.speedOn = true
+    state.speed = math.max(tonumber(savedSpeed) or 16, 38)
+    humanoid.WalkSpeed = state.speed
+    pcall(function()
+        humanoid.JumpPower = math.max(savedJumpPower, 60)
+    end)
+
+    local deadline = os.clock() + 60
+    local distanceNow = (root.Position - position).Magnitude
+    local lastDistance = distanceNow
+    local lastCheck = os.clock()
+    local lastJump = 0
+    local boostUntil = 0
+    local arrived = false
+
+    while os.clock() < deadline do
+        if state.dead or token ~= campaignToken then
+            break
+        end
+
+        local distance = (root.Position - position).Magnitude
+        if distance <= stopDistance then
+            arrived = true
+            break
+        end
+
+        local now = os.clock()
+        if now - lastCheck >= 0.8 then
+            if lastDistance - distance < 0.4 then
+                -- Blocked on geometry. Glide toward the target for a moment
+                -- so windows, fences and closed interiors do not stall the
+                -- mission. Movement jitter alone no longer counts as progress.
+                boostUntil = now + 1.2
+            end
+            lastDistance = distance
+            lastCheck = now
+        end
+
+        if now < boostUntil then
+            local flat = Vector3.new(position.X - root.Position.X, 0,
+                position.Z - root.Position.Z)
+            if flat.Magnitude > 0.05 then
+                local step = math.min(flat.Magnitude, 1.3)
+                local nextPosition = root.Position + flat.Unit * step
+                local targetY = root.Position.Y
+                if position.Y > root.Position.Y + 5 then
+                    targetY = position.Y + 3
+                end
+                local lift = math.clamp(targetY - root.Position.Y, -1.2, 1.2)
+                nextPosition = Vector3.new(
+                    nextPosition.X,
+                    root.Position.Y + lift,
+                    nextPosition.Z
+                )
+                root.CFrame = CFrame.lookAt(nextPosition, nextPosition + flat.Unit)
+            end
+        else
+            humanoid:MoveTo(position)
+
+            if now - lastJump > 0.9
+                and (position.Y + 3 - root.Position.Y) > 5 then
+                humanoid.Jump = true
+                lastJump = now
+            end
+        end
+
+        local flat = Vector3.new(position.X, root.Position.Y, position.Z)
+        if (flat - root.Position).Magnitude > 0.1 then
+            pcall(function()
+                root.CFrame = CFrame.lookAt(root.Position, flat)
+            end)
+        end
+
+        task.wait(0.06)
+    end
+
+    pcall(function()
+        humanoid:MoveTo(root.Position)
+    end)
+    humanoid.WalkSpeed = savedWalkSpeed
+    pcall(function()
+        humanoid.JumpPower = savedJumpPower
+    end)
+    state.speedOn = savedSpeedOn
+    state.speed = savedSpeed
+
+    return arrived or (root.Position - position).Magnitude <= stopDistance + 2
+end
+
+local function campaignDoUse(entry, token)
+    if not (type(entry) == "table" and type(entry.run) == "function") then
+        return false
+    end
+
+    if not campaignUseCan(entry) then
+        return false
+    end
+
+    local usePosition = campaignUsePosition(entry)
+    if not usePosition then
+        return false
+    end
+
+    local agent, _, root = campaignCharacter()
+    if not (agent and root) then
+        return false
+    end
+
+    campaignTravel(usePosition, token, 3.5)
+    if state.dead or token ~= campaignToken then
+        return false
+    end
+
+    local elapsed = os.clock() + 0.4
+    while os.clock() < elapsed do
+        if (root.Position - usePosition).Magnitude <= 6 then
+            break
+        end
+        task.wait(0.1)
+    end
+
+    pcall(function()
+        root.CFrame = CFrame.lookAt(root.Position,
+            Vector3.new(usePosition.X, root.Position.Y, usePosition.Z))
+    end)
+
+    local hold = math.clamp(tonumber(entry.hold) or 0.4, 0.25, 26)
+    local label = type(entry.text) == "string" and entry.text or "objective"
+    state.campaignNote = ("using: %s"):format(label)
+    local holdUntil = os.clock() + hold
+    while os.clock() < holdUntil do
+        if state.dead or token ~= campaignToken then
+            return false
+        end
+        task.wait(math.min(0.25, math.max(0.05, holdUntil - os.clock())))
+    end
+    state.campaignNote = ("using: %s"):format(label)
+
+    local ok = pcall(entry.run, agent)
+    task.wait(0.4)
+    return ok
+end
+
+local function campaignDoObjective(objective, token, attempts)
+    if not objective then
+        return false, "no objective"
+    end
+
+    local mission = currentMission()
+    if not (mission and mission.running) then
+        return true
+    end
+
+    local tried = {}
+    attempts = attempts or 4
+
+    for attempt = 1, attempts do
+        if campaignObjectiveDone(objective) then
+            return true
+        end
+        if state.dead or token ~= campaignToken then
+            return false, "cancelled"
+        end
+
+        local position = campaignObjectivePosition(objective)
+        if position then
+            if attempt > 1 then
+                state.campaignNote = ("retrying: %s"):format(objective.text)
+            else
+                state.campaignNote = ("heading to: %s"):format(objective.text)
+            end
+
+            campaignTravel(position, token, 4)
+            if campaignObjectiveDone(objective) then
+                return true
+            end
+
+            local entry, usePosition = campaignFindUse(position, objective, 10 + attempt * 2, tried)
+            if not entry then
+                local _, _, root = campaignCharacter()
+                if root then
+                    entry, usePosition = campaignFindUse(root.Position, objective, 11 + attempt * 2, tried)
+                end
+            end
+
+            if entry then
+                tried[entry] = (tried[entry] or 0) + 1
+                campaignDoUse(entry, token)
+                if campaignObjectiveDone(objective) then
+                    return true
+                end
+            end
+
+            local deadline = os.clock() + 2.5
+            while os.clock() < deadline and not campaignObjectiveDone(objective) do
+                task.wait(0.15)
+            end
+            if campaignObjectiveDone(objective) then
+                return true
+            end
+        else
+            task.wait(1)
+            if campaignObjectiveDone(objective) then
+                return true
+            end
+        end
+    end
+
+    return false, "no usable interaction"
+end
+
+local function campaignFindKillTarget(objective)
+    local _, _, root = campaignCharacter()
+    local origin = root and root.Position
+    local suffix = objective and objective.id and objective.id:match("^kill_(.+)$")
+    local key = suffix and string.lower(suffix) or nil
+    local best, bestDistance = nil, nil
+
+    for _, npc in ipairs(NPC.all or {}) do
+        if npc.isTarget and npc.alive and npc.actor and npc.actor.root then
+            local name = string.lower(tostring(npc.name or npc.role or ""))
+            if not key or name:find(key, 1, true) then
+                local position = npc.actor.root.Position
+                local distance = origin and (position - origin).Magnitude or 0
+                if not bestDistance or distance < bestDistance then
+                    best = npc
+                    bestDistance = distance
+                end
+            end
+        end
+    end
+
+    if not best then
+        for _, npc in ipairs(NPC.all or {}) do
+            if npc.isTarget and npc.alive and npc.actor and npc.actor.root then
+                local position = npc.actor.root.Position
+                local distance = origin and (position - origin).Magnitude or 0
+                if not bestDistance or distance < bestDistance then
+                    best = npc
+                    bestDistance = distance
+                end
+            end
+        end
+    end
+
+    return best
+end
+
+local function campaignKill(objective, token)
+    if not objective then
+        return false
+    end
+
+    local mission = currentMission()
+    if not (mission and mission.running) then
+        return campaignObjectiveDone(objective)
+    end
+
+    local _, _, root = campaignCharacter()
+    if not root then
+        return false
+    end
+
+    local target = campaignFindKillTarget(objective)
+    local spawnDeadline = os.clock() + 15
+    while not target and os.clock() < spawnDeadline do
+        if state.dead or token ~= campaignToken then
+            return false
+        end
+        if campaignObjectiveDone(objective) then
+            return true
+        end
+        task.wait(0.5)
+        target = campaignFindKillTarget(objective)
+    end
+
+    if not target then
+        return campaignObjectiveDone(objective)
+    end
+
+    local saved = {
+        aimbot = state.aimbot,
+        autoFire = state.autoFire,
+        requireLos = state.requireLos,
+        avoidCivilians = state.avoidCivilians,
+        avoidPolice = state.avoidPolice,
+        fov = state.fov,
+        maxDistance = state.maxDistance,
+        preferTarget = state.preferTarget,
+    }
+
+    state.aimbot = true
+    state.autoFire = true
+    state.requireLos = false
+    state.avoidCivilians = false
+    state.avoidPolice = false
+    state.fov = 180
+    state.maxDistance = 650
+    state.preferTarget = true
+
+    local deadline = os.clock() + 45
+    while os.clock() < deadline do
+        if state.dead or token ~= campaignToken or campaignObjectiveDone(objective) then
+            break
+        end
+
+        target = campaignFindKillTarget(objective) or target
+        if target and target.alive and target.actor and target.actor.root then
+            local position = target.actor.root.Position
+            if (position - root.Position).Magnitude > 30 then
+                state.campaignNote = ("closing on: %s"):format(objective.text)
+                campaignTravel(position, token, 18)
+            end
+
+            local aimAt = position + Vector3.new(0, 0.5, 0)
+            pcall(function()
+                root.CFrame = CFrame.lookAt(root.Position, aimAt)
+            end)
+            local camera = workspace.CurrentCamera
+            if camera then
+                pcall(function()
+                    camera.CFrame = CFrame.lookAt(camera.CFrame.Position, aimAt)
+                end)
+            end
+        end
+
+        task.wait(0.12)
+    end
+
+    state.aimbot = saved.aimbot
+    state.autoFire = saved.autoFire
+    state.requireLos = saved.requireLos
+    state.avoidCivilians = saved.avoidCivilians
+    state.avoidPolice = saved.avoidPolice
+    state.fov = saved.fov
+    state.maxDistance = saved.maxDistance
+    state.preferTarget = saved.preferTarget
+
+    return campaignObjectiveDone(objective)
+end
+
+local function campaignExit(token)
+    local mission = currentMission()
+    if not (mission and mission.running) then
+        return true
+    end
+
+    local _, _, root = campaignCharacter()
+    local origin = root and root.Position
+    local exit = campaignNearestExit(origin)
+    local position = exit and exit.pos
+
+    if not position then
+        local ok, marker = pcall(function()
+            return mission:guideMarker()
+        end)
+        if ok and typeof(marker) == "Vector3" then
+            position = marker
+        end
+    end
+
+    if not position then
+        return false, "no exit found"
+    end
+
+    state.campaignNote = ("leaving: %s"):format(
+        exit and tostring(exit.text or exit.id or "exit") or "exit"
+    )
+    campaignTravel(position, token, 3)
+
+    if state.dead or token ~= campaignToken then
+        return false, "cancelled"
+    end
+
+    pcall(function()
+        mission:tryExit()
+    end)
+
+    local deadline = os.clock() + 6
+    while os.clock() < deadline and mission.running do
+        task.wait(0.2)
+    end
+
+    if mission.running then
+        state.campaignNote = "exit failed, saving"
+        pcall(function()
+            mission:finish(true)
+        end)
+        task.wait(0.6)
+    end
+
+    return true
+end
+
+local function campaignFirstPending(mission, requiredOnly)
+    local exitObjective = nil
+
+    for _, objective in ipairs(mission and mission.objectives or {}) do
+        if not objective.done and not objective.failed and not objective.hidden then
+            if objective.id == "exit" then
+                exitObjective = exitObjective or objective
+            elseif not requiredOnly or not objective.optional then
+                return objective
+            end
+        end
+    end
+
+    return exitObjective
+end
+
+local function campaignStartOnly(entry, internal)
     if not entry then
         return false, "no mission selected"
+    end
+
+    if state.campaignBusy and not internal then
+        return false, "a mission is already playing"
     end
 
     if state.autoLoop then
@@ -31885,32 +32733,149 @@ local function campaignStartOnly(entry)
     return true
 end
 
-local function campaignRunEntry(entry)
-    local started, err = campaignStartOnly(entry)
+local function campaignPlayMission(entry, token, manual)
+    local started, err = campaignStartOnly(entry, true)
     if not started then
         return false, err
     end
 
-    state.campaignNote = ("completing %s"):format(entry.id)
-    completeObjectives()
-    task.wait(0.4)
-
+    token = token or campaignToken
     local mission = currentMission()
     if not (mission and mission.running) then
-        return false, "mission ended before finish"
+        return false, "mission did not start"
     end
 
-    state.campaignNote = ("finishing %s"):format(entry.id)
-    local ok, finishErr = pcall(function()
-        mission:finish(true)
-    end)
-    if not ok then
-        return false, ("finish failed: %s"):format(tostring(finishErr))
+    task.wait(0.8)
+
+    local budget = os.clock() + 360
+    while (manual or state.campaignPlay)
+        and not state.dead
+        and token == campaignToken
+        and os.clock() < budget do
+        mission = currentMission()
+        if not (mission and mission.running) then
+            if state.dead then
+                return false, "character died"
+            end
+            autoLoopSyncPayout()
+            state.campaignNote = ("%s finished"):format(entry.id)
+            return true
+        end
+
+        local objective = campaignFirstPending(mission, true)
+        if not objective then
+            break
+        end
+
+        if objective.id == "exit" then
+            campaignExit(token)
+            break
+        end
+
+        if objective.id:match("^kill_") then
+            state.campaignNote = ("fighting: %s"):format(objective.text)
+            if not campaignKill(objective, token) then
+                return false, ("could not eliminate: %s"):format(objective.text)
+            end
+        else
+            local ok, why = campaignDoObjective(objective, token)
+            if not ok then
+                return false, ("stuck on %s: %s"):format(
+                    objective.text,
+                    tostring(why)
+                )
+            end
+        end
+
+        task.wait(0.2)
+    end
+
+    mission = currentMission()
+    if not (mission and mission.running) then
+        if state.dead then
+            return false, "character died"
+        end
+        autoLoopSyncPayout()
+        state.campaignNote = ("%s finished"):format(entry.id)
+        return true
+    end
+
+    if state.campaignOptional then
+        for _, objective in ipairs(mission.objectives or {}) do
+            if objective.optional
+                and not objective.done
+                and not objective.failed
+                and not objective.hidden
+                and not state.dead
+                and token == campaignToken then
+                state.campaignNote = ("optional: %s"):format(objective.text)
+                if objective.id:match("^kill_") then
+                    campaignKill(objective, token)
+                else
+                    campaignDoObjective(objective, token, 2)
+                end
+            end
+        end
+    end
+
+    mission = currentMission()
+    if mission and mission.running then
+        campaignExit(token)
     end
 
     autoLoopSyncPayout()
     state.campaignNote = ("%s finished"):format(entry.id)
     return true
+end
+
+local function campaignRunEntry(entry, manual)
+    if state.campaignBusy then
+        return false, "a mission is already playing"
+    end
+
+    state.campaignBusy = true
+    local ok, result, err
+
+    if state.campaignFast then
+        local started, startErr = campaignStartOnly(entry, true)
+        if not started then
+            state.campaignBusy = false
+            return false, startErr
+        end
+
+        state.campaignNote = ("completing %s"):format(entry.id)
+        completeObjectives()
+        task.wait(0.4)
+
+        local mission = currentMission()
+        if not (mission and mission.running) then
+            state.campaignBusy = false
+            return false, "mission ended before finish"
+        end
+
+        state.campaignNote = ("finishing %s"):format(entry.id)
+        local finishOk, finishErr = pcall(function()
+            mission:finish(true)
+        end)
+        if not finishOk then
+            state.campaignBusy = false
+            return false, ("finish failed: %s"):format(tostring(finishErr))
+        end
+
+        autoLoopSyncPayout()
+        state.campaignNote = ("%s finished"):format(entry.id)
+        state.campaignBusy = false
+        return true
+    end
+
+    ok, result, err = pcall(campaignPlayMission, entry, campaignToken, manual)
+    state.campaignBusy = false
+
+    if not ok then
+        return false, tostring(result)
+    end
+
+    return result, err
 end
 
 local function stopCampaignPlay(note)
@@ -31936,6 +32901,11 @@ end
 
 local function startCampaignPlay()
     if state.campaignPlay or state.dead then
+        return
+    end
+
+    if state.campaignBusy then
+        state.campaignNote = "a mission is already playing"
         return
     end
 
@@ -32123,11 +33093,11 @@ campaignTab:CreateButton({
 
 campaignTab:CreateButton({
     name = "Run selected now",
-    description = "Starts the mission, marks its objectives and finishes it in one go.",
+    description = "Starts the mission, walks to each objective, uses the game's interactions, then leaves.",
     callback = function()
         task.spawn(function()
             local entry = campaignEntryById(state.campaignMission)
-            local ok, result, err = pcall(campaignRunEntry, entry)
+            local ok, result, err = pcall(campaignRunEntry, entry, true)
             if ok and result then
                 Window:Notify({
                     title = "Campaign",
@@ -32165,8 +33135,8 @@ campaignTab:CreateButton({
 campaignTab:CreateSection({ name = "Guide" })
 
 ui.campaignGuide = campaignTab:CreateToggle({
-    name = "Objective waypoint",
-    description = "Shows an in-world beacon on the next objective or living target.",
+    name = "Objective waypoint + arrow",
+    description = "Shows the in-world beacon and a top-screen arrow that turns toward the next objective or living target.",
     value = false,
     flag = "hbCampaignGuide",
     callback = function(value)
@@ -32225,15 +33195,45 @@ campaignPlayText = campaignTab:CreateText({
     text = "off - start from the first unfinished mission",
 })
 
+campaignTab:CreateToggle({
+    name = "Instant complete (speed mode)",
+    description = "Skips walking and interactions, marks every objective and finishes the mission immediately.",
+    value = false,
+    flag = "hbCampaignFast",
+    callback = function(value)
+        state.campaignFast = value
+    end,
+})
+
+campaignTab:CreateSection({ name = "Challenges" })
+
+local autoChallengesToggle = campaignTab:CreateToggle({
+    name = "Auto-complete all challenges",
+    description = "On every successful finish, reports all of that mission's challenges (Ghost, Suit Only, Not One Shot, story kills, In And Out) through the game's own SaveResult. Works with manual, instant and auto-play finishes.",
+    value = false,
+    flag = "hbAutoChallenges",
+    callback = function(value)
+        state.autoChallenges = value
+    end,
+})
+ui.autoChallenges = autoChallengesToggle
+
 campaignPlayToggle = campaignTab:CreateToggle({
     name = "Auto-play whole campaign",
-    description = "Starts every unfinished contract, finale and side quest in campaign order, marks the objectives and finishes each one. Leave Auto collect payout off while this runs.",
+    description = "Walks through every unfinished contract, finale and side quest in campaign order, uses the game's objectives, then leaves each mission. Leave Auto collect payout off while this runs.",
     value = false,
     flag = "hbCampaignPlay",
     callback = function(value)
         if value then
+            if state.campaignBusy then
+                state.campaignNote = "a mission is already playing"
+                pcall(function()
+                    campaignPlayToggle:Set(false, true)
+                end)
+                return
+            end
             startCampaignPlay()
-        else
+        elseif state.campaignPlay then
             stopCampaignPlay("stopped")
         end
     end,
@@ -32264,7 +33264,8 @@ local function panic()
     for _, key in ipairs({
         "aimbot", "noSpread", "noRecoil", "infAmmo", "instantReload",
         "esp", "undetectable", "godmode", "autoHideBodies", "autoPayout",
-        "autoLoop", "campaignGuide", "campaignPlay", "speedOn", "jumpOn", "noclip",
+        "autoLoop", "campaignGuide", "campaignPlay", "autoChallenges",
+        "speedOn", "jumpOn", "noclip",
     }) do
         state[key] = false
         local element = ui[key]
@@ -32312,7 +33313,7 @@ end
 -- poking at the menu.
 if getgenv then
     getgenv().HitBloxHub = {
-        version = "1.3.0",
+        version = "1.4.0",
         state = state,
         panic = panic,
         unload = unload,
@@ -32362,6 +33363,10 @@ if getgenv then
         campaignStatus = function()
             return {
                 playing = state.campaignPlay,
+                busy = state.campaignBusy,
+                fast = state.campaignFast,
+                optional = state.campaignOptional,
+                autoChallenges = state.autoChallenges,
                 index = state.campaignIndex,
                 total = state.campaignTotal,
                 current = state.campaignCurrent,
@@ -32380,7 +33385,7 @@ if getgenv then
             return campaignStartOnly(campaignEntryById(id))
         end,
         runMission = function(id)
-            return campaignRunEntry(campaignEntryById(id))
+            return campaignRunEntry(campaignEntryById(id), true)
         end,
         refreshCampaign = function()
             campaignRefreshRoadmap()
