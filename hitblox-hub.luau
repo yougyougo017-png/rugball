@@ -162,6 +162,12 @@ local state = {
     autoChallenges = false,
     campaignBusy = false,
 
+    -- challenge helper
+    challengeGuide = false,
+    challengeMission = nil,
+    challengeIndex = 1,
+    challengeNote = "off",
+
     dead = false,
 }
 
@@ -2245,6 +2251,7 @@ local function ensureCampaignBeam(kind)
     campaignGuideBeam.Color = ColorSequence.new(
         kind == "target" and Color3.fromRGB(255, 96, 96)
             or kind == "story" and Color3.fromRGB(255, 255, 255)
+            or kind == "challenge" and Color3.fromRGB(190, 140, 255)
             or Color3.fromRGB(255, 196, 96)
     )
 end
@@ -2278,6 +2285,587 @@ local function campaignHintFor(label)
         end
     end
 
+    return nil
+end
+
+local challengeStopWords = {
+    about = true, after = true, again = true, along = true, another = true,
+    before = true, blow = true, both = true, bring = true, bullet = true,
+    change = true, changing = true, clothes = true, complete = true,
+    cut = true, death = true, deaths = true, done = true, down = true,
+    drive = true, drop = true, drown = true, every = true, finish = true,
+    firing = true, from = true, give = true, help = true, him = true,
+    his = true, her = true, into = true, job = true, jobs = true,
+    kill = true, leave = true, let = true, look = true, make = true,
+    makes = true, mission = true, nobody = true, off = true, onto = true,
+    open = true, out = true, own = true, poison = true, push = true,
+    put = true, reach = true, send = true, side = true, start = true,
+    steal = true, take = true, target = true, targets = true, than = true,
+    that = true, the = true, their = true, them = true, ["then"] = true,
+    there = true, this = true, time = true, under = true, using = true,
+    want = true, way = true, when = true, ["while"] = true, wipe = true,
+    with = true, without = true, your = true, ever = true, knowing = true,
+    were = true, all = true, ["and"] = true, are = true, away = true, but = true,
+    can = true, ["for"] = true, get = true, had = true, has = true, have = true,
+    ["not"] = true, only = true, people = true, just = true, like = true,
+    other = true, some = true, very = true, will = true, you = true,
+}
+
+local challengeSynonyms = {
+    barbecue = {"bbq", "grill"},
+    beer = {"bottle", "tap"},
+    champagne = {"bubbly", "bottle"},
+    wine = {"bottle"},
+    coffee = {"mug", "urn"},
+    tea = {"kettle"},
+    dinner = {"plate", "food"},
+    car = {"sedan"},
+    truck = {"rig", "semi"},
+    rig = {"truck", "semi"},
+    toilet = {"washroom", "bathroom"},
+    washroom = {"toilet"},
+    bathroom = {"toilet"},
+    walkway = {"balcony", "rail", "deck", "platform"},
+    balcony = {"walkway", "terrace", "rail"},
+    terrace = {"balcony", "walkway", "rail"},
+    platform = {"walkway", "deck", "platform"},
+    pier = {"dock"},
+    speedboat = {"boat"},
+    boat = {"speedboat", "tender", "rib"},
+    helicopter = {"heli"},
+    heli = {"helicopter"},
+    clams = {"clam"},
+    pills = {"pill"},
+    breaker = {"power"},
+    valve = {"steam"},
+    radio = {"radio"},
+}
+
+local challengeGenericIds = {
+    Ghost = true,
+    SuitOnly = true,
+    NoShots = true,
+    Fast = true,
+    Jobs = true,
+    Accidents = true,
+    NoOne = true,
+    Sharp = true,
+}
+
+local challengeExtraHints = {
+    Ghost = "No alarms, no bodies found and no witnesses.",
+    SuitOnly = "Never use a wardrobe or change disguise.",
+    NoShots = "No gunfire - melee, poison or accidents only.",
+    Fast = "Skip side jobs and go straight for the target.",
+    Jobs = "Finish every side job before you leave.",
+    Accidents = "Every death has to read as an accident.",
+    NoOne = "Only the listed targets may die.",
+    Sharp = "Only the targets may die, no innocents.",
+    NoLasers = "Take the Star without touching or switching off the lasers.",
+    Drown = "Get poison or ipecac first, then drown the target in a toilet.",
+}
+
+local challengePropIgnore = {
+    Part = true, Ground = true, Edge = true, Window = true, Wheel = true,
+    Body = true, Handle = true, Trailer = true, RailCollide = true,
+    StairFill = true, StairRamp = true, FenceCollide = true,
+}
+
+local challengePlanCache = { key = nil, at = 0, plan = nil }
+
+local function challengeGuideDef()
+    local mission = currentMission()
+    if mission and mission.running and mission.def then
+        return mission.def
+    end
+
+    local entry = campaignEntryById(state.campaignMission)
+    return entry and entry.def or nil
+end
+
+local function challengeEarned(defId, challengeId)
+    local record = campaignRecord(defId)
+    local earned = record and record.challenges
+    return type(earned) == "table" and earned[challengeId] == true
+end
+
+local function challengeDefaultIndex(def)
+    local list = def and def.challenges or {}
+    local fallback = nil
+
+    for index, challenge in ipairs(list) do
+        if not fallback then
+            fallback = index
+        end
+        if not challengeEarned(def.id, challenge.id) and not challengeGenericIds[challenge.id] then
+            return index
+        end
+    end
+
+    for index, challenge in ipairs(list) do
+        if not challengeEarned(def.id, challenge.id) then
+            return index
+        end
+    end
+
+    return fallback or 1
+end
+
+local function challengeStoryFor(def, challenge)
+    local stories = def and def.stories
+    if type(stories) ~= "table" then
+        return nil, nil
+    end
+
+    local wantedName = type(challenge.name) == "string" and string.lower(challenge.name) or nil
+    local wantedId = type(challenge.id) == "string" and string.lower(challenge.id) or nil
+
+    for key, story in pairs(stories) do
+        if type(story) == "table" then
+            local title = type(story.title) == "string" and string.lower(story.title) or nil
+            local keyText = string.lower(tostring(key))
+            if (wantedName and title == wantedName) or (wantedId and keyText == wantedId) then
+                return key, story
+            end
+        end
+    end
+
+    return nil, nil
+end
+
+local function challengeResolveAt(at, mission)
+    if type(at) == "function" then
+        local ok, result = pcall(at, mission)
+        if ok then
+            at = result
+        else
+            at = nil
+        end
+    end
+
+    if typeof(at) == "Vector3" then
+        return at
+    end
+
+    if type(at) == "string" and World and World.spots then
+        local spot = World.spots[at]
+        if spot and spot.cf then
+            return spot.cf.Position
+        end
+    end
+
+    return nil
+end
+
+local function challengeStepText(step, mission)
+    if type(step) ~= "table" then
+        return nil
+    end
+
+    if type(step.text) == "function" then
+        local ok, text = pcall(step.text, mission)
+        if ok and type(text) == "string" then
+            return text
+        end
+        return nil
+    end
+
+    return type(step.text) == "string" and step.text or nil
+end
+
+local function challengeAnchor(mission)
+    local def = mission and mission.def
+    local names = {}
+
+    for _, target in ipairs(def and def.targets or {}) do
+        local name = type(target) == "table" and (target.name or target.id) or target
+        if type(name) == "string" and name ~= "" then
+            names[#names + 1] = string.lower(name)
+        end
+    end
+
+    local fallback = nil
+    for _, npc in ipairs(NPC and NPC.all or {}) do
+        if npc.isTarget and npc.alive and npc.actor and npc.actor.root then
+            local position = npc.actor.root.Position
+            if not fallback then
+                fallback = position
+            end
+
+            local low = string.lower(tostring(npc.name or ""))
+            for _, name in ipairs(names) do
+                if string.find(low, name, 1, true) then
+                    return position
+                end
+            end
+        end
+    end
+
+    if fallback then
+        return fallback
+    end
+
+    local agent = currentAgent()
+    return agent and agent.actor and agent.actor.root and agent.actor.root.Position or nil
+end
+
+local function challengeWords(challenge, def)
+    local seen = {}
+    local words = {}
+
+    local function add(word)
+        if type(word) ~= "string" then
+            return
+        end
+
+        word = string.lower(word)
+        if #word < 3 or challengeStopWords[word] or seen[word] then
+            return
+        end
+
+        seen[word] = true
+        words[#words + 1] = word
+    end
+
+    local text = ("%s %s %s"):format(
+        tostring(challenge.text or ""),
+        tostring(challenge.name or ""),
+        tostring(challenge.id or "")
+    )
+
+    for word in string.gmatch(text, "[%a]+") do
+        add(word)
+    end
+
+    local base = #words
+    for index = 1, base do
+        for _, word in ipairs(challengeSynonyms[words[index]] or {}) do
+            add(word)
+        end
+    end
+
+    local blocked = {}
+    for _, target in ipairs(def and def.targets or {}) do
+        local name = type(target) == "table" and (target.name or target.id) or target
+        if type(name) == "string" then
+            for word in string.gmatch(string.lower(name), "[%a]+") do
+                blocked[word] = true
+            end
+        end
+    end
+
+    local filtered = {}
+    for _, word in ipairs(words) do
+        if not blocked[word] then
+            filtered[#filtered + 1] = word
+        end
+    end
+
+    return filtered
+end
+
+local function challengeNameMatches(name, words)
+    local low = string.lower(name)
+    for _, word in ipairs(words) do
+        if string.find(low, word, 1, true) then
+            return true
+        end
+    end
+
+    return false
+end
+
+local function challengeSpotPosition(words, anchor)
+    local bestPosition = nil
+    local bestScore = nil
+
+    for key, spot in pairs(World and World.spots or {}) do
+        local position = spot and spot.cf and spot.cf.Position
+        if typeof(position) == "Vector3" then
+            local low = string.lower(tostring(key))
+            local hit = false
+
+            for _, word in ipairs(words) do
+                if string.find(low, word, 1, true)
+                    or (#low >= 3 and string.find(word, low, 1, true)) then
+                    hit = true
+                    break
+                end
+            end
+
+            if hit then
+                local score = anchor and (position - anchor).Magnitude or 0
+                if string.sub(low, 1, 5) == "start" then
+                    score = score + 500
+                elseif string.sub(low, 1, 4) == "mark" then
+                    score = score - 60
+                end
+
+                if not bestScore or score < bestScore then
+                    bestPosition = position
+                    bestScore = score
+                end
+            end
+        end
+    end
+
+    return bestPosition
+end
+
+local function challengePropPosition(instance)
+    if instance:IsA("BasePart") then
+        return instance.Position
+    end
+
+    if instance:IsA("Model") then
+        if instance.PrimaryPart then
+            return instance.PrimaryPart.Position
+        end
+
+        local ok, box = pcall(function()
+            return instance:GetBoundingBox()
+        end)
+        if ok and typeof(box) == "CFrame" then
+            return box.Position
+        end
+    end
+
+    return nil
+end
+
+local function challengePropSearch(folder, words, anchor, cap)
+    local bestPosition = nil
+    local bestDistance = nil
+    local checked = 0
+
+    for _, instance in ipairs(folder:GetChildren()) do
+        if instance.Name ~= "HitBloxQuestBeacon" and not challengePropIgnore[instance.Name] then
+            if instance:IsA("Model") or instance:IsA("BasePart") then
+                checked = checked + 1
+                if checked > cap then
+                    break
+                end
+
+                if challengeNameMatches(instance.Name, words) then
+                    local position = challengePropPosition(instance)
+                    if position then
+                        local distance = anchor and (position - anchor).Magnitude or 0
+                        if not bestDistance or distance < bestDistance then
+                            bestPosition = position
+                            bestDistance = distance
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    return bestPosition
+end
+
+local function challengePropPositionFor(mission, words, anchor)
+    local folder = workspace:FindFirstChild("Mission")
+    if not folder then
+        return nil
+    end
+
+    local position = challengePropSearch(folder, words, anchor, 400)
+    if position then
+        return position
+    end
+
+    return challengePropSearch(folder, words, anchor, 1200)
+end
+
+local function challengeExitPosition(challenge, words, anchor)
+    local text = string.lower(tostring(challenge.text or ""))
+    local leaveish = string.find(text, "leave", 1, true)
+        or string.find(text, "drive away", 1, true)
+        or string.find(text, "fly out", 1, true)
+        or string.find(text, "take off", 1, true)
+        or string.find(text, "exit", 1, true)
+
+    if not leaveish then
+        return nil
+    end
+
+    local challengeId = string.lower(tostring(challenge.id or ""))
+    local bestPosition = nil
+    local bestMatches = nil
+    local bestDistance = nil
+
+    for _, exit in ipairs(World and World.exits or {}) do
+        local position = exit and exit.pos
+        if typeof(position) == "Vector3" then
+            local exitId = string.lower(tostring(exit.id or ""))
+            local haystack = string.lower(("%s %s %s"):format(
+                tostring(exit.id or ""),
+                tostring(exit.text or ""),
+                tostring(exit.name or "")
+            ))
+
+            local matches = 0
+            for _, word in ipairs(words) do
+                if #word >= 3 and string.find(haystack, word, 1, true) then
+                    matches = matches + 1
+                end
+            end
+
+            if #challengeId >= 3 and string.find(haystack, challengeId, 1, true) then
+                matches = matches + 2
+            end
+
+            if #exitId >= 3 and string.find(challengeId, exitId, 1, true) then
+                matches = matches + 2
+            end
+
+            if matches > 0 then
+                local distance = anchor and (position - anchor).Magnitude or 0
+                if not bestMatches
+                    or matches > bestMatches
+                    or (matches == bestMatches and distance < (bestDistance or math.huge)) then
+                    bestPosition = position
+                    bestMatches = matches
+                    bestDistance = distance
+                end
+            end
+        end
+    end
+
+    return bestPosition
+end
+
+local function challengePlan(mission, challenge, def)
+    if not (mission and challenge and def) then
+        return nil
+    end
+
+    local extra = challengeExtraHints[challenge.id]
+    local plan = { hint = challenge.text }
+
+    if challengeGenericIds[challenge.id] then
+        if extra then
+            plan.hint = ("%s %s"):format(tostring(challenge.text or ""), extra)
+        end
+        return plan
+    end
+
+    local storyKey, story = challengeStoryFor(def, challenge)
+    local step = nil
+    local stepIndex = nil
+
+    if story then
+        local runtime = mission.stories and mission.stories[storyKey]
+        stepIndex = runtime and tonumber(runtime.step) or 1
+        if stepIndex < 1 then
+            stepIndex = 1
+        end
+
+        local steps = story.steps or {}
+        step = steps[stepIndex] or steps[1]
+    end
+
+    local cacheKey = ("%s:%s:%s:%s"):format(
+        tostring(def.id),
+        tostring(challenge.id),
+        tostring(storyKey),
+        tostring(stepIndex)
+    )
+    local now = os.clock()
+
+    if challengePlanCache.key == cacheKey and now - challengePlanCache.at < 1.25 then
+        return challengePlanCache.plan
+    end
+
+    if step then
+        plan.position = challengeResolveAt(step.at, mission)
+        plan.source = plan.position and "story" or nil
+        plan.hint = challengeStepText(step, mission) or challenge.text
+    end
+
+    if not plan.position then
+        local words = challengeWords(challenge, def)
+        local anchor = challengeAnchor(mission)
+
+        plan.position = challengeExitPosition(challenge, words, anchor)
+        plan.source = plan.position and "exit" or nil
+
+        if not plan.position then
+            plan.position = challengeSpotPosition(words, anchor)
+            plan.source = plan.position and "spot" or nil
+        end
+
+        if not plan.position then
+            plan.position = challengePropPositionFor(mission, words, anchor)
+            plan.source = plan.position and "prop" or nil
+        end
+
+        if not plan.position then
+            local fallback = challengeAnchor(mission)
+            if fallback then
+                plan.position = fallback
+                plan.source = "target"
+            end
+        end
+    end
+
+    if extra and plan.source ~= "story" then
+        plan.hint = ("%s %s"):format(tostring(plan.hint or challenge.text or ""), extra)
+    end
+
+    challengePlanCache.key = cacheKey
+    challengePlanCache.at = now
+    challengePlanCache.plan = plan
+
+    return plan
+end
+
+local function challengeSelected()
+    local def = challengeGuideDef()
+    local list = def and def.challenges or {}
+    if #list == 0 then
+        return nil, nil, nil, nil
+    end
+
+    if state.challengeMission ~= def.id then
+        state.challengeMission = def.id
+        state.challengeIndex = challengeDefaultIndex(def)
+    end
+
+    local index = math.clamp(tonumber(state.challengeIndex) or 1, 1, #list)
+    state.challengeIndex = index
+
+    return def, list, index, list[index]
+end
+
+local function challengeMarker()
+    local mission = currentMission()
+    if not (mission and mission.running) then
+        state.challengeNote = "no mission running"
+        return nil
+    end
+
+    local def, list, index, challenge = challengeSelected()
+    if not challenge then
+        state.challengeNote = "this mission has no challenges"
+        return nil
+    end
+
+    local plan = challengePlan(mission, challenge, def)
+    local hint = plan and plan.hint or challenge.text
+
+    if type(hint) == "string" and #hint > 108 then
+        hint = hint:sub(1, 105) .. "..."
+    end
+
+    local label = ("Challenge %d/%d: %s"):format(index, #list, challenge.name or challenge.id)
+
+    if plan and plan.position then
+        state.challengeNote = ("arrow to %s"):format(plan.source or "spot")
+        return plan.position, label, "challenge", hint
+    end
+
+    state.challengeNote = "instruction only - no map spot"
     return nil
 end
 
@@ -2399,21 +2987,29 @@ local function campaignMarker()
 end
 
 local function campaignGuideStep()
-    if not state.campaignGuide or state.dead then
+    if not (state.campaignGuide or state.challengeGuide) or state.dead then
         return
     end
 
     ensureCampaignGuide()
     ensureCampaignArrow()
 
-    local position, label, kind, hint = campaignMarker()
+    local position, label, kind, hint
+    if state.challengeGuide then
+        position, label, kind, hint = challengeMarker()
+    else
+        position, label, kind, hint = campaignMarker()
+    end
+
     if not position then
         campaignGuideBillboard.Enabled = false
         campaignArrowGui.Enabled = false
         if campaignGuideBeam then
             campaignGuideBeam.Enabled = false
         end
-        state.campaignGuideNote = "no active objective"
+        if not state.challengeGuide then
+            state.campaignGuideNote = "no active objective"
+        end
         return
     end
 
@@ -2431,6 +3027,8 @@ local function campaignGuideStep()
         campaignGuideLabel.TextColor3 = Color3.fromRGB(255, 96, 96)
     elseif kind == "story" then
         campaignGuideLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+    elseif kind == "challenge" then
+        campaignGuideLabel.TextColor3 = Color3.fromRGB(190, 140, 255)
     else
         campaignGuideLabel.TextColor3 = Color3.fromRGB(255, 196, 96)
     end
@@ -2449,6 +3047,8 @@ local function campaignGuideStep()
         color = Color3.fromRGB(255, 96, 96)
     elseif kind == "story" then
         color = Color3.fromRGB(255, 255, 255)
+    elseif kind == "challenge" then
+        color = Color3.fromRGB(190, 140, 255)
     else
         color = Color3.fromRGB(255, 196, 96)
     end
@@ -2459,7 +3059,11 @@ local function campaignGuideStep()
     campaignArrowHint.Text = hint or ""
     ensureCampaignBeam(kind)
 
-    state.campaignGuideNote = ("guiding to %s (%dm)"):format(title, distance)
+    if state.challengeGuide then
+        state.challengeNote = ("guiding to %s (%dm)"):format(title, distance)
+    else
+        state.campaignGuideNote = ("guiding to %s (%dm)"):format(title, distance)
+    end
 end
 
 local function campaignObjectiveSummary()
@@ -3420,8 +4024,11 @@ local campaignRoadmapText = nil
 local campaignSelectedText = nil
 local campaignActiveText = nil
 local campaignPlayText = nil
+local challengeListText = nil
+local challengeActiveText = nil
 local campaignGuideClock = 0
 local campaignRoadmapAt = 0
+local challengeRefreshAt = 0
 
 local function campaignRefreshRoadmap()
     if not campaignRoadmapText then
@@ -3433,6 +4040,91 @@ local function campaignRefreshRoadmap()
     pcall(function()
         campaignRoadmapText:Set(text)
     end)
+end
+
+local function challengeRefresh()
+    challengeRefreshAt = os.clock()
+
+    if not (challengeListText and challengeActiveText) then
+        return
+    end
+
+    local def, list, index, challenge = challengeSelected()
+    if not def or #list == 0 or not challenge then
+        pcall(function()
+            challengeListText:Set("No mission selected.")
+            challengeActiveText:Set("No challenge selected.")
+        end)
+        return
+    end
+
+    local lines = {}
+    for position, entry in ipairs(list) do
+        local mark = challengeEarned(def.id, entry.id) and "[x]" or "[ ]"
+        lines[#lines + 1] = ("%s%s %d. %s - %s"):format(
+            position == index and ">" or " ",
+            mark,
+            position,
+            tostring(entry.name or entry.id),
+            tostring(entry.text or "")
+        )
+    end
+
+    local mission = currentMission()
+    local plan = nil
+    if mission and mission.running and mission.def and mission.def.id == def.id then
+        plan = challengePlan(mission, challenge, def)
+    end
+
+    local earned = challengeEarned(def.id, challenge.id)
+    local action = plan and plan.hint or challenge.text
+    local marker = "instruction only"
+
+    if plan and plan.position then
+        local agent = currentAgent()
+        local origin = agent and agent.actor and agent.actor.root
+            and agent.actor.root.Position or nil
+        local distance = origin and math.floor((plan.position - origin).Magnitude + 0.5) or 0
+        marker = ("arrow ready (%s, %dm)"):format(plan.source or "spot", distance)
+    elseif plan then
+        marker = "instruction only"
+    else
+        marker = "start the mission for a map arrow"
+    end
+
+    local extra = challengeExtraHints[challenge.id]
+    local body = ("%d/%d %s   |   %s   |   %s\n%s"):format(
+        index,
+        #list,
+        tostring(challenge.name or challenge.id),
+        earned and "earned" or "not earned",
+        marker,
+        tostring(action or "")
+    )
+
+    if extra then
+        body = body .. "\nTip: " .. extra
+    end
+
+    pcall(function()
+        challengeListText:Set(("Challenges - %s\n%s"):format(tostring(def.id), table.concat(lines, "\n")))
+        challengeActiveText:Set(body)
+    end)
+end
+
+local function challengeCycle(delta)
+    local def = challengeGuideDef()
+    local list = def and def.challenges or {}
+    if #list == 0 then
+        state.challengeNote = "no challenges to cycle"
+        challengeRefresh()
+        return
+    end
+
+    local index = math.clamp(tonumber(state.challengeIndex) or 1, 1, #list)
+    state.challengeIndex = ((index - 1 + delta) % #list) + 1
+    state.challengeMission = def.id
+    challengeRefresh()
 end
 
 local campaignTab = Window:CreateTab({ name = "Campaign" })
@@ -3578,6 +4270,58 @@ campaignActiveText = campaignTab:CreateText({
     text = "No mission running.",
 })
 
+campaignTab:CreateSection({ name = "Challenge guide" })
+
+ui.challengeGuide = campaignTab:CreateToggle({
+    name = "Challenge arrow + instructions",
+    description = "Turns the top-screen arrow and beacon toward the selected challenge's spot. Challenges with no map location show a written instruction instead.",
+    value = false,
+    flag = "hbChallengeGuide",
+    callback = function(value)
+        state.challengeGuide = value
+        if value then
+            state.challengeMission = nil
+            state.challengeIndex = 1
+            state.challengeNote = "waiting for a mission"
+        else
+            state.challengeNote = "off"
+        end
+        challengeRefresh()
+    end,
+})
+
+challengeListText = campaignTab:CreateText({
+    name = "Challenges",
+    text = "Start a mission to load its challenge list.",
+})
+
+challengeActiveText = campaignTab:CreateText({
+    name = "Selected challenge",
+    text = "No challenge selected.",
+})
+
+campaignTab:CreateButton({
+    name = "Previous challenge",
+    callback = function()
+        challengeCycle(-1)
+    end,
+})
+
+campaignTab:CreateButton({
+    name = "Next challenge",
+    description = "Cycles through this mission's challenges; the arrow follows the one you pick.",
+    callback = function()
+        challengeCycle(1)
+    end,
+})
+
+campaignTab:CreateButton({
+    name = "Refresh challenges",
+    callback = function()
+        challengeRefresh()
+    end,
+})
+
 campaignTab:CreateSection({ name = "Auto-play" })
 
 campaignTab:CreateToggle({
@@ -3688,6 +4432,7 @@ local function panic()
         "aimbot", "noSpread", "noRecoil", "infAmmo", "instantReload",
         "esp", "undetectable", "godmode", "autoHideBodies", "autoPayout",
         "autoLoop", "campaignGuide", "campaignPlay", "autoChallenges",
+        "challengeGuide",
         "speedOn", "jumpOn", "noclip",
     }) do
         state[key] = false
@@ -3736,7 +4481,7 @@ end
 -- poking at the menu.
 if getgenv then
     getgenv().HitBloxHub = {
-        version = "1.4.0",
+        version = "1.5.0",
         state = state,
         panic = panic,
         unload = unload,
@@ -3796,6 +4541,103 @@ if getgenv then
                 note = state.campaignNote,
                 guide = state.campaignGuide,
                 guideNote = state.campaignGuideNote,
+            }
+        end,
+        challengeGuide = function()
+            local def, list, index, challenge = challengeSelected()
+            return {
+                enabled = state.challengeGuide,
+                mission = def and def.id or nil,
+                index = index,
+                total = list and #list or 0,
+                id = challenge and challenge.id or nil,
+                name = challenge and challenge.name or nil,
+                text = challenge and challenge.text or nil,
+                earned = def and challenge and challengeEarned(def.id, challenge.id) or false,
+                note = state.challengeNote,
+            }
+        end,
+        challenges = function()
+            local def = challengeGuideDef()
+            local out = {}
+            for position, challenge in ipairs(def and def.challenges or {}) do
+                out[#out + 1] = {
+                    index = position,
+                    id = challenge.id,
+                    name = challenge.name,
+                    text = challenge.text,
+                    earned = challengeEarned(def.id, challenge.id),
+                }
+            end
+            return out
+        end,
+        selectChallenge = function(value)
+            local def = challengeGuideDef()
+            local list = def and def.challenges or {}
+            if #list == 0 then
+                return false
+            end
+
+            local index = tonumber(value)
+            if not index then
+                for position, challenge in ipairs(list) do
+                    if challenge.id == value then
+                        index = position
+                        break
+                    end
+                end
+            end
+
+            if not index then
+                return false
+            end
+
+            state.challengeIndex = math.clamp(math.floor(index), 1, #list)
+            state.challengeMission = def.id
+            challengeRefresh()
+            return true
+        end,
+        nextChallenge = function()
+            challengeCycle(1)
+            return state.challengeIndex
+        end,
+        setChallengeGuide = function(value)
+            state.challengeGuide = value == true
+            if ui.challengeGuide then
+                pcall(function()
+                    ui.challengeGuide:Set(state.challengeGuide, true)
+                end)
+            end
+            if state.challengeGuide then
+                state.challengeMission = nil
+                state.challengeIndex = 1
+                state.challengeNote = "waiting for a mission"
+            else
+                state.challengeNote = "off"
+            end
+            challengeRefresh()
+            return state.challengeGuide
+        end,
+        challengePlan = function()
+            local def, list, index, challenge = challengeSelected()
+            local mission = currentMission()
+            if not (def and challenge and mission and mission.running) then
+                return nil
+            end
+
+            local plan = challengePlan(mission, challenge, def)
+            local position = plan and plan.position
+            return {
+                mission = def.id,
+                id = challenge.id,
+                name = challenge.name,
+                source = plan and plan.source or nil,
+                hint = plan and plan.hint or nil,
+                position = position and {
+                    x = position.X,
+                    y = position.Y,
+                    z = position.Z,
+                } or nil,
             }
         end,
         startCampaign = function()
@@ -3962,6 +4804,10 @@ RunService.Heartbeat:Connect(function(dt)
                 state.campaignGuideNote
             ))
         end)
+    end
+
+    if challengeListText and os.clock() - challengeRefreshAt >= 1 then
+        pcall(challengeRefresh)
     end
 
     if campaignPlayText then
