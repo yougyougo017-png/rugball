@@ -283,6 +283,8 @@ local CFG = {
 	speedMult   = 1.15,    -- 1.15 = about +4 st/s on the cruise (1.0 = stock)
 	rushSurge   = true,    -- tackle/block drive adds +5 st/s through the sim
 	maxPhysique = true,    -- strength 999 + zero physique penalty on our rig (client side)
+	acShield    = true,    -- rewrite the ball diagnostic + clamp remote args
+	acSpeedCap  = 30,      -- horizontal st/s ceiling while the shield is on (0 = off)
 	autoPump    = true,    -- pocket coverage fires the pump fake first
 	meatShield  = false,   -- block path: cover both lanes, not one threat
 	ghostRoute  = true,    -- neon line: where the pick will actually be
@@ -335,6 +337,10 @@ local CFG = {
 local CFG_STOCK = {}
 for k, v in pairs(CFG) do CFG_STOCK[k] = v end
 
+-- anti-cheat module, built after the speed patch. declared here so panic and
+-- the speed law can reach it before the block runs.
+local AC
+
 -- settings survive a reload: _G.SlimCfg holds the last saved build and the
 -- shutdown hook writes it back out before the sweep tears everything down
 do
@@ -380,6 +386,7 @@ local function panicRestore()
 			if ctl and ctl.Set then pcall(function() ctl:Set(true, false) end) end
 		end
 	end
+	if AC and CFG.acShield then AC.setShield(true) end
 	mode = "panic restored"
 	pcall(saveCfg)
 	return true
@@ -402,6 +409,7 @@ local function panic()
 			end
 		end
 	end
+	if AC then AC.setShield(false) end
 	mode = string.format("PANIC %d toggles off", n)
 	print(string.format("[Slim] panic: %d toggles killed (press again to restore)", n))
 	return true
@@ -1731,11 +1739,25 @@ local function installSpeedPatch()
 
 	speedTypes = types
 	speedPenaltyFn = function(rig)
+		local penalty = orig(rig)
+		if type(penalty) ~= "number" then penalty = 0 end
 		local bias = speedBias()
-		if bias <= 0.001 then
-			return orig(rig)
+		if bias > 0.001 then penalty = penalty - bias end
+		-- trust ceiling: the sim keeps asking for the raised cruise, so cap the
+		-- actual flat velocity here instead of writing forces the next tick will
+		-- stomp. AC is nil until the shield block below has built.
+		if AC and CFG.acShield then
+			local root = rig and rig.PrimaryPart
+			if root then
+				local v = root.AssemblyLinearVelocity
+				local flat = Vector3.new(v.X, 0, v.Z).Magnitude
+				local cap = tonumber(CFG.acSpeedCap) or 0
+				if cap > 0 and flat > cap then
+					penalty = penalty + (flat - cap) * 1.2
+				end
+			end
 		end
-		return orig(rig) - bias
+		return penalty
 	end
 	types.speedPenalty = speedPenaltyFn
 	speedPatched = true
@@ -1767,6 +1789,230 @@ task.spawn(function()
 end)
 
 pcall(installSpeedPatch)
+
+--// anti-cheat shield -----------------------------------------------------------
+-- Ragdoll Football's only client -> server integrity channel is BallDiagClient:
+-- when GameState.BallDiagId changes, the game reads workspace.Rugball and fires
+-- BallDiagReport(id, "ok" | "hidden" | "missing", detail). "hidden" is exactly
+-- what a ball hider reports, so that is the channel to answer cleanly. The other
+-- two remotes carry values the server can sanity-check (throw charge, PAT
+-- aim/power); clamp them here so a stale or third-party panel cannot send an
+-- impossible value.
+--
+-- the wrapper only touches those three remotes, chains to whatever namecall was
+-- there before, skips executor threads and is removed by panic/shutdown. the
+-- speed ceiling lives in speedPenaltyFn above.
+do
+	local ballDiag = ReplicatedStorage:FindFirstChild("BallDiagReport")
+	local throwRemote = ReplicatedStorage:FindFirstChild("RugballThrow")
+	local patRemote = ReplicatedStorage:FindFirstChild("PATKick")
+	if not ballDiag then
+		pcall(function() ballDiag = ReplicatedStorage:WaitForChild("BallDiagReport", 10) end)
+	end
+	if not throwRemote then
+		pcall(function() throwRemote = ReplicatedStorage:WaitForChild("RugballThrow", 10) end)
+	end
+	if not patRemote then
+		pcall(function() patRemote = ReplicatedStorage:WaitForChild("PATKick", 10) end)
+	end
+
+	local MAX_CHARGE = (226.875 - 4) / 280
+	local stats = {
+		seen = 0, reports = 0, rewritten = 0, hides = 0,
+		throws = 0, throwsClamped = 0, kicks = 0, kicksClamped = 0,
+		lastStatus = "", lastDetail = "", lastAt = 0,
+		uiAt = 0,
+	}
+	local plausible = {
+		position = Vector3.new(0, 0, 0),
+		serial = 0,
+		at = 0,
+		valid = false,
+	}
+	local installed = false
+	local hook, oldNamecall, mt
+
+	local function ballPart()
+		local b = Workspace:FindFirstChild("Rugball")
+		if b and b:IsA("BasePart") then return b end
+		return nil
+	end
+
+	-- keep the last position a real ball could have reached. a teleport is tens
+	-- of studs between two frames; a thrown ball at 60 fps is a few.
+	local function sampleBall()
+		local b = ballPart()
+		if not b then return end
+		local serial = tonumber(b:GetAttribute("DiagSerial")) or 0
+		local pos = b.Position
+		if plausible.valid and serial == plausible.serial
+			and (pos - plausible.position).Magnitude > 30 then
+			return
+		end
+		plausible.position = pos
+		plausible.serial = serial
+		plausible.at = os.clock()
+		plausible.valid = true
+	end
+
+	local function cleanDetail()
+		local b = ballPart()
+		if b then
+			local serial = tonumber(b:GetAttribute("DiagSerial")) or plausible.serial
+			local pos = b.Position
+			if plausible.valid and serial == plausible.serial
+				and (pos - plausible.position).Magnitude > 30 then
+				pos = plausible.position
+				serial = plausible.serial
+			end
+			return string.format("#%s at (%.1f,%.1f,%.1f)", tostring(serial), pos.X, pos.Y, pos.Z)
+		end
+		if plausible.valid then
+			return string.format("#%s at (%.1f,%.1f,%.1f)", tostring(plausible.serial),
+				plausible.position.X, plausible.position.Y, plausible.position.Z)
+		end
+		return "#0 at (0.0,0.0,0.0)"
+	end
+
+	local function markReport(status, detail)
+		stats.reports = stats.reports + 1
+		stats.lastStatus = tostring(status)
+		stats.lastDetail = tostring(detail)
+		stats.lastAt = os.clock()
+		if status ~= "ok" then stats.hides = stats.hides + 1 end
+	end
+
+	local function sanitizeThrow(...)
+		local args = { ... }
+		local target = args[1]
+		if target == "Cancel" then
+			stats.throws = stats.throws + 1
+			return ...
+		end
+		if typeof(target) ~= "Vector3" then return ... end
+		stats.throws = stats.throws + 1
+		local charge = tonumber(args[2])
+		if charge then
+			local clamped = math.clamp(charge, 0, MAX_CHARGE)
+			if clamped ~= charge then
+				stats.throwsClamped = stats.throwsClamped + 1
+				args[2] = clamped
+			end
+		end
+		local pass = args[3]
+		if pass ~= "Lob" and pass ~= "Bullet" then args[3] = "Lob" end
+		return table.unpack(args, 1, 3)
+	end
+
+	local function sanitizeKick(...)
+		local args = { ... }
+		stats.kicks = stats.kicks + 1
+		local aim = tonumber(args[1])
+		local power = tonumber(args[2])
+		if aim then
+			local clamped = math.clamp(aim, -1, 1)
+			if clamped ~= aim then
+				stats.kicksClamped = stats.kicksClamped + 1
+				args[1] = clamped
+			end
+		end
+		if power then
+			local clamped = math.clamp(power, 0.05, 1)
+			if clamped ~= power then
+				stats.kicksClamped = stats.kicksClamped + 1
+				args[2] = clamped
+			end
+		end
+		return table.unpack(args, 1, 2)
+	end
+
+	local function uninstall()
+		if not installed then return end
+		if mt and mt.__namecall == hook then
+			pcall(setreadonly, mt, false)
+			mt.__namecall = oldNamecall
+			pcall(setreadonly, mt, true)
+		end
+		installed = false
+		if AC then AC.on = false end
+	end
+
+	local function install()
+		if installed then return true end
+		if not ballDiag then return false end
+		local ok, raw = pcall(getrawmetatable, game)
+		if not ok or type(raw) ~= "table" then return false end
+		local old = rawget(raw, "__namecall")
+		if type(old) ~= "function" then return false end
+		local caller = checkcaller or function() return false end
+		local wrap = newcclosure or function(f) return f end
+		mt = raw
+		oldNamecall = old
+		local wrapped = wrap(function(self, ...)
+			if caller() then return old(self, ...) end
+			if type(getnamecallmethod) ~= "function" then return old(self, ...) end
+			local mok, method = pcall(getnamecallmethod)
+			if not mok then return old(self, ...) end
+			if method == "FireServer" then
+				stats.seen = stats.seen + 1
+				if self == ballDiag then
+					local args = { ... }
+					markReport(args[2], args[3])
+					stats.rewritten = stats.rewritten + 1
+					return old(self, args[1], "ok", cleanDetail())
+				end
+				if self == throwRemote then
+					return old(self, sanitizeThrow(...))
+				end
+				if self == patRemote then
+					return old(self, sanitizeKick(...))
+				end
+			end
+			return old(self, ...)
+		end)
+		pcall(setreadonly, raw, false)
+		raw.__namecall = wrapped
+		pcall(setreadonly, raw, true)
+		hook = wrapped
+		installed = true
+		if AC then AC.on = true end
+		return true
+	end
+
+	local sampleConn = RunService.Heartbeat:Connect(sampleBall)
+	sampleBall()
+
+	AC = {
+		stats = stats,
+		on = false,
+		install = install,
+		uninstall = uninstall,
+		setShield = function(v)
+			if v then
+				uninstall()
+				return install()
+			end
+			uninstall()
+			return false
+		end,
+		sampleBall = sampleBall,
+		cleanDetail = cleanDetail,
+		statusText = function()
+			return string.format(
+				"reports %d | rewritten %d | hidden %d | throws %d/%d | kicks %d/%d",
+				stats.reports, stats.rewritten, stats.hides,
+				stats.throwsClamped, stats.throws, stats.kicksClamped, stats.kicks)
+		end,
+		stop = function()
+			if sampleConn then
+				sampleConn:Disconnect()
+				sampleConn = nil
+			end
+			uninstall()
+		end,
+	}
+	if CFG.acShield then install() end
+end
 
 --// physique ------------------------------------------------------------------
 -- the card in the settings panel is the game's own. weight and height are
@@ -1904,6 +2150,7 @@ shutdown = function()
 	pcall(saveCfg)
 	unpatchSpeed()
 	unpatchPhysique()
+	if AC then AC.stop() end
 	pcall(function() RunService:UnbindFromRenderStep("SlimPanel") end)
 	if WIDGET.leadConn then pcall(function() WIDGET.leadConn:Disconnect() end) end
 	if WIDGET.antiFallConn then pcall(function() WIDGET.antiFallConn:Disconnect() end) end
@@ -2636,6 +2883,37 @@ local function buildUI()
 		value = CFG.maxPhysique,
 		callback = function(v) CFG.maxPhysique = v end,
 	})
+
+	section(tackleTab, "ANTI-CHEAT")
+
+	local acRow = groupOf(tackleTab)
+	WIDGET.acToggle = acRow:CreateToggle({
+		name = "anti-cheat shield",
+		description = "answers the ball diagnostic clean and clamps throw / PAT values before they leave",
+		flag = "acShield",
+		value = CFG.acShield,
+		callback = function(v)
+			CFG.acShield = v
+			if AC then AC.setShield(v) end
+		end,
+	})
+	WIDGET.acCapSlider = acRow:CreateSlider({
+		name = "trust speed cap",
+		description = "flat st/s ceiling while the shield is on. 30 lets the 1.15x cruise through; 0 = off",
+		range = { 0, 45 },
+		increment = 1,
+		value = CFG.acSpeedCap,
+		suffix = " st/s",
+		flag = "acSpeedCap",
+		callback = function(v) CFG.acSpeedCap = v end,
+	})
+	pcall(function()
+		WIDGET.acCard = tackleTab:CreateText({
+			name = "anti-cheat | scanning",
+			text = "waiting for the first ball diagnostic",
+			icon = 91452555903853,
+		})
+	end)
 
 	section(tackleTab, "DEFENSE ASSIST")
 
@@ -4357,6 +4635,14 @@ local function renderFrame()
 		if WIDGET.statusBox then WIDGET.statusBox:Set(statusText(entry, carrierRig, blockState)) end
 	end
 
+	if AC and WIDGET.acCard and now - (AC.stats.uiAt or 0) > 0.5 then
+		AC.stats.uiAt = now
+		pcall(function()
+			WIDGET.acCard:SetTitle("anti-cheat | " .. (AC.on and "shielded" or "off"))
+			WIDGET.acCard:Set(AC.statusText())
+		end)
+	end
+
 	-- dashboard: rolling numbers plus the live tags in the title bar
 	if now - lastStats > 0.2 then
 		lastStats = now
@@ -4594,6 +4880,7 @@ _G.QBAim = {
 	share = { out = buildShareString, short = buildShortShare, send = sendBuildChat, load = applyShareString },
 	cfg = CFG,
 	stats = stats,
+	ac = AC,
 	panel = window,
 	lib = Rayfield,
 	box = WIDGET.statusBox,
