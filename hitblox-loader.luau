@@ -11,9 +11,9 @@
     nothing.
 ]]
 
--- upload-hitblox.py replaces https://raw.githubusercontent.com/yougyougo017-png/rugball/main/ with the token account's raw
--- base URL before upload, so the published loader always points at the repo
--- that actually received the files. Do not paste this local template directly.
+-- upload-hitblox.py replaces the placeholder below with the token account's
+-- raw base URL before upload, so the published loader always points at the
+-- repo that actually received the files. Do not paste this template directly.
 local BASE = "https://raw.githubusercontent.com/yougyougo017-png/rugball/main/"
 local HUB = BASE .. "hitblox-hub.luau"
 
