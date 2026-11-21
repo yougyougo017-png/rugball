@@ -29632,10 +29632,28 @@ pcall(function()
 	})
 end)
 
+-- one picker button per game, not per place id. Criminal Simulator has a root
+-- place and a live sub-place with the same label and suite chain, which used
+-- to render two identical CRIMINAL SIMULATOR buttons. group them and show
+-- every wired place id on the single button.
+local pickerGames = {}
+local pickerSeen = {}
 for _, g in ipairs(Hub.ORDER) do
+	local key = g.label .. "|" .. table.concat(g.suites, ",")
+	local row = pickerSeen[key]
+	if row then
+		row.places = row.places .. " / " .. tostring(g.place)
+	else
+		row = { label = g.label, suites = g.suites, places = tostring(g.place) }
+		pickerSeen[key] = row
+		table.insert(pickerGames, row)
+	end
+end
+
+for _, g in ipairs(pickerGames) do
 	pcall(function()
 		tab:CreateButton({
-			name = string.format("%s   [%d]", g.label, g.place),
+			name = string.format("%s   [%s]", g.label, g.places),
 			description = "runs: " .. table.concat(g.suites, " -> "),
 			callback = function()
 				Hub.runAll(g.suites)
