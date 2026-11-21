@@ -29588,6 +29588,7 @@ Hub.SUITE.hitblox = function()
         Agent.wantedSpeed                    -> movement speed
         Agent:dumpBody                      -> body hiding (same result, no walk)
         Mission:complete / Mission:finish   -> objectives
+        Boot.quick / Config.Acts            -> campaign and side-quest helper
         SaveResult                          -> contract payout (client-trusted fields)
 
     Re-running tears the previous copy down through STATE.onCleanup, so hooks
@@ -29718,6 +29719,20 @@ local state = {
     autoLoopCycles = 0,
     autoLoopNote = "off",
     autoLoopNextAt = 0,
+    autoLoopBusy = false,
+
+    -- campaign / quest helper
+    campaignGuide = false,
+    campaignPlay = false,
+    campaignMission = "Maple",
+    campaignSkipDone = true,
+    campaignIncludeSide = true,
+    campaignDelay = 3,
+    campaignNote = "off",
+    campaignGuideNote = "off",
+    campaignIndex = 0,
+    campaignTotal = 0,
+    campaignCurrent = nil,
 
     dead = false,
 }
@@ -31095,6 +31110,7 @@ end
 -- rules still apply. No invented remotes.
 
 local autoLoopToken = 0
+local stopCampaignFromLoop = nil
 
 local function autoLoopChoices()
     local choices = {}
@@ -31148,6 +31164,10 @@ local function autoLoopSyncPayout()
 end
 
 local function autoLoopOnce(manual)
+    if manual and state.campaignPlay then
+        return false, "campaign auto-play is running"
+    end
+
     local boot = Game.boot
     if not boot or type(boot.quick) ~= "function" then
         return false, "HITBLOX boot not ready"
@@ -31226,6 +31246,10 @@ local function startAutoLoop()
         return
     end
 
+    if stopCampaignFromLoop then
+        stopCampaignFromLoop()
+    end
+
     if not (Game.boot and type(Game.boot.quick) == "function") then
         Window:Notify({ title = "Auto loop", content = "HITBLOX boot is not ready yet." })
         return
@@ -31239,7 +31263,9 @@ local function startAutoLoop()
 
     task.spawn(function()
         while state.autoLoop and not state.dead and token == autoLoopToken do
+            state.autoLoopBusy = true
             local ok, result, err = pcall(autoLoopOnce)
+            state.autoLoopBusy = false
             if not state.autoLoop or state.dead or token ~= autoLoopToken then
                 break
             end
@@ -31412,6 +31438,822 @@ missionTab:CreateButton({
     end,
 })
 
+-- Campaign / quest helper -----------------------------------------------------
+--
+-- The campaign order comes from Config.Acts: prequel quests, the act's
+-- contracts, its finale and then the sequel quests. Missions start through
+-- Boot.quick and finish through Mission:finish, exactly like the menus, so the
+-- game records progress and SaveResult on its own terms.
+
+local campaignToken = 0
+local campaignPlayToggle = nil
+local campaignHintFailures = {}
+local campaignAtFailures = {}
+local campaignGuidePart = nil
+local campaignGuideBillboard = nil
+local campaignGuideLabel = nil
+local campaignGuideHint = nil
+
+local function campaignEntryDef(id)
+    return autoLoopFind(id)
+end
+
+local function campaignEntries(includeSide)
+    local list = {}
+    local seen = {}
+    local acts = (Config and Config.Acts) or {}
+
+    local function add(id, role, act, actTitle, numeral)
+        if not id or seen[id] then
+            return
+        end
+
+        seen[id] = true
+        local def = campaignEntryDef(id)
+        if not def then
+            return
+        end
+
+        local side = def.kind == "Prequel" or def.kind == "Sequel" or def.kind == "Side"
+        if includeSide == false and side then
+            return
+        end
+
+        table.insert(list, {
+            id = id,
+            role = role or def.kind or "Contract",
+            act = act or def.act or 0,
+            actTitle = actTitle,
+            numeral = numeral,
+            def = def,
+        })
+    end
+
+    for index, act in ipairs(acts) do
+        local quests = act.quests or {}
+
+        for _, id in ipairs(quests) do
+            local def = campaignEntryDef(id)
+            if def and def.kind == "Prequel" then
+                add(id, "Prequel", index, act.title, act.numeral)
+            end
+        end
+
+        for _, id in ipairs(act.contracts or {}) do
+            add(id, "Contract", index, act.title, act.numeral)
+        end
+
+        add(act.finale, "Finale", index, act.title, act.numeral)
+
+        for _, id in ipairs(quests) do
+            local def = campaignEntryDef(id)
+            if def and def.kind ~= "Prequel" then
+                add(id, def.kind or "Sequel", index, act.title, act.numeral)
+            end
+        end
+    end
+
+    local boot = Game.boot
+    for _, def in ipairs(boot and boot.quests or {}) do
+        add(def.id, def.kind or "Side quest", def.act, "SIDE QUESTS", nil)
+    end
+
+    for _, def in ipairs(boot and boot.missions or {}) do
+        if not seen[def.id] then
+            add(def.id, def.kind or "Contract", def.act, "EXTRA CONTRACTS", nil)
+        end
+    end
+
+    return list
+end
+
+local function campaignRecord(id)
+    local boot = Game.boot
+    local profile = boot and boot.profile or Game.profile
+    local missions = profile and profile.missions
+    return missions and missions[id]
+end
+
+local function campaignDone(id)
+    local record = campaignRecord(id)
+    return record ~= nil and record.done == true
+end
+
+local function campaignStatus(id)
+    local record = campaignRecord(id)
+    if not record then
+        return "NEW"
+    end
+    if record.done then
+        return ("DONE %d stars"):format(record.stars or 0)
+    end
+    return "STARTED"
+end
+
+local function campaignEntryById(id)
+    for _, entry in ipairs(campaignEntries(true)) do
+        if entry.id == id then
+            return entry
+        end
+    end
+    return nil
+end
+
+local function campaignRoadmap()
+    local entries = campaignEntries(true)
+    local done = 0
+    for _, entry in ipairs(entries) do
+        if campaignDone(entry.id) then
+            done = done + 1
+        end
+    end
+
+    local lines = { ("Campaign progress: %d/%d"):format(done, #entries) }
+    local lastAct = nil
+
+    for index, entry in ipairs(entries) do
+        if entry.act ~= lastAct then
+            lastAct = entry.act
+            local numeral = entry.numeral or tostring(entry.act)
+            local title = entry.actTitle or "SIDE QUESTS"
+            lines[#lines + 1] = ""
+            lines[#lines + 1] = ("ACT %s - %s"):format(numeral, title)
+        end
+
+        lines[#lines + 1] = ("%02d %-10s %-9s %s"):format(
+            index,
+            entry.id,
+            entry.role,
+            campaignStatus(entry.id)
+        )
+    end
+
+    return table.concat(lines, "\n"), done, #entries
+end
+
+local function clearCampaignGuide()
+    if campaignGuidePart then
+        campaignGuidePart.Parent = nil
+    end
+    campaignGuidePart = nil
+    campaignGuideBillboard = nil
+    campaignGuideLabel = nil
+    campaignGuideHint = nil
+end
+
+local function ensureCampaignGuide()
+    if campaignGuidePart and campaignGuidePart.Parent then
+        return
+    end
+
+    local part = Instance.new("Part")
+    part.Name = "HitBloxQuestBeacon"
+    part.Anchored = true
+    part.CanCollide = false
+    part.CanQuery = false
+    part.CanTouch = false
+    part.CastShadow = false
+    part.Size = Vector3.new(0.2, 0.2, 0.2)
+    part.Transparency = 1
+    part.Parent = workspace
+
+    local billboard = Instance.new("BillboardGui")
+    billboard.Name = "HitBloxQuestBeaconGui"
+    billboard.AlwaysOnTop = true
+    billboard.LightInfluence = 0
+    billboard.MaxDistance = 5000
+    billboard.Size = UDim2.fromOffset(380, 86)
+    billboard.StudsOffsetWorldSpace = Vector3.new(0, 3, 0)
+    billboard.Parent = part
+
+    local label = Instance.new("TextLabel")
+    label.Name = "Objective"
+    label.BackgroundTransparency = 1
+    label.Position = UDim2.fromOffset(0, 0)
+    label.Size = UDim2.fromOffset(380, 46)
+    label.Font = Enum.Font.GothamBold
+    label.TextSize = 18
+    label.TextColor3 = Color3.fromRGB(255, 196, 96)
+    label.TextStrokeTransparency = 0.25
+    label.Text = ""
+    label.Parent = billboard
+
+    local hint = Instance.new("TextLabel")
+    hint.Name = "Hint"
+    hint.BackgroundTransparency = 1
+    hint.Position = UDim2.fromOffset(0, 46)
+    hint.Size = UDim2.fromOffset(380, 38)
+    hint.Font = Enum.Font.Gotham
+    hint.TextSize = 14
+    hint.TextColor3 = Color3.fromRGB(235, 235, 235)
+    hint.TextStrokeTransparency = 0.35
+    hint.TextWrapped = true
+    hint.Text = ""
+    hint.Parent = billboard
+
+    campaignGuidePart = part
+    campaignGuideBillboard = billboard
+    campaignGuideLabel = label
+    campaignGuideHint = hint
+end
+
+local function campaignHintFor(label)
+    if not label then
+        return nil
+    end
+
+    local mission = currentMission()
+    for _, objective in ipairs(mission and mission.objectives or {}) do
+        if objective.text == label then
+            local key = objective.id or objective.text
+            local left = objective.left
+
+            if type(left) == "function" and not campaignHintFailures[key] then
+                local ok, result = pcall(left, mission)
+                if ok then
+                    left = result
+                else
+                    campaignHintFailures[key] = true
+                    left = nil
+                end
+            elseif type(left) == "function" then
+                left = nil
+            end
+
+            if type(left) == "string" then
+                return left
+            end
+        end
+    end
+
+    return nil
+end
+
+local function campaignMarker()
+    local mission = currentMission()
+    if not (mission and mission.running) then
+        return nil
+    end
+
+    local ok, position, label, kind = pcall(function()
+        return mission:guideMarker()
+    end)
+
+    if ok and typeof(position) == "Vector3" then
+        return position, label, kind or "story", campaignHintFor(label)
+    end
+
+    for _, objective in ipairs(mission.objectives or {}) do
+        if not objective.done
+            and not objective.optional
+            and not objective.hidden
+            and not objective.failed then
+            local at = objective.at
+
+            if type(at) == "function" then
+                local key = objective.id or objective.text
+                if not campaignAtFailures[key] then
+                    local atOk, result = pcall(at, mission)
+                    if atOk then
+                        at = result
+                    else
+                        campaignAtFailures[key] = true
+                        at = nil
+                    end
+                else
+                    at = nil
+                end
+            end
+
+            if typeof(at) == "Vector3" then
+                return at, objective.text, "objective", campaignHintFor(objective.text)
+            end
+
+            if type(at) == "string" and World and World.spots then
+                local spot = World.spots[at]
+                if spot and spot.cf then
+                    return spot.cf.Position, objective.text, "objective",
+                        campaignHintFor(objective.text)
+                end
+            end
+        end
+    end
+
+    local agent = currentAgent()
+    local origin = agent and agent.actor and agent.actor.root
+        and agent.actor.root.Position or nil
+    local best = nil
+    local bestDistance = nil
+
+    for _, npc in ipairs(NPC.all or {}) do
+        if npc.isTarget and npc.alive and npc.actor and npc.actor.root then
+            local position = npc.actor.root.Position
+            local distance = origin and (position - origin).Magnitude or 0
+            if not bestDistance or distance < bestDistance then
+                best = npc
+                bestDistance = distance
+            end
+        end
+    end
+
+    if best then
+        local name = best.name or best.role or "target"
+        return best.actor.root.Position, ("Eliminate %s"):format(name), "target",
+            "Eliminate all targets, then follow the exit marker."
+    end
+
+    return nil
+end
+
+local function campaignGuideStep()
+    if not state.campaignGuide or state.dead then
+        return
+    end
+
+    ensureCampaignGuide()
+
+    local position, label, kind, hint = campaignMarker()
+    if not position then
+        campaignGuideBillboard.Enabled = false
+        state.campaignGuideNote = "no active objective"
+        return
+    end
+
+    campaignGuideBillboard.Enabled = true
+    campaignGuidePart.CFrame = CFrame.new(position + Vector3.new(0, 0.2, 0))
+
+    local agent = currentAgent()
+    local origin = agent and agent.actor and agent.actor.root
+        and agent.actor.root.Position or nil
+    local distance = origin and math.floor((position - origin).Magnitude + 0.5) or 0
+    local title = label or "Objective"
+
+    campaignGuideLabel.Text = ("◆ %s   [%dm]"):format(title, distance)
+    if kind == "target" then
+        campaignGuideLabel.TextColor3 = Color3.fromRGB(255, 96, 96)
+    elseif kind == "story" then
+        campaignGuideLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+    else
+        campaignGuideLabel.TextColor3 = Color3.fromRGB(255, 196, 96)
+    end
+    campaignGuideHint.Text = hint or ""
+
+    state.campaignGuideNote = ("guiding to %s (%dm)"):format(title, distance)
+end
+
+local function campaignObjectiveSummary()
+    local mission = currentMission()
+    if not (mission and mission.running) then
+        return "no mission running"
+    end
+
+    local total = 0
+    local done = 0
+    local nextText = nil
+
+    for _, objective in ipairs(mission.objectives or {}) do
+        if not objective.optional and not objective.hidden then
+            total = total + 1
+            if objective.done then
+                done = done + 1
+            elseif not nextText then
+                nextText = objective.text
+            end
+        end
+    end
+
+    if nextText and #nextText > 54 then
+        nextText = nextText:sub(1, 51) .. "..."
+    end
+
+    local id = mission.def and mission.def.id or "mission"
+    return ("%s   |   %d/%d objectives%s"):format(
+        id,
+        done,
+        total,
+        nextText and ("   |   next: " .. nextText) or "   |   exit ready"
+    )
+end
+
+local function campaignStartOnly(entry)
+    if not entry then
+        return false, "no mission selected"
+    end
+
+    if state.autoLoop then
+        return false, "stop the contract loop first"
+    end
+
+    local boot = Game.boot
+    if not (boot and type(boot.quick) == "function") then
+        return false, "HITBLOX boot is not ready"
+    end
+
+    local mission = currentMission()
+    if mission and mission.running then
+        if mission.def and mission.def.id == entry.id then
+            return true
+        end
+
+        state.campaignNote = ("ending %s before %s"):format(
+            tostring(mission.def and mission.def.id or "current mission"),
+            entry.id
+        )
+        completeObjectives()
+        pcall(function()
+            mission:finish(true)
+        end)
+        task.wait(0.8)
+    end
+
+    local ok, err = pcall(boot.quick, entry.id)
+    if not ok then
+        return false, ("start failed: %s"):format(tostring(err))
+    end
+
+    local deadline = os.clock() + 10
+    while not state.dead and not Game.running and os.clock() < deadline do
+        task.wait(0.1)
+    end
+
+    mission = currentMission()
+    if not (mission and mission.running) then
+        return false, "mission did not start"
+    end
+
+    state.campaignNote = ("started %s"):format(entry.id)
+    return true
+end
+
+local function campaignRunEntry(entry)
+    local started, err = campaignStartOnly(entry)
+    if not started then
+        return false, err
+    end
+
+    state.campaignNote = ("completing %s"):format(entry.id)
+    completeObjectives()
+    task.wait(0.4)
+
+    local mission = currentMission()
+    if not (mission and mission.running) then
+        return false, "mission ended before finish"
+    end
+
+    state.campaignNote = ("finishing %s"):format(entry.id)
+    local ok, finishErr = pcall(function()
+        mission:finish(true)
+    end)
+    if not ok then
+        return false, ("finish failed: %s"):format(tostring(finishErr))
+    end
+
+    autoLoopSyncPayout()
+    state.campaignNote = ("%s finished"):format(entry.id)
+    return true
+end
+
+local function stopCampaignPlay(note)
+    state.campaignPlay = false
+    campaignToken = campaignToken + 1
+    if note then
+        state.campaignNote = note
+    end
+end
+
+stopCampaignFromLoop = function()
+    if not state.campaignPlay then
+        return
+    end
+
+    stopCampaignPlay("stopped for contract loop")
+    if campaignPlayToggle then
+        pcall(function()
+            campaignPlayToggle:Set(false, true)
+        end)
+    end
+end
+
+local function startCampaignPlay()
+    if state.campaignPlay or state.dead then
+        return
+    end
+
+    if state.autoLoop then
+        stopAutoLoop("stopped for campaign")
+        pcall(function()
+            ui.autoLoop:Set(false, true)
+        end)
+    end
+
+    local boot = Game.boot
+    if not (boot and type(boot.quick) == "function") then
+        Window:Notify({ title = "Campaign", content = "HITBLOX boot is not ready yet." })
+        return
+    end
+
+    state.campaignPlay = true
+    campaignToken = campaignToken + 1
+    local token = campaignToken
+
+    task.spawn(function()
+        local handoffDeadline = os.clock() + 12
+        while state.autoLoopBusy and not state.dead and os.clock() < handoffDeadline do
+            task.wait(0.1)
+        end
+
+        local entries = campaignEntries(state.campaignIncludeSide ~= false)
+        state.campaignTotal = #entries
+        local index = 1
+
+        while state.campaignPlay and not state.dead and token == campaignToken do
+            local entry = nil
+
+            while index <= #entries do
+                local candidate = entries[index]
+                if not (state.campaignSkipDone and campaignDone(candidate.id)) then
+                    entry = candidate
+                    break
+                end
+                index = index + 1
+            end
+
+            if not entry then
+                state.campaignNote = "campaign complete"
+                break
+            end
+
+            state.campaignIndex = index
+            state.campaignCurrent = entry.id
+            state.campaignMission = entry.id
+            state.campaignNote = ("running %d/%d %s"):format(index, #entries, entry.id)
+
+            local ok, result, err = pcall(campaignRunEntry, entry)
+            local succeeded = ok and result ~= false
+
+            if not state.campaignPlay or state.dead or token ~= campaignToken then
+                break
+            end
+
+            if succeeded then
+                index = index + 1
+                local delay = math.max(1, tonumber(state.campaignDelay) or 3)
+                task.wait(delay)
+            else
+                state.campaignNote = ("skipped %s: %s"):format(
+                    entry.id,
+                    tostring(ok and err or result)
+                )
+                index = index + 1
+                task.wait(2)
+            end
+        end
+
+        if token == campaignToken then
+            state.campaignPlay = false
+            if state.campaignNote ~= "campaign complete" then
+                state.campaignNote = state.campaignNote .. " (stopped)"
+            end
+            if campaignPlayToggle then
+                pcall(function()
+                    campaignPlayToggle:Set(false, true)
+                end)
+            end
+        end
+    end)
+end
+
+local campaignRoadmapText = nil
+local campaignSelectedText = nil
+local campaignActiveText = nil
+local campaignPlayText = nil
+local campaignGuideClock = 0
+local campaignRoadmapAt = 0
+
+local function campaignRefreshRoadmap()
+    if not campaignRoadmapText then
+        return
+    end
+
+    local text = campaignRoadmap()
+    campaignRoadmapAt = os.clock()
+    pcall(function()
+        campaignRoadmapText:Set(text)
+    end)
+end
+
+local campaignTab = Window:CreateTab({ name = "Campaign" })
+
+campaignTab:CreateSection({ name = "Roadmap" })
+
+campaignRoadmapText = campaignTab:CreateText({
+    name = "Main contracts and side quests",
+    text = "Loading campaign...",
+})
+
+campaignTab:CreateButton({
+    name = "Refresh progress",
+    callback = function()
+        campaignRefreshRoadmap()
+    end,
+})
+
+campaignTab:CreateSection({ name = "Run mission" })
+
+local campaignAll = campaignEntries(true)
+local campaignOptions = {}
+local campaignOptionIds = {}
+
+for index, entry in ipairs(campaignAll) do
+    local label = ("%02d %s [%s]"):format(index, entry.id, entry.role)
+    campaignOptions[index] = label
+    campaignOptionIds[label] = entry.id
+end
+
+if not campaignEntryById(state.campaignMission) and campaignAll[1] then
+    state.campaignMission = campaignAll[1].id
+end
+
+local campaignSelectedLabel = campaignOptions[1]
+for index, entry in ipairs(campaignAll) do
+    if entry.id == state.campaignMission then
+        campaignSelectedLabel = campaignOptions[index]
+    end
+end
+
+if #campaignOptions > 0 then
+    campaignTab:CreateDropdown({
+        name = "Campaign mission",
+        description = "Campaign order: prequel quests, contracts, finale, sequel quests.",
+        options = campaignOptions,
+        value = campaignSelectedLabel,
+        flag = "hbCampaignMission",
+        callback = function(selected)
+            state.campaignMission = campaignOptionIds[selected] or selected
+        end,
+    })
+end
+
+campaignSelectedText = campaignTab:CreateText({
+    name = "Selected",
+    text = "Select a mission.",
+})
+
+campaignTab:CreateButton({
+    name = "Start selected",
+    description = "Starts the selected contract or side quest from its first entry point.",
+    callback = function()
+        task.spawn(function()
+            local entry = campaignEntryById(state.campaignMission)
+            local ok, result, err = pcall(campaignStartOnly, entry)
+            if ok and result then
+                Window:Notify({
+                    title = "Campaign",
+                    content = ("Started %s."):format(entry.id),
+                })
+            else
+                Window:Notify({
+                    title = "Campaign",
+                    content = tostring(ok and err or result),
+                })
+            end
+        end)
+    end,
+})
+
+campaignTab:CreateButton({
+    name = "Run selected now",
+    description = "Starts the mission, marks its objectives and finishes it in one go.",
+    callback = function()
+        task.spawn(function()
+            local entry = campaignEntryById(state.campaignMission)
+            local ok, result, err = pcall(campaignRunEntry, entry)
+            if ok and result then
+                Window:Notify({
+                    title = "Campaign",
+                    content = ("%s completed."):format(entry.id),
+                })
+            else
+                Window:Notify({
+                    title = "Campaign",
+                    content = tostring(ok and err or result),
+                })
+            end
+            campaignRefreshRoadmap()
+        end)
+    end,
+})
+
+campaignTab:CreateButton({
+    name = "Complete all objectives",
+    callback = function()
+        if completeObjectives() then
+            Window:Notify({ title = "Objectives", content = "All objectives marked done." })
+        end
+    end,
+})
+
+campaignTab:CreateButton({
+    name = "Finish current mission",
+    callback = function()
+        if finishContract() then
+            Window:Notify({ title = "Campaign", content = "Mission finished." })
+        end
+    end,
+})
+
+campaignTab:CreateSection({ name = "Guide" })
+
+ui.campaignGuide = campaignTab:CreateToggle({
+    name = "Objective waypoint",
+    description = "Shows an in-world beacon on the next objective or living target.",
+    value = false,
+    flag = "hbCampaignGuide",
+    callback = function(value)
+        state.campaignGuide = value
+        if value then
+            state.campaignGuideNote = "waiting for a mission"
+        else
+            state.campaignGuideNote = "off"
+            clearCampaignGuide()
+        end
+    end,
+})
+
+campaignActiveText = campaignTab:CreateText({
+    name = "Current objective",
+    text = "No mission running.",
+})
+
+campaignTab:CreateSection({ name = "Auto-play" })
+
+campaignTab:CreateToggle({
+    name = "Skip completed missions",
+    description = "Auto-play starts at the first mission that is not marked done.",
+    value = true,
+    flag = "hbCampaignSkipDone",
+    callback = function(value)
+        state.campaignSkipDone = value
+    end,
+})
+
+campaignTab:CreateToggle({
+    name = "Include side quests",
+    description = "Runs the six prequel/sequel quests alongside the main campaign.",
+    value = true,
+    flag = "hbCampaignSide",
+    callback = function(value)
+        state.campaignIncludeSide = value
+    end,
+})
+
+campaignTab:CreateSlider({
+    name = "Mission delay",
+    description = "Pause after a finished mission before auto-play loads the next one.",
+    range = { 1, 30 },
+    increment = 1,
+    value = 3,
+    suffix = " s",
+    flag = "hbCampaignDelay",
+    callback = function(value)
+        state.campaignDelay = value
+    end,
+})
+
+campaignPlayText = campaignTab:CreateText({
+    name = "Auto-play status",
+    text = "off - start from the first unfinished mission",
+})
+
+campaignPlayToggle = campaignTab:CreateToggle({
+    name = "Auto-play whole campaign",
+    description = "Starts every unfinished contract, finale and side quest in campaign order, marks the objectives and finishes each one. Leave Auto collect payout off while this runs.",
+    value = false,
+    flag = "hbCampaignPlay",
+    callback = function(value)
+        if value then
+            startCampaignPlay()
+        else
+            stopCampaignPlay("stopped")
+        end
+    end,
+})
+ui.campaignPlay = campaignPlayToggle
+
+campaignTab:CreateButton({
+    name = "Stop auto-play",
+    callback = function()
+        stopCampaignPlay("stopped")
+        if ui.campaignPlay then
+            pcall(function()
+                ui.campaignPlay:Set(false, true)
+            end)
+        end
+    end,
+})
+
+campaignRefreshRoadmap()
+
 -- Settings --------------------------------------------------------------------
 
 local settingsTab = Window:CreateTab({ name = "Settings" })
@@ -31422,7 +32264,7 @@ local function panic()
     for _, key in ipairs({
         "aimbot", "noSpread", "noRecoil", "infAmmo", "instantReload",
         "esp", "undetectable", "godmode", "autoHideBodies", "autoPayout",
-        "autoLoop", "speedOn", "jumpOn", "noclip",
+        "autoLoop", "campaignGuide", "campaignPlay", "speedOn", "jumpOn", "noclip",
     }) do
         state[key] = false
         local element = ui[key]
@@ -31434,6 +32276,8 @@ local function panic()
     end
 
     stopAutoLoop("panic")
+    stopCampaignPlay("panic")
+    clearCampaignGuide()
     clearEsp()
     setSpreadZero(false)
 
@@ -31468,7 +32312,7 @@ end
 -- poking at the menu.
 if getgenv then
     getgenv().HitBloxHub = {
-        version = "1.2.2",
+        version = "1.3.0",
         state = state,
         panic = panic,
         unload = unload,
@@ -31498,6 +32342,49 @@ if getgenv then
         end,
         runContract = function()
             return autoLoopOnce(true)
+        end,
+        campaign = function()
+            local out = {}
+            for index, entry in ipairs(campaignEntries(true)) do
+                local record = campaignRecord(entry.id)
+                table.insert(out, {
+                    index = index,
+                    id = entry.id,
+                    role = entry.role,
+                    act = entry.act,
+                    done = record ~= nil and record.done == true,
+                    stars = record and record.stars or 0,
+                    plays = record and record.plays or 0,
+                })
+            end
+            return out
+        end,
+        campaignStatus = function()
+            return {
+                playing = state.campaignPlay,
+                index = state.campaignIndex,
+                total = state.campaignTotal,
+                current = state.campaignCurrent,
+                note = state.campaignNote,
+                guide = state.campaignGuide,
+                guideNote = state.campaignGuideNote,
+            }
+        end,
+        startCampaign = function()
+            startCampaignPlay()
+        end,
+        stopCampaign = function()
+            stopCampaignPlay("stopped")
+        end,
+        startMission = function(id)
+            return campaignStartOnly(campaignEntryById(id))
+        end,
+        runMission = function(id)
+            return campaignRunEntry(campaignEntryById(id))
+        end,
+        refreshCampaign = function()
+            campaignRefreshRoadmap()
+            return campaignRoadmap()
         end,
     }
 end
@@ -31530,6 +32417,12 @@ settingsTab:CreateButton({
 RunService.Heartbeat:Connect(function(dt)
     if state.dead then
         return
+    end
+
+    campaignGuideClock = campaignGuideClock + dt
+    if campaignGuideClock >= 0.15 then
+        campaignGuideClock = 0
+        pcall(campaignGuideStep)
     end
 
     statusClock = statusClock + dt
@@ -31619,15 +32512,58 @@ RunService.Heartbeat:Connect(function(dt)
         end)
     end
 
-    if state.autoPayout and not state.autoLoop and not state.payoutBusy
-        and payoutReadyIn() <= 0 and not (mission and mission.running) then
+    if campaignSelectedText then
+        local entry = campaignEntryById(state.campaignMission)
+        if entry then
+            pcall(function()
+                campaignSelectedText:Set(("selected %s   |   %s   |   %s   |   %s"):format(
+                    entry.id,
+                    entry.def.title or "",
+                    entry.role,
+                    campaignStatus(entry.id)
+                ))
+            end)
+        end
+    end
+
+    if campaignActiveText then
+        pcall(function()
+            campaignActiveText:Set(("%s   |   guide %s (%s)"):format(
+                campaignObjectiveSummary(),
+                state.campaignGuide and "ON" or "off",
+                state.campaignGuideNote
+            ))
+        end)
+    end
+
+    if campaignPlayText then
+        local progress = state.campaignTotal > 0
+            and ("%d/%d"):format(state.campaignIndex, state.campaignTotal)
+            or "-/-"
+        pcall(function()
+            campaignPlayText:Set(("auto-play %s   |   %s   |   current %s   |   %s"):format(
+                state.campaignPlay and "ON" or "off",
+                progress,
+                state.campaignCurrent or "-",
+                state.campaignNote
+            ))
+        end)
+    end
+
+    if campaignRoadmapText and os.clock() - campaignRoadmapAt >= 3 then
+        campaignRefreshRoadmap()
+    end
+
+    if state.autoPayout and not state.autoLoop and not state.campaignPlay
+        and not state.payoutBusy and payoutReadyIn() <= 0
+        and not (mission and mission.running) then
         collectPayout(false)
     end
 end)
 
 Window:Notify({
     title = "HitBlox loaded",
-    content = "Combat, visuals, stealth and contract tools are ready.",
+    content = "Combat, visuals, stealth, contract and campaign tools are ready.",
 })
 
 return true
