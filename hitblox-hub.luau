@@ -1583,7 +1583,9 @@ local function autoLoopOnce(manual)
             return false, ("unknown contract: %s"):format(tostring(state.autoLoopMission))
         end
 
-        state.autoLoopNote = ("starting %s"):format(tostring(def.id))
+        if state.autoLoop or manual then
+            state.autoLoopNote = ("starting %s"):format(tostring(def.id))
+        end
         local ok, err = pcall(boot.quick, def.id)
         if not ok then
             return false, ("start failed: %s"):format(tostring(err))
@@ -1604,13 +1606,17 @@ local function autoLoopOnce(manual)
     end
 
     if state.autoLoopComplete then
-        state.autoLoopNote = "completing objectives"
+        if state.autoLoop or manual then
+            state.autoLoopNote = "completing objectives"
+        end
         completeObjectives()
         task.wait(0.4)
     end
 
     if mission.running then
-        state.autoLoopNote = "finishing"
+        if state.autoLoop or manual then
+            state.autoLoopNote = "finishing"
+        end
         local ok, err = pcall(function()
             mission:finish(true)
         end)
