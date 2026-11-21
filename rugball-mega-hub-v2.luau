@@ -17575,6 +17575,14 @@ Hub.SUITE.mma = function()
 -- style id the server gave it, so a local edit cannot change the damage another
 -- player takes. only the server equip does that.
 --
+-- SIGNATURE | place version 116 added the Moves module and the signature key.
+-- the panel reads Moves.selected() and Moves.cooldownLeft(), and presses the
+-- game's own Match:touchSig() key. Moves.install turns that key into the equipped
+-- signature and keeps ownership of every rule: cooldown, stamina cost, grapple
+-- restrictions in 2v2 / network fights, the showtime / ninja fence checks, and
+-- the suplex / flying-armbar branches. the auto switch only decides when to
+-- press it, so it cannot equip, unlock or bypass a move.
+--
 -- nothing here invents remotes, writes career data, or fires fake server events.
 
 local prev = _G.RagdollMmaPanel
@@ -17584,6 +17592,8 @@ for k, v in pairs({
 	retreatStamina = 24,
 	finishPush = true,
 	autoFight = false,
+	autoSig = false,
+	sigStamina = 25,
 	autoAim = true,
 	aimZone = "head",
 	hitReach = 1.30,
@@ -17845,6 +17855,7 @@ _G.RagdollMmaStats = stats
 for k, v in pairs({
 	fights = 0, wins = 0, losses = 0, koWins = 0, koLosses = 0,
 	strikes = 0, landed = 0, damage = 0, takedowns = 0, tdConceded = 0, knockdowns = 0, subs = 0,
+	sigThrown = 0, sigLanded = 0,
 }) do
 	if stats[k] == nil then stats[k] = v end
 end
@@ -19321,7 +19332,7 @@ local function scanForMatch()
 end
 
 local function resetWatch()
-	lastState = { thrown = 0, landed = 0, damage = 0, td = 0, tdP = 0, kdO = 0, kdP = 0, finished = false, round = 0 }
+	lastState = { thrown = 0, landed = 0, damage = 0, td = 0, tdP = 0, kdO = 0, kdP = 0, sigThrown = 0, sigLanded = 0, finished = false, round = 0 }
 end
 
 local function adopt(m)
@@ -20160,6 +20171,17 @@ local function readSummary()
 	if READ.counter ~= "" then
 		table.insert(lines, "counter: " .. READ.counter)
 	end
+	local me = match.player
+	if me and ((me.sigThrown or 0) > 0 or (me.headLanded or 0) + (me.bodyLanded or 0) + (me.legLanded or 0) > 0) then
+		table.insert(lines, string.format(
+			"signature %d/%d  |  head %d  body %d  leg %d",
+			me.sigLanded or 0,
+			me.sigThrown or 0,
+			me.headLanded or 0,
+			me.bodyLanded or 0,
+			me.legLanded or 0
+		))
+	end
 	if TUNE.takedown == true and not autoOn("autoTakedown") then
 		table.insert(lines, "takedowns off  |  auto takedown is off")
 	end
@@ -20477,6 +20499,212 @@ READ.legKickTick = function(m)
 	if not canThrow(p, move) then return end
 	lastTry = t
 	strikeAt(m, move, move == "rkick" and "legR" or "legL")
+end
+
+--// signature moves --------------------------------------------------------------
+-- place version 116 added Moves and the signature key. Match:touchSig is still
+-- the only input path the game uses: Moves.install patches the strike pipeline so
+-- a "knee" call becomes the equipped signature, and the module keeps ownership of
+-- the cooldown, stamina cost, grapple restrictions, fence checks and the
+-- suplex / flying-armbar branches. the panel only decides when to press that key.
+--
+-- the whole patch lives in a do block because this suite is at the top-level
+-- register limit; the handles live on ui.moves.
+do
+	ui.moves = {
+		module = tryRequire("Moves"),
+		lastTry = 0,
+		s = {
+			id = "knee",
+			name = "FLYING KNEE",
+			tag = "STANDARD",
+			left = 0,
+			total = 0,
+			ready = false,
+			why = "moves module not found",
+			uses = 0,
+			auto = false,
+			team = false,
+		},
+	}
+
+	ui.moves.refresh = function(m)
+		local M = ui.moves
+		local Moves = M.module
+		local state = M.s
+		if not Moves then
+			state.id, state.name, state.tag = "knee", "FLYING KNEE", "STANDARD"
+			state.left, state.total, state.ready = 0, 0, false
+			state.why = "moves module not found (pre-116 place?)"
+			return
+		end
+		local id = "knee"
+		if type(Moves.selected) == "function" then
+			local ok, v = pcall(Moves.selected)
+			if ok and type(v) == "string" and v ~= "" then id = v end
+		elseif type(Moves._eq) == "string" and Moves._eq ~= "" then
+			id = Moves._eq
+		end
+		local def = type(Moves.BY_ID) == "table" and Moves.BY_ID[id] or nil
+		state.id = id
+		state.name = def and tostring(def.name or id) or string.upper(id)
+		state.tag = def and tostring(def.tag or "STANDARD") or "STANDARD"
+		local left, total = 0, 0
+		if type(Moves.cooldownLeft) == "function" then
+			local ok, a, b = pcall(Moves.cooldownLeft, id)
+			if ok then
+				left = math.max(0, tonumber(a) or 0)
+				total = math.max(0, tonumber(b) or 0)
+			end
+		end
+		state.left, state.total = left, total
+		state.ready = left <= 0.05
+		state.team = m ~= nil and m.team ~= nil
+	end
+
+	ui.moves.reason = function(m, manual)
+		local M = ui.moves
+		local Moves = M.module
+		local state = M.s
+		local id, tag = state.id, state.tag
+		if not Moves then return "moves module not found" end
+		if id == "knee" and not manual then return "flying knee only - equip a signature in MOVES" end
+		if m.tutorial then return "tutorial" end
+		if tag == "GRAPPLE" then
+			if m.team and m.team.net then return "grapple is disabled in network 2v2" end
+			if m.multi then return "grapple is disabled in multi" end
+		end
+		local p = m.player
+		local o = m.opp
+		if not (p and o) then return "no opponent" end
+		local minStam = math.clamp(tonumber(CFG.sigStamina) or 25, 5, 90)
+		if (tonumber(p.stamina) or 0) < minStam then return "stamina" end
+		if os.clock() < (tonumber(p.sigReadyT) or 0) then return "recovery" end
+		if m.gnd or m.drive then return "grappling" end
+		if p.down or o.down or (p.rig and p.rig.ragdolled) or (o.rig and o.rig.ragdolled) then return "down" end
+		if p.shot or p.clinch then return "busy" end
+		if not state.ready then return string.format("%.1fs cooldown", state.left) end
+		if not manual and autoOn("autoCounter") and incomingStrike(m) then return "incoming strike" end
+
+		local dist = flat(o.pos - p.pos).Magnitude
+		local reach = armReach(p)
+		local hr = math.clamp(tonumber(CFG.hitReach) or 1.30, 0.80, 1.60)
+		local limit = reach * hr
+		if id == "superman" then
+			limit = reach * (hr + 0.35)
+		elseif id == "uppercut" or id == "selbow" then
+			limit = reach * math.max(0.55, hr * 0.72)
+		elseif id == "sbackfist" or id == "sbkick" or id == "tornado"
+			or id == "cranekick" or id == "showtime" or id == "ninja" then
+			limit = reach * hr * 1.15
+		end
+		if tag == "GRAPPLE" then
+			local ok, can = pcall(function() return m:canShoot(p) end)
+			if not (ok and can) then return "grapple range" end
+			local shoot = 3.4 * ((tonumber(p.s) or 1) + (tonumber(o.s) or 1)) / 2
+			limit = math.max(limit, shoot)
+		end
+		if dist > limit then return string.format("out of range %.1fm", dist) end
+
+		if id == "showtime" or id == "ninja" then
+			if type(Moves.cageSide) ~= "function" then return "fence check unavailable" end
+			local ok, dir, _, lookDot = pcall(Moves.cageSide, p)
+			if not ok or not dir then return "not near the cage" end
+			if id == "showtime" and (tonumber(lookDot) or -1) < -0.45 then return "cage not at your side" end
+			if id == "ninja" and (tonumber(lookDot) or 1) > -0.35 then return "back is not to the cage" end
+		end
+		return nil
+	end
+
+	ui.moves.cast = function(m)
+		local M = ui.moves
+		if not (m and m.player and m.opp) then return false end
+		if CFG.autoAim then
+			pcall(function()
+				local tgt = aimPoint(m, effAim())
+				local cam = workspace.CurrentCamera
+				if tgt and cam then
+					local pos = cam.CFrame.Position
+					if flat(tgt - pos).Magnitude > 0.2 then
+						cam.CFrame = CFrame.lookAt(pos, tgt)
+					end
+				end
+			end)
+		end
+		local ok, err = pcall(m.touchSig, m)
+		if ok then
+			M.s.uses = M.s.uses + 1
+			M.lastTry = now()
+			pushLog("signature: " .. M.s.name)
+		else
+			warn("[MMA] signature error: " .. tostring(err))
+		end
+		return ok
+	end
+
+	ui.moves.tick = function(m)
+		local M = ui.moves
+		local state = M.s
+		M.refresh(m)
+		state.auto = autoOn("autoSig")
+		if not m then
+			state.why = "idle  |  no match"
+			return
+		end
+		if m.state ~= "fight" or m.finish or not m.controls then
+			state.why = "match  |  " .. tostring(m.state or "waiting")
+			return
+		end
+		if not state.auto then
+			state.why = "auto signature off"
+			return
+		end
+		local why = M.reason(m, false)
+		if why then
+			state.why = why
+			return
+		end
+		state.why = "ready"
+		local t = now()
+		if t - M.lastTry < 0.4 then return end
+		M.cast(m)
+	end
+
+	ui.moves.use = function()
+		local M = ui.moves
+		local m = match
+		if not (m and m.player and m.opp) then
+			notify("signature: no match")
+			return false
+		end
+		M.refresh(m)
+		if m.state ~= "fight" or m.finish or not m.controls then
+			notify("signature: not in a live fight")
+			return false
+		end
+		local why = M.reason(m, true)
+		if why then
+			notify("signature: " .. why)
+			return false
+		end
+		return M.cast(m)
+	end
+
+	ui.moves.state = function()
+		local s = ui.moves.s
+		return {
+			id = s.id,
+			name = s.name,
+			tag = s.tag,
+			left = s.left,
+			total = s.total,
+			ready = s.ready,
+			why = s.why,
+			uses = s.uses,
+			auto = s.auto,
+			team = s.team,
+		}
+	end
 end
 
 local function groundTick(m)
@@ -20799,6 +21027,15 @@ local function watch(m)
 			lastState.tdP = ps.takedowns
 			stats.takedowns = stats.takedowns + 1
 			pushLog("takedown completed")
+		end
+		if (ps.sigThrown or 0) > (lastState.sigThrown or 0) then
+			lastState.sigThrown = ps.sigThrown
+			stats.sigThrown = (stats.sigThrown or 0) + 1
+		end
+		if (ps.sigLanded or 0) > (lastState.sigLanded or 0) then
+			lastState.sigLanded = ps.sigLanded
+			stats.sigLanded = (stats.sigLanded or 0) + 1
+			pushLog("signature landed")
 		end
 	end
 	if os_ then
@@ -21363,6 +21600,32 @@ local function buildUI()
 		value = CFG.autoLegKick,
 		callback = function(v) CFG.autoLegKick = v end,
 	})
+	fightTab:CreateSection({ name = "SIGNATURE  |  MOVES  |  PLACE 116" })
+	ui.sigCard = fightTab:CreateText({ name = "signature  |  knee", text = "moves module not found" })
+	fightTab:CreateToggle({
+		name = "auto signature",
+		description = "presses the game's signature key when the equipped move is off cooldown, in range, above the stamina floor, and not blocked by a grapple, fence or 2v2 rule. it calls Match:touchSig() - the same input the game uses - so the Moves module still owns the cooldown, the showtime/ninja fence check and the suplex/armbar branch. equip the move in the game's MOVES menu; this never grants, rolls or equips one.",
+		flag = "mma_autoSig",
+		value = CFG.autoSig,
+		callback = function(v) CFG.autoSig = v end,
+	})
+	fightTab:CreateSlider({
+		name = "signature stamina",
+		description = "minimum stamina before the auto signature starts. signatures cost more than a jab and a missed one can leave you tired for the next exchange.",
+		flag = "mma_sigStamina",
+		range = { 5, 80 },
+		increment = 1,
+		value = CFG.sigStamina,
+		suffix = "%",
+		callback = function(v) CFG.sigStamina = tonumber(v) or 25 end,
+	})
+	fightTab:CreateButton({
+		name = "use signature now",
+		description = "one Match:touchSig() through the game's own signature path. refuses when the move is on cooldown, out of its range, below the stamina floor, or locked by a grapple/fence/2v2 rule; the card below says which.",
+		callback = function()
+			if ui.moves then ui.moves.use() end
+		end,
+	})
 	fightTab:CreateSection({ name = "OPPONENT READ  |  LIVE  |  COUNTER" })
 	ui.readCard = fightTab:CreateText({ name = "read  |  unknown", text = "no match captured" })
 	fightTab:CreateToggle({
@@ -21816,6 +22079,7 @@ local function buildUI()
 	ui.sDamage = hudTab:CreateStat({ name = "damage", value = stats.damage })
 	ui.sTd = hudTab:CreateStat({ name = "takedowns", value = stats.takedowns })
 	ui.sSubs = hudTab:CreateStat({ name = "subs", value = stats.subs })
+	ui.sSig = hudTab:CreateStat({ name = "signatures", value = stats.sigLanded })
 	ui.sAcc = hudTab:CreateStat({ name = "accuracy", value = 0, suffix = "%" })
 	-- session log
 	ui.logText = hudTab:CreateText({ name = "log", text = "-" })
@@ -22430,6 +22694,21 @@ local function syncUI()
 			ui.readCard:Set(txt)
 		end)
 	end
+	if ui.sigCard and ui.moves then
+		pcall(function()
+			local s = ui.moves.state()
+			local title = "signature  |  " .. string.lower(s.name)
+			if s.tag and s.tag ~= "STANDARD" then title = title .. "  |  " .. s.tag end
+			ui.sigCard:SetTitle(title)
+			local bits = {}
+			if s.why and s.why ~= "" then bits[#bits + 1] = s.why end
+			if (s.left or 0) > 0.05 then bits[#bits + 1] = string.format("%.1fs", s.left) end
+			if (s.uses or 0) > 0 then bits[#bits + 1] = tostring(s.uses) .. " used" end
+			if s.auto then bits[#bits + 1] = "auto on" end
+			if s.team then bits[#bits + 1] = "2v2" end
+			ui.sigCard:Set(#bits > 0 and table.concat(bits, "  |  ") or "ready")
+		end)
+	end
 	if ui.groundCard then
 		pcall(function()
 			local g = match and match.gnd			local txt = "no match captured"
@@ -22495,6 +22774,7 @@ local function syncUI()
 	if ui.sDamage then pcall(function() ui.sDamage:Set(stats.damage) end) end
 	if ui.sTd then pcall(function() ui.sTd:Set(stats.takedowns) end) end
 	if ui.sSubs then pcall(function() ui.sSubs:Set(stats.subs) end) end
+	if ui.sSig then pcall(function() ui.sSig:Set(stats.sigLanded or 0) end) end
 	if ui.sAcc then
 		pcall(function()
 			local acc = stats.strikes > 0 and math.floor(stats.landed / stats.strikes * 100) or 0
@@ -22520,10 +22800,7 @@ local function syncUI()
 	updateStyleCard()
 end
 
-local lastSync = 0
-local lastHudWarn = 0
-local lastSave = 0
-local lastAutoWarn = 0
+ui.clock = { sync = 0, hudWarn = 0, save = 0, autoWarn = 0 }
 
 -- pcall alone hides the exact error and the guard then does nothing for the
 -- whole fight. surface it once per 5 s and keep the message in GUARD.err.
@@ -22532,8 +22809,8 @@ local function runAuto(name, fn, m)
 	if not ok then
 		GUARD.err = name .. ": " .. tostring(err)
 		local t = now()
-		if t - lastAutoWarn > 5 then
-			lastAutoWarn = t
+		if t - ui.clock.autoWarn > 5 then
+			ui.clock.autoWarn = t
 			warn("[MMA] " .. name .. " error: " .. tostring(err))
 		end
 	end
@@ -22594,21 +22871,22 @@ local function tick()
 			pcall(function() Touch.block = false; Touch.lowBlock = false end)
 		end
 	end
+	if ui.moves then runAuto("signature", ui.moves.tick, match) end
 	pcall(skipTick)
 	if ui.career then pcall(ui.career.tick) end
 	pcall(queueTick)
 	local okHud, hudErr = pcall(hudTick)
-	if not okHud and now() - lastHudWarn > 5 then
-		lastHudWarn = now()
+	if not okHud and now() - ui.clock.hudWarn > 5 then
+		ui.clock.hudWarn = now()
 		warn("[MMA] hud error: " .. tostring(hudErr))
 	end
 	local t = now()
-	if t - lastSync > 0.3 then
-		lastSync = t
+	if t - ui.clock.sync > 0.3 then
+		ui.clock.sync = t
 		pcall(syncUI)
 	end
-	if t - lastSave > 4 then
-		lastSave = t
+	if t - ui.clock.save > 4 then
+		ui.clock.save = t
 		pcall(saveCfg)
 	end
 end
@@ -22642,7 +22920,7 @@ task.spawn(function()
 end)
 
 _G.RagdollMmaPanel = {
-	build = "ironknuckles-2l",
+	build = "ironknuckles-2m",
 	cfg = CFG,
 	guard = guardTick,
 	guardState = function()
@@ -22678,6 +22956,12 @@ _G.RagdollMmaPanel = {
 	getMatch = function() return match end,
 	hitbox = function()
 		return { installed = ui.hitbox.installed(), mult = ui.hitbox.mult(), original = ui.hitbox.hasOriginal() }
+	end,
+	moves = function()
+		return ui.moves and ui.moves.state() or nil
+	end,
+	moveUse = function()
+		return ui.moves and ui.moves.use() or false
 	end,
 	replay = function()
 		return ui.replay and ui.replay.state() or nil
