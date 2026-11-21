@@ -54,6 +54,14 @@ if not (Game and Config and Agent and NPC) then
     return warn("[HitBlox] core modules unavailable, aborting.")
 end
 
+-- Re-running tears the previous copy down before new hooks go in, so two
+-- panels and two hook sets never stack. getgenv().HitBloxHub is set by the
+-- previous copy, whether it came from the standalone loader or the mega hub.
+local previousHub = getgenv and getgenv().HitBloxHub
+if type(previousHub) == "table" and type(previousHub.unload) == "function" then
+    pcall(previousHub.unload)
+end
+
 -- Rayfield Gen2 ---------------------------------------------------------------
 
 local loaded, Rayfield = pcall(function()
@@ -1617,7 +1625,7 @@ end
 -- poking at the menu.
 if getgenv then
     getgenv().HitBloxHub = {
-        version = "1.2.0",
+        version = "1.2.1",
         state = state,
         panic = panic,
         unload = unload,
@@ -1753,12 +1761,5 @@ Window:Notify({
     title = "HitBlox loaded",
     content = "Combat, visuals, stealth and contract tools are ready.",
 })
-
--- Live-reload teardown: the previous copy unloads itself instead of stacking.
-if STATE and STATE.onCleanup then
-    STATE.onCleanup(function()
-        pcall(unload)
-    end)
-end
 
 return true
