@@ -11,9 +11,10 @@
     nothing.
 ]]
 
--- upload-hitblox.py replaces the placeholder below with the token account's
--- raw base URL before upload, so the published loader always points at the
--- repo that actually received the files. Do not paste this template directly.
+-- upload-hitblox.py rewrites the BASE line to the token account's raw base
+-- before upload, so the published loader always points at the repo that
+-- actually received the files. This default is the current SLIMHUB repo, so
+-- the checked-in loader runs as-is.
 local BASE = "https://raw.githubusercontent.com/yougyougo017-png/rugball/main/"
 local HUB = BASE .. "hitblox-hub.luau"
 
