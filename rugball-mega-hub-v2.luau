@@ -29710,6 +29710,15 @@ local state = {
     payoutCash = nil,
     payoutNote = "ready",
 
+    -- contract loop
+    autoLoop = false,
+    autoLoopMission = "Museum",
+    autoLoopDelay = 3,
+    autoLoopComplete = true,
+    autoLoopCycles = 0,
+    autoLoopNote = "off",
+    autoLoopNextAt = 0,
+
     dead = false,
 }
 
@@ -31078,6 +31087,177 @@ local function collectPayout(manual)
     return false
 end
 
+-- Auto contract loop ---------------------------------------------------------
+--
+-- quick() is the game's own fast-start path: it builds the map, creates the
+-- Agent and Mission, and runs the short intro. Finishing goes through the
+-- regular results screen and SaveResult, so progress and the server's payout
+-- rules still apply. No invented remotes.
+
+local autoLoopToken = 0
+
+local function autoLoopChoices()
+    local choices = {}
+    local boot = Game.boot
+    for _, def in ipairs(boot and boot.missions or {}) do
+        if def.id then
+            table.insert(choices, def.id)
+        end
+    end
+
+    if #choices == 0 then
+        choices = {
+            "Museum", "Bank", "Halcyon", "Tower", "Estate", "Rig",
+            "Express", "Hotel", "Ranch", "Pier", "Creek", "Maple",
+        }
+    end
+
+    return choices
+end
+
+local function autoLoopFind(id)
+    local boot = Game.boot
+    if not boot then
+        return nil
+    end
+
+    if type(boot.find) == "function" then
+        local ok, def = pcall(boot.find, id)
+        if ok and def then
+            return def
+        end
+    end
+
+    for _, def in ipairs(boot.missions or {}) do
+        if def.id == id then
+            return def
+        end
+    end
+
+    return nil
+end
+
+local function autoLoopSyncPayout()
+    -- Finishing a contract calls the game's SaveResult, which starts the same
+    -- server cooldown the fabricated payout uses. Keep the local timer honest
+    -- so auto-payout does not waste an attempt while the loop is running.
+    state.payoutNextAt = math.max(state.payoutNextAt, os.time() + PAYOUT_COOLDOWN)
+    if getgenv then
+        getgenv().HitBloxPayoutNextAt = state.payoutNextAt
+    end
+end
+
+local function autoLoopOnce(manual)
+    local boot = Game.boot
+    if not boot or type(boot.quick) ~= "function" then
+        return false, "HITBLOX boot not ready"
+    end
+
+    local mission = currentMission()
+    if not (mission and mission.running) then
+        local def = autoLoopFind(state.autoLoopMission)
+        if not def then
+            return false, ("unknown contract: %s"):format(tostring(state.autoLoopMission))
+        end
+
+        state.autoLoopNote = ("starting %s"):format(tostring(def.id))
+        local ok, err = pcall(boot.quick, def.id)
+        if not ok then
+            return false, ("start failed: %s"):format(tostring(err))
+        end
+
+        -- The short intro sets Game.running. Finishing before it ends would let
+        -- the intro callback flip Game.running back on after the result.
+        local deadline = os.clock() + 10
+        while (manual or state.autoLoop) and not state.dead and not Game.running
+            and os.clock() < deadline do
+            task.wait(0.1)
+        end
+
+        mission = currentMission()
+        if not (mission and mission.running) then
+            return false, "contract did not start"
+        end
+    end
+
+    if state.autoLoopComplete then
+        state.autoLoopNote = "completing objectives"
+        completeObjectives()
+        task.wait(0.4)
+    end
+
+    if mission.running then
+        state.autoLoopNote = "finishing"
+        local ok, err = pcall(function()
+            mission:finish(true)
+        end)
+        if not ok then
+            return false, ("finish failed: %s"):format(tostring(err))
+        end
+    end
+
+    autoLoopSyncPayout()
+    state.autoLoopCycles = state.autoLoopCycles + 1
+    -- Stopping mid-cycle must keep the stop note; only a loop that is still
+    -- running (or a deliberate single run) reports the finished cycle.
+    if state.autoLoop or manual then
+        state.autoLoopNote = ("cycle %d done"):format(state.autoLoopCycles)
+    end
+    return true
+end
+
+local function stopAutoLoop(note)
+    state.autoLoop = false
+    autoLoopToken = autoLoopToken + 1
+    state.autoLoopNextAt = 0
+    if note then
+        state.autoLoopNote = note
+    end
+end
+
+local function startAutoLoop()
+    if state.autoLoop or state.dead then
+        return
+    end
+
+    if not (Game.boot and type(Game.boot.quick) == "function") then
+        Window:Notify({ title = "Auto loop", content = "HITBLOX boot is not ready yet." })
+        return
+    end
+
+    state.autoLoop = true
+    state.autoLoopNextAt = 0
+    state.autoLoopNote = "starting"
+    autoLoopToken = autoLoopToken + 1
+    local token = autoLoopToken
+
+    task.spawn(function()
+        while state.autoLoop and not state.dead and token == autoLoopToken do
+            local ok, result, err = pcall(autoLoopOnce)
+            if not state.autoLoop or state.dead or token ~= autoLoopToken then
+                break
+            end
+
+            if not ok then
+                state.autoLoopNote = ("error: %s"):format(tostring(result))
+                task.wait(3)
+            elseif result == false then
+                state.autoLoopNote = tostring(err or "loop stalled")
+                task.wait(3)
+            else
+                local delay = math.max(1, tonumber(state.autoLoopDelay) or 3)
+                state.autoLoopNextAt = os.clock() + delay
+                task.wait(delay)
+            end
+        end
+
+        if token == autoLoopToken then
+            state.autoLoop = false
+            state.autoLoopNextAt = 0
+        end
+    end)
+end
+
 missionTab:CreateSection({ name = "Payout" })
 
 local payoutText = missionTab:CreateText({
@@ -31147,6 +31327,85 @@ missionTab:CreateButton({
     end,
 })
 
+missionTab:CreateSection({ name = "Auto loop" })
+
+local loopOptions = autoLoopChoices()
+if not table.find(loopOptions, state.autoLoopMission) then
+    state.autoLoopMission = loopOptions[1]
+end
+
+missionTab:CreateDropdown({
+    name = "Loop contract",
+    description = "The contract the loop starts from a clean map every cycle.",
+    options = loopOptions,
+    value = state.autoLoopMission,
+    flag = "hbLoopMission",
+    callback = function(selected)
+        state.autoLoopMission = selected
+    end,
+})
+
+missionTab:CreateSlider({
+    name = "Loop delay",
+    description = "Pause after a finished contract before the next one starts.",
+    range = { 1, 30 },
+    increment = 1,
+    value = 3,
+    suffix = " s",
+    flag = "hbLoopDelay",
+    callback = function(value)
+        state.autoLoopDelay = value
+    end,
+})
+
+missionTab:CreateToggle({
+    name = "Complete objectives first",
+    description = "Marks every objective done before finishing, so each cycle succeeds.",
+    value = true,
+    flag = "hbLoopComplete",
+    callback = function(value)
+        state.autoLoopComplete = value
+    end,
+})
+
+local loopText = missionTab:CreateText({
+    name = "Loop status",
+    text = "off - choose a contract and enable the loop",
+})
+
+ui.autoLoop = missionTab:CreateToggle({
+    name = "Auto contract loop",
+    description = "Starts the chosen contract, completes its objectives, finishes it and repeats. Each finish uses the game's SaveResult, so leave Auto collect payout off while the loop runs - they share the same ~180 s cooldown.",
+    value = false,
+    flag = "hbAutoLoop",
+    callback = function(value)
+        if value then
+            startAutoLoop()
+        else
+            stopAutoLoop("stopped")
+        end
+    end,
+})
+
+missionTab:CreateButton({
+    name = "Run one contract now",
+    description = "One loop cycle without enabling the loop.",
+    callback = function()
+        local ok, result, err = pcall(autoLoopOnce, true)
+        if ok and result ~= false then
+            Window:Notify({
+                title = "Auto loop",
+                content = ("Cycle %d done."):format(state.autoLoopCycles),
+            })
+        else
+            Window:Notify({
+                title = "Auto loop",
+                content = tostring(ok and err or result),
+            })
+        end
+    end,
+})
+
 -- Settings --------------------------------------------------------------------
 
 local settingsTab = Window:CreateTab({ name = "Settings" })
@@ -31157,7 +31416,7 @@ local function panic()
     for _, key in ipairs({
         "aimbot", "noSpread", "noRecoil", "infAmmo", "instantReload",
         "esp", "undetectable", "godmode", "autoHideBodies", "autoPayout",
-        "speedOn", "jumpOn", "noclip",
+        "autoLoop", "speedOn", "jumpOn", "noclip",
     }) do
         state[key] = false
         local element = ui[key]
@@ -31168,6 +31427,7 @@ local function panic()
         end
     end
 
+    stopAutoLoop("panic")
     clearEsp()
     setSpreadZero(false)
 
@@ -31202,7 +31462,7 @@ end
 -- poking at the menu.
 if getgenv then
     getgenv().HitBloxHub = {
-        version = "1.2.1",
+        version = "1.2.2",
         state = state,
         panic = panic,
         unload = unload,
@@ -31224,6 +31484,15 @@ if getgenv then
             return collectPayout(true)
         end,
         payoutReadyIn = payoutReadyIn,
+        startLoop = function()
+            startAutoLoop()
+        end,
+        stopLoop = function()
+            stopAutoLoop("stopped")
+        end,
+        runContract = function()
+            return autoLoopOnce(true)
+        end,
     }
 end
 
@@ -31307,6 +31576,22 @@ RunService.Heartbeat:Connect(function(dt)
         statusText:Set(table.concat(parts, "   |   "))
     end)
 
+    if loopText then
+        local nextIn = math.max(0, state.autoLoopNextAt - os.clock())
+        local suffix = ""
+        if state.autoLoop and nextIn > 0 then
+            suffix = ("   |   next %d s"):format(math.ceil(nextIn))
+        end
+        pcall(function()
+            loopText:Set(("loop %s   |   %s   |   cycles %d%s"):format(
+                state.autoLoop and "ON" or "off",
+                state.autoLoopNote,
+                state.autoLoopCycles,
+                suffix
+            ))
+        end)
+    end
+
     if payoutText then
         local left = payoutReadyIn()
         local nextText
@@ -31328,8 +31613,8 @@ RunService.Heartbeat:Connect(function(dt)
         end)
     end
 
-    if state.autoPayout and not state.payoutBusy and payoutReadyIn() <= 0
-        and not (mission and mission.running) then
+    if state.autoPayout and not state.autoLoop and not state.payoutBusy
+        and payoutReadyIn() <= 0 and not (mission and mission.running) then
         collectPayout(false)
     end
 end)
