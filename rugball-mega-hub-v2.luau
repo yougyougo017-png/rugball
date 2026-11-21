@@ -17797,6 +17797,14 @@ local READ = {
 	lastOPos = nil, lastPPos = nil, incoming = false,
 	read = "unknown", candidate = "unknown", candidateT = 0,
 	counter = "", style = "", prior = "", confidence = 0, changedAt = 0,
+	-- timing read: who leads, who counters, and the late window after an
+	-- opponent strike when their guard is disabled by isStriking().
+	ourLeads = 0, theirStrikes = 0, counters = 0, counterRate = 0,
+	lastCounterAt = 0, respectCounter = false, respectUntil = 0,
+	lastOStrikeAt = 0, cadence = 0, cadenceN = 0, nextOAt = 0,
+	nextLead = 0, ourLeadAt = 0, backAt = 0, fwdAt = 0,
+	baitAt = 0, baitUntil = 0, oFacing = true, oBlock = false, oBlockPrev = false,
+	oGuardAt = 0, punishes = 0, punishAt = 0, punishMove = "",
 }
 
 local function clearTune()
@@ -17838,6 +17846,30 @@ local function resetAdapt()
 	READ.comboIdx = 0
 	READ.comboAt = 0
 	READ.styleKickZone = nil
+	READ.ourLeads = 0
+	READ.theirStrikes = 0
+	READ.counters = 0
+	READ.counterRate = 0
+	READ.lastCounterAt = 0
+	READ.respectCounter = false
+	READ.respectUntil = 0
+	READ.lastOStrikeAt = 0
+	READ.cadence = 0
+	READ.cadenceN = 0
+	READ.nextOAt = 0
+	READ.nextLead = 0
+	READ.ourLeadAt = 0
+	READ.backAt = 0
+	READ.fwdAt = 0
+	READ.baitAt = 0
+	READ.baitUntil = 0
+	READ.oFacing = true
+	READ.oBlock = false
+	READ.oBlockPrev = false
+	READ.oGuardAt = 0
+	READ.punishes = 0
+	READ.punishAt = 0
+	READ.punishMove = ""
 end
 
 local function fmtTime(t)
@@ -19672,7 +19704,7 @@ local function kickWindow(m, dist)
 	return dist > armReach(o) + 0.4 * (tonumber(o.s) or 1)
 end
 
-local function pickStrike(m, dist, reach, threat)
+local function pickStrike(m, dist, reach, threat, noHeavy)
 	local o = m.opp
 	local p = m.player
 	local style = effStyle()
@@ -19728,7 +19760,9 @@ local function pickStrike(m, dist, reach, threat)
 				end
 				local kick = move == "lkick" or move == "rkick"
 				local knee = move == "knee"
-				if (not kick or canKick)
+				local heavy = kick or knee or move == "lhook" or move == "rhook"
+				if (not noHeavy or not heavy)
+					and (not kick or canKick)
 					and (not knee or (dist < reach * 0.62 and stamina >= 20))
 					and canThrow(p, move)
 				then
@@ -19742,7 +19776,7 @@ local function pickStrike(m, dist, reach, threat)
 		end
 		local move = nextCombo(READ.comboSeq ~= nil)
 		if move then return move end
-		if canKick and dist > reach * 0.62 and math.random() < math.max(0.12, plan.kicks) then
+		if not noHeavy and canKick and dist > reach * 0.62 and math.random() < math.max(0.12, plan.kicks) then
 			local km
 			if math.random() < (plan.lowKicks or 0) then
 				READ.legKickSide = not READ.legKickSide
@@ -19755,7 +19789,7 @@ local function pickStrike(m, dist, reach, threat)
 			if canThrow(p, km) then return km end
 			READ.styleKickZone = nil
 		end
-		if dist < reach * 0.55 and stamina >= 20
+		if not noHeavy and dist < reach * 0.55 and stamina >= 20
 			and math.random() < math.min(0.65, (plan.knees or 0) * 0.3)
 		then
 			if canThrow(p, "knee") then return "knee" end
@@ -19775,7 +19809,7 @@ local function pickStrike(m, dist, reach, threat)
 
 	-- explicit leg-kick switch: at kick range, take the leg instead of waiting
 	-- for a kick style. sides alternate so the same shin is not kicked forever.
-	if CFG.autoLegKick and canKick and stamina >= 6.5 and dist > reach * 0.55 then
+	if not noHeavy and CFG.autoLegKick and canKick and stamina >= 6.5 and dist > reach * 0.55 then
 		READ.legKickSide = not READ.legKickSide
 		return READ.legKickSide and "rkick" or "lkick"
 	end
@@ -19791,6 +19825,12 @@ local function pickStrike(m, dist, reach, threat)
 	if style == "smart" then
 		if stamina < 26 then
 			if dist <= reach then return "jab" end
+			return nil
+		end
+		if noHeavy then
+			if dist <= reach then
+				return (stamina >= 4.6 and math.random() < 0.25) and "cross" or "jab"
+			end
 			return nil
 		end
 		if rocked then
@@ -19813,12 +19853,16 @@ local function pickStrike(m, dist, reach, threat)
 
 	if style == "power" then
 		if dist > reach then return nil end
-		if stamina < 5 then return "jab" end
+		if noHeavy or stamina < 5 then return "jab" end
 		local pool = { "cross", "rhook", "lhook", "cross" }
 		return pool[math.random(1, #pool)]
 	end
 
 	if style == "kicks" then
+		if noHeavy then
+			if dist <= reach then return "jab" end
+			return nil
+		end
 		if stamina >= 8 and canKick and dist > reach * 0.7 then
 			-- at real kick range a jab cannot reach; do not waste the turn
 			local pool = dist > reach * 0.95
@@ -19835,6 +19879,7 @@ local function pickStrike(m, dist, reach, threat)
 
 	if style == "combo" then
 		if dist > reach then return nil end
+		if noHeavy then return "jab" end
 		local pool = { "jab", "cross", "jab", "cross", "lhook", "rhook" }
 		return pool[math.random(1, #pool)]
 	end
@@ -19849,7 +19894,10 @@ local function incomingStrike(m)
 	local p = m.player
 	if not o or not p then return false, nil end
 	local dist = flat(o.pos - p.pos).Magnitude
-	local reach = (p.d and p.d.reach or 2.27) + 1.4 * (p.s or 1)
+	-- the threat is the opponent's reach, not ours. a taller fighter or a kick
+	-- can reach us from outside our own arm range; measuring with p.d.reach is
+	-- how the guard and auto counter used to miss exactly those strikes.
+	local reach = (o.d and o.d.reach or 2.27) + 1.4 * (o.s or 1) + 0.15
 	if dist > reach then return false, nil end
 	local ok, strikes = pcall(function() return o.strikes end)
 	if not ok or type(strikes) ~= "table" then return false, nil end
@@ -19894,6 +19942,41 @@ local function liveStrike(m)
 					best = {
 						left = left,
 						kind = def.kind,
+						zone = st.aimZone or (def.kind == "kick" and "leg" or "head"),
+					}
+				end
+			end
+		end
+	end
+	return best
+end
+
+-- the opponent's strike after impact. hold and retract still count as
+-- isStriking(), and Fighter zeroes blockAmt while a strike is active, so this
+-- is the one window where a counter cannot be blocked. return the strike with
+-- the most recovery left, and how long until it is fully done.
+READ.recoverStrike = function(m)
+	local o = m and m.opp
+	if not o then return nil end
+	local ok, strikes = pcall(function() return o.strikes end)
+	if not ok or type(strikes) ~= "table" then return nil end
+	local best = nil
+	for _, st in pairs(strikes) do
+		if type(st) == "table" then
+			local def = st.def or strikeDef(st.kind)
+			local phase = strikePhase(st)
+			if def and (phase == "hold" or phase == "retract") then
+				local speed = math.max(0.1, tonumber(st.speed) or 1)
+				local windup = (def.windup or 0.1) / speed
+				local extend = (def.extend or 0.12) / speed
+				local hold = (def.hold or 0.05) / speed
+				local retract = (def.retract or 0.2) / speed
+				local left = windup + extend + hold + retract - (tonumber(st.t) or 0)
+				if left > 0.03 and (best == nil or left > best.left) then
+					best = {
+						left = left,
+						kind = def.kind,
+						phase = phase,
 						zone = st.aimZone or (def.kind == "kick" and "leg" or "head"),
 					}
 				end
@@ -20084,6 +20167,35 @@ local function adaptTick(m)
 				else
 					READ.punches = READ.punches + 1
 				end
+				-- timing read: every new opponent strike is a beat. the gap
+				-- between beats gives their rhythm; a beat inside 0.55 s of
+				-- one of our leads is a counter attempt.
+				READ.theirStrikes = READ.theirStrikes + 1
+				if READ.lastOStrikeAt > 0 then
+					local gap = t - READ.lastOStrikeAt
+					if gap >= 0.12 and gap <= 8 then
+						READ.cadenceN = math.min(6, READ.cadenceN + 1)
+						READ.cadence = READ.cadence + (gap - READ.cadence) / READ.cadenceN
+					end
+				end
+				READ.lastOStrikeAt = t
+				if READ.cadenceN >= 3 then
+					READ.nextOAt = t + READ.cadence
+				else
+					READ.nextOAt = 0
+				end
+				if READ.ourLeadAt > 0 and t - READ.ourLeadAt <= 0.55
+					and t - READ.lastCounterAt > 0.35
+				then
+					READ.counters = READ.counters + 1
+					READ.lastCounterAt = t
+					if READ.counters >= 2 and READ.ourLeads >= 6
+						and READ.counters / READ.ourLeads >= 0.28
+					then
+						READ.respectCounter = true
+						READ.respectUntil = t + 12
+					end
+				end
 			end
 		end
 	end
@@ -20115,15 +20227,39 @@ local function adaptTick(m)
 				local dot = step.Unit:Dot(toUs.Unit)
 				if dot > 0.35 then
 					READ.fwdT = READ.fwdT + dt
+					READ.fwdAt = t
 					READ.incoming = true
 				elseif dot < -0.35 then
 					READ.backT = READ.backT + dt
+					READ.backAt = t
 				end
 			end
 		end
 	end
 	READ.lastOPos = o.pos
 	READ.lastPPos = p.pos
+
+	-- is the opponent actually turned toward us? a strike started while they
+	-- are turning or walking away cannot counter us, so this opens the lead.
+	READ.oBlock = o.block == true
+	if READ.oBlock and not READ.oBlockPrev then READ.oGuardAt = t end
+	READ.oBlockPrev = READ.oBlock
+	local facing = true
+	local okF, look = pcall(function() return o:rootCF().LookVector end)
+	if not okF or typeof(look) ~= "Vector3" then
+		okF, look = pcall(function() return o.rig.root.CFrame.LookVector end)
+	end
+	if okF and typeof(look) == "Vector3" then
+		local toUs = flat(p.pos - o.pos)
+		if toUs.Magnitude > 0.05 then
+			facing = look:Dot(toUs.Unit) > 0.2
+		end
+	end
+	READ.oFacing = facing
+	if READ.respectUntil > 0 and t > READ.respectUntil then
+		READ.respectCounter = false
+		READ.respectUntil = 0
+	end
 
 	if READ.time < 2.5 then return end
 	if t - (READ.lastClass or 0) < 0.5 then return end
@@ -20170,6 +20306,24 @@ local function readSummary()
 	end
 	if READ.counter ~= "" then
 		table.insert(lines, "counter: " .. READ.counter)
+	end
+	if READ.ourLeads > 0 or READ.counters > 0 or READ.punishes > 0 then
+		local tn = now()
+		local mode = "ready"
+		if READ.punishAt > 0 and tn - READ.punishAt < 1.2 then
+			mode = "punish " .. tostring(READ.punishMove or "")
+		elseif READ.baitUntil > tn then
+			mode = "bait"
+		elseif READ.respectCounter then
+			mode = "respect"
+		elseif READ.nextLead > tn then
+			mode = "wait"
+		end
+		table.insert(lines, string.format(
+			"timing %s  |  leads %d  |  counters %d (%d%%)  |  punishes %d",
+			mode, READ.ourLeads, READ.counters,
+			math.floor((READ.counterRate or 0) * 100 + 0.5), READ.punishes
+		))
 	end
 	local me = match.player
 	if me and ((me.sigThrown or 0) > 0 or (me.headLanded or 0) + (me.bodyLanded or 0) + (me.legLanded or 0) > 0) then
@@ -20349,6 +20503,10 @@ local function fightTick(m)
 	local dist = delta.Magnitude
 	local reach = (p.d and p.d.reach or 2.27) + 0.75 * (p.s or 1) + (tonumber(p.reachBonus) or 0)
 	local hr = math.clamp(tonumber(CFG.hitReach) or 1.30, 0.80, 1.60)
+	local t = now()
+	local live = liveStrike(m)
+	local rec = READ.recoverStrike(m)
+	local theirReach = armReach(o)
 
 	-- read the fight: are they hurt enough to press, or are we too tired to trade
 	local headHp = (o.hp and o.hp.head) or 100
@@ -20400,6 +20558,45 @@ local function fightTick(m)
 		want = reach * 1.55          -- back out and breathe, let them walk onto a counter
 	end
 
+	-- timing: a fresh opponent standing inside their own range is waiting to
+	-- counter the next lead. hold the edge of their punch range, step out,
+	-- then step back in on the last 0.18 s of the bait. if they bite, the live
+	-- strike is blocked and `rec` opens the punish; if they do not, the step-in
+	-- is a jab. every window is short so the game's blockHold still resets.
+	local opening = (o.rockedT or 0) > 0 or (tonumber(o.bodyHurtT) or 0) > 0.2
+		or (tonumber(o.stamina) or 100) < 25
+		or (o.shot ~= nil and o.shot ~= false)
+		or (o.clinch ~= nil and o.clinch ~= false)
+		or READ.oFacing == false
+		or (READ.backAt > 0 and t - READ.backAt < 0.4)
+	local danger = autoOn("autoCounter") and not gassed and not pressing
+		and not tonumber(TUNE.range)
+		and dist <= theirReach + 0.35
+		and READ.oFacing ~= false and not opening and not rec
+	local punish = autoOn("autoCounter") and not live and rec ~= nil
+		and dist <= reach * hr * 1.08
+	local feint = READ.baitUntil > t and (READ.baitUntil - t) <= 0.18
+	local anticipate = READ.cadenceN >= 3 and READ.nextOAt > 0
+		and (READ.nextOAt - t) > -0.12 and (READ.nextOAt - t) < 0.22
+
+	if punish then
+		want = math.max(reach * 0.45, math.min(want, dist - 0.2))
+	elseif danger then
+		if t >= (READ.baitAt or 0) then
+			READ.baitAt = t + (READ.respectCounter and math.random(0.9, 1.5) or math.random(1.3, 2.4))
+			READ.baitUntil = t + 0.55
+		end
+		if READ.baitUntil > t then
+			if t < READ.baitUntil - 0.18 then
+				want = math.max(want, theirReach + 0.12)
+			else
+				want = math.min(want, theirReach - 0.2, reach * 0.9)
+			end
+		else
+			want = math.max(want, theirReach + 0.05)
+		end
+	end
+
 	local fwd, side = 0, 0
 	if dist > want + 0.05 then
 		fwd = -1
@@ -20407,7 +20604,6 @@ local function fightTick(m)
 		fwd = 0.8
 	end
 	-- small orbit so the AI cannot just line us up, and so we stay off the fence
-	local t = now()
 	side = math.sin(t * 1.3) * (gassed and 0.55 or 0.25)
 	setMove(Vector3.new(side, 0, fwd))
 
@@ -20415,23 +20611,64 @@ local function fightTick(m)
 	guardTick(m, dist, pressing, threat)
 
 	local allowStrike = pressing or (not autoOn("autoBlock")) or (not threat) or (not autoOn("autoCounter"))
-	if allowStrike and not gassed and dist <= reach * hr and now() - lastTry > 0.09 then
-		local move = pickStrike(m, dist, reach, threat)
-		if move and canThrow(p, move) then
-			lastTry = now()
-			local zone
-			if move == "knee" then
-				zone = "head"
-			elseif move == "lkick" and CFG.autoLegKick then
-				zone = "legL"
-			elseif move == "rkick" and CFG.autoLegKick then
-				zone = "legR"
-			elseif READ.styleKickZone then
-				zone = READ.styleKickZone
-			else
-				zone = effAim()
+	-- a live opponent strike owns the next beat: block it instead of trading.
+	-- in their pocket with no opening, only the final step-in of a bait leads.
+	if live and autoOn("autoCounter") then allowStrike = false end
+	if danger and not feint then allowStrike = false end
+	if feint and anticipate then allowStrike = false end
+	if feint and READ.respectCounter and not opening and o.block == true then allowStrike = false end
+	if punish then allowStrike = true end
+	if allowStrike and not gassed and dist <= reach * hr
+		and t >= (READ.nextLead or 0) and t - lastTry > 0.09
+	then
+		local move
+		if punish and rec then
+			-- fastest strike that still lands inside their recovery. a cross
+			-- pays more, a jab is the only thing that beats a short retract.
+			local speed = math.max(0.5, tonumber(p.strikeSpeed) or 1)
+			local crossDef = strikeDef("cross")
+			local jabDef = strikeDef("jab")
+			local crossT = crossDef and ((crossDef.windup or 0.08) + (crossDef.extend or 0.14)) / speed or 0.22
+			local jabT = jabDef and ((jabDef.windup or 0.05) + (jabDef.extend or 0.11)) / speed or 0.16
+			if rec.left >= crossT * 0.9 and canThrow(p, "cross") then
+				move = "cross"
+			elseif rec.left >= jabT * 0.75 and canThrow(p, "jab") then
+				move = "jab"
 			end
-			strikeAt(m, move, zone)
+			if move then
+				lastTry = t
+				READ.nextLead = t + 0.16
+				READ.punishes = READ.punishes + 1
+				READ.punishAt = t
+				READ.punishMove = move
+				local aim = effAim()
+				if aim == "legs" or aim == "legL" or aim == "legR" then aim = "head" end
+				strikeAt(m, move, aim)
+			end
+		else
+			move = pickStrike(m, dist, reach, threat, danger and not opening)
+			if move and canThrow(p, move) then
+				lastTry = t
+				local leadGap = pressing and 0.14 or (danger and 0.5 or math.random(0.3, 0.65))
+				if danger and READ.respectCounter then leadGap = math.random(0.7, 1.1) end
+				READ.nextLead = t + leadGap
+				READ.ourLeadAt = t
+				READ.ourLeads = READ.ourLeads + 1
+				READ.counterRate = READ.counters / math.max(1, READ.ourLeads)
+				local zone
+				if move == "knee" then
+					zone = "head"
+				elseif move == "lkick" and CFG.autoLegKick then
+					zone = "legL"
+				elseif move == "rkick" and CFG.autoLegKick then
+					zone = "legR"
+				elseif READ.styleKickZone then
+					zone = READ.styleKickZone
+				else
+					zone = effAim()
+				end
+				strikeAt(m, move, zone)
+			end
 		end
 	end
 
@@ -21548,7 +21785,7 @@ local function buildUI()
 	})
 	fightTab:CreateToggle({
 		name = "auto fight",
-		description = "picks a strike from range and stamina, holds the right distance, and fires it with Match:playerStrike. everything is the game's own strike path.",
+		description = "picks a strike from range and stamina, holds the right distance, and fires it with Match:playerStrike. reads the opponent's strike phases: it holds the edge of their range and baits a lead, blocks the live strike, then counters in the hold/retract window when Fighter has blockAmt at zero. after repeated counters it stops leading into their range, waits for the recovery and slows its own cadence. everything is the game's own strike path.",
 		flag = "mma_autoFight",
 		value = CFG.autoFight,
 		callback = function(v) CFG.autoFight = v end,
@@ -22920,7 +23157,7 @@ task.spawn(function()
 end)
 
 _G.RagdollMmaPanel = {
-	build = "ironknuckles-2m",
+	build = "ironknuckles-2n",
 	cfg = CFG,
 	guard = guardTick,
 	guardState = function()
@@ -22962,6 +23199,24 @@ _G.RagdollMmaPanel = {
 	end,
 	moveUse = function()
 		return ui.moves and ui.moves.use() or false
+	end,
+	timing = function()
+		return {
+			leads = READ.ourLeads,
+			counters = READ.counters,
+			counterRate = READ.counterRate,
+			respect = READ.respectCounter,
+			cadence = READ.cadence,
+			cadenceN = READ.cadenceN,
+			nextOpponent = READ.nextOAt,
+			facing = READ.oFacing,
+			guard = READ.oBlock,
+			baitUntil = READ.baitUntil,
+			punishes = READ.punishes,
+			lastPunish = READ.punishAt,
+			punishMove = READ.punishMove,
+			nextLead = READ.nextLead,
+		}
 	end,
 	replay = function()
 		return ui.replay and ui.replay.state() or nil
