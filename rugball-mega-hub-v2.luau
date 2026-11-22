@@ -28,6 +28,8 @@
 		73251213967624   Criminal Simulator      criminal (live sub-place)
 		135079017614182  HITBLOX [UPD 2]         hitblox
 		92640845955320   HITBLOX MULTIPLAYER     hitblox
+		92551591080135   The Ditch Hotel (match)  ditch_hotel
+		83379330867218   The Ditch Hotel (lobby)  ditch_hotel
 
 	the taf bypass suite is standalone now. Throw A Football's Drive Duels and 7s
 	modes both run qb_aimbot, which carries the same MoveGuard/AnimGuard layers,
@@ -69,6 +71,8 @@ Hub.ORDER = {
 	{ place = 73251213967624,  label = "CRIMINAL SIMULATOR", suites = { "criminal" } },
 	{ place = 135079017614182, label = "HITBLOX", suites = { "hitblox" } },
 	{ place = 92640845955320,  label = "HITBLOX", suites = { "hitblox" } },
+	{ place = 92551591080135,  label = "THE DITCH HOTEL", suites = { "ditch_hotel" } },
+	{ place = 83379330867218,  label = "THE DITCH HOTEL", suites = { "ditch_hotel" } },
 }
 
 Hub.GAMES = {}
@@ -85,9 +89,10 @@ Hub.UNIVERSE = {
 	[10774293033] = { "superhero" },
 	[10769851460] = { "criminal" },
 	[10774632516] = { "hitblox" },
+	[10773912080] = { "ditch_hotel" },
 }
 
-Hub.SUITE_ORDER = { "football", "anime", "nba", "swish", "duels", "qb_aimbot", "taf_bypass", "physbox", "tps", "track", "rss", "mma", "carsoccer", "skyview", "superhero", "criminal", "hitblox" }
+Hub.SUITE_ORDER = { "football", "anime", "nba", "swish", "duels", "qb_aimbot", "taf_bypass", "physbox", "tps", "track", "rss", "mma", "carsoccer", "skyview", "superhero", "criminal", "hitblox", "ditch_hotel" }
 
 Hub.SUITE_NAMES = {
 	football   = "football panel    |  aim / tackle / block",
@@ -107,6 +112,7 @@ Hub.SUITE_NAMES = {
 	superhero  = "superhero duels    |  auto put best stat / auto roll / probe",
 	criminal   = "criminal simulator |  loot esp / prompt sniper / grab / movement",
 	hitblox    = "hitblox panel     |  contract / payout / combat / esp / stealth",
+	ditch_hotel = "ditch hotel       |  auto knock / escape / esp",
 }
 
 Hub.SUITE = {}
@@ -36478,6 +36484,1370 @@ Window:Notify({
 })
 
 return true
+end
+
+--// embedded suite: ditch_hotel  (from ditch_hotel.luau) =========================
+Hub.SUITE.ditch_hotel = function()
+--[[
+	THE DITCH HOTEL -- SLIM auto-knock panel
+	place 92551591080135 (match) | 83379330867218 (lobby)
+
+	WHAT THIS IS
+	  A client-side helper for The Ditch Hotel. The server owns cash, doors,
+	  guests and the round result, so nothing here fakes those values.
+
+	  FARM    auto farm: finds un-knocked rooms, knocks them on the game's
+	          cooldown, retreats above the map between knocks, then teleports
+	          to the escape zone when the exit opens. In the lobby, START
+	          MATCH steps into an elevator queue and uses the game's own
+	          QueueAction remote.
+	  ESP     guests, un-knocked rooms and the exit, with names/distances.
+	  MOVE    walk speed, jump power, camera fly.
+	  SYSTEM  anti-AFK, panic, unload.
+
+	  A knock has an 8 second cooldown (the HUD shows "next knock in X.X").
+	  Retreating to the sky between knocks is what keeps the guests from
+	  catching you before the cooldown ends. Turning that off is a bad idea.
+
+	  When a round ends the game sends you back to the lobby, and the place
+	  change unloads executor scripts. Keep auto-exec on for hands-free
+	  rounds, otherwise re-run the panel after every round.
+
+	  P = panic (turns everything off and restores the body).
+]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
+
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+local STOCK_WALK = 16
+local STOCK_JUMP = 50
+
+local CFG = {
+	-- esp
+	espGuests = true,
+	espRooms = true,
+	espExit = true,
+	espNames = true,
+	espBoxes = true,
+	espTracers = true,
+	espKnocked = false,
+	espDist = 0,
+	followFloor = true,
+
+	-- body
+	speed = false,
+	speedVal = 22,
+	jump = false,
+	jumpVal = 50,
+	fly = false,
+	flySpeed = 60,
+
+	-- system
+	antiAfk = true,
+
+	-- farm
+	autoFarm = false,
+	autoEscape = true,
+	autoReplay = false,
+	skyRetreat = true,
+	preferDND = false,
+	mode = "Hotel",
+	difficulty = "Easy",
+	safeY = 220,
+	fallbackDelay = 8.2,
+}
+
+local STATE = {
+	floorY = nil,
+	busy = false,
+	escaping = false,
+	lastKnock = 0,
+	lastDone = nil,
+	fail = 0,
+	voted = false,
+	stock = nil,
+	flyBV = nil,
+	flyConn = nil,
+	guestDraw = {},
+	roomDraw = {},
+	exitDraw = nil,
+	connections = {},
+	lastStatus = "",
+	lastInfo = "",
+}
+
+local ui = {}
+local window = nil
+local uiInfo, uiStatus, uiEspInfo
+
+--// helpers --------------------------------------------------------------------
+local function getChar()
+	return LocalPlayer.Character
+end
+
+local function getHRP()
+	local ch = getChar()
+	return ch and ch:FindFirstChild("HumanoidRootPart")
+end
+
+local function getHum()
+	local ch = getChar()
+	return ch and ch:FindFirstChildOfClass("Humanoid")
+end
+
+local function getPos()
+	local hrp = getHRP()
+	return hrp and hrp.Position or Vector3.zero
+end
+
+local function isAlive()
+	local hum = getHum()
+	return hum and hum.Health > 0
+end
+
+local function teleport(p)
+	local hrp = getHRP()
+	if not hrp then return false end
+	hrp.CFrame = CFrame.new(p)
+	hrp.AssemblyLinearVelocity = Vector3.zero
+	return true
+end
+
+local function map()
+	return Workspace:FindFirstChild("Map")
+end
+
+local function houses()
+	local m = map()
+	return m and m:FindFirstChild("Houses")
+end
+
+local function guests()
+	local m = map()
+	return m and m:FindFirstChild("Guests")
+end
+
+local function info()
+	return ReplicatedStorage:FindFirstChild("MatchInfo")
+end
+
+local function inLobby()
+	return info() == nil
+end
+
+local function matchValue(name, default)
+	local m = info()
+	local v = m and m:FindFirstChild(name)
+	if v and v:IsA("ValueBase") then return v.Value end
+	return default
+end
+
+local function done()
+	return tonumber(matchValue("HousesDone", 0)) or 0
+end
+
+local function needed()
+	return tonumber(matchValue("HousesNeeded", 10)) or 10
+end
+
+local function exitOpen()
+	return matchValue("ExitOpen", false) == true
+end
+
+local function matchState()
+	return tostring(matchValue("State", "?"))
+end
+
+local function matchResult()
+	return tostring(matchValue("Result", ""))
+end
+
+local function stat(name)
+	local ls = LocalPlayer:FindFirstChild("leaderstats")
+	local v = ls and ls:FindFirstChild(name)
+	return v and tostring(v.Value) or "--"
+end
+
+local function guestCount()
+	local g = guests()
+	return g and #g:GetChildren() or 0
+end
+
+--// rooms ----------------------------------------------------------------------
+local roomCache = nil
+
+local function rooms()
+	if roomCache and roomCache[1] and roomCache[1].model.Parent then
+		return roomCache
+	end
+	local folder = houses()
+	if not folder then return {} end
+
+	local list = {}
+	for _, room in ipairs(folder:GetChildren()) do
+		local door = room:FindFirstChild("Door")
+		local attach = door and door:FindFirstChild("KnockAttach")
+		local prompt = attach and attach:FindFirstChild("KnockPrompt")
+		local spot = room:FindFirstChild("KnockSpot")
+		if prompt and spot and room.Name:match("^Room%d+$") then
+			list[#list + 1] = {
+				model = room,
+				prompt = prompt,
+				spot = spot,
+				name = room.Name,
+				number = tonumber(room.Name:match("%d+")) or 0,
+			}
+		end
+	end
+	roomCache = list
+	return list
+end
+
+local function isKnocked(room)
+	return room.model:GetAttribute("Knocked") == true
+end
+
+local function isDND(room)
+	return room.prompt:GetAttribute("DND") == true
+end
+
+local function distanceTo(room)
+	return (room.spot.Position - getPos()).Magnitude
+end
+
+local function resolveFloorY()
+	if STATE.floorY then return STATE.floorY end
+	local list = rooms()
+	if #list == 0 then return nil end
+	local p = getPos()
+
+	local best, bestDy = nil, math.huge
+	for _, room in ipairs(list) do
+		local dy = math.abs(room.spot.Position.Y - p.Y)
+		if dy < bestDy then
+			best, bestDy = room.spot.Position.Y, dy
+		end
+	end
+	if best and bestDy <= 15 then
+		STATE.floorY = best
+		return best
+	end
+
+	local bx, bd = nil, math.huge
+	for _, room in ipairs(list) do
+		local d = (Vector3.new(room.spot.Position.X, 0, room.spot.Position.Z)
+			- Vector3.new(p.X, 0, p.Z)).Magnitude
+		if d < bd then bx, bd = room.spot.Position.Y, d end
+	end
+	STATE.floorY = bx
+	return bx
+end
+
+local function pickRoom()
+	local floorY = resolveFloorY()
+	if not floorY then return nil end
+
+	local list = {}
+	for _, room in ipairs(rooms()) do
+		if not isKnocked(room) and math.abs(room.spot.Position.Y - floorY) <= 6 then
+			list[#list + 1] = room
+		end
+	end
+
+	if #list == 0 then
+		for _, room in ipairs(rooms()) do
+			if not isKnocked(room) then list[#list + 1] = room end
+		end
+		if #list > 0 then
+			table.sort(list, function(a, b) return distanceTo(a) < distanceTo(b) end)
+			STATE.floorY = list[1].spot.Position.Y
+		end
+	end
+
+	if #list == 0 then return nil end
+
+	table.sort(list, function(a, b)
+		if CFG.preferDND and isDND(a) ~= isDND(b) then return isDND(a) end
+		return distanceTo(a) < distanceTo(b)
+	end)
+	return list[1]
+end
+
+--// match HUD ------------------------------------------------------------------
+local function cooldown()
+	local hud = PlayerGui:FindFirstChild("MatchHUD")
+	if not hud then return nil end
+	for _, d in ipairs(hud:GetDescendants()) do
+		if d:IsA("TextLabel") then
+			local n = d.Text:match("next knock in%s*([%d%.]+)")
+			if n then return tonumber(n) end
+		end
+	end
+	return nil
+end
+
+local function setStatus(text)
+	if not text or text == STATE.lastStatus then return end
+	STATE.lastStatus = text
+	if uiStatus then pcall(function() uiStatus:Set(text) end) end
+end
+
+--// escaping -------------------------------------------------------------------
+local function tryEscape()
+	if STATE.escaping then return end
+	local m = map()
+	local esc = m and m:FindFirstChild("Escape")
+	local zone = esc and esc:FindFirstChild("EscapeZone")
+	if not zone then
+		setStatus("exit open - escape zone was not found")
+		return
+	end
+
+	STATE.escaping = true
+	local ok, err = pcall(function()
+		setStatus("exit open - teleporting to the escape zone")
+		teleport(zone.Position + Vector3.new(0, 3, 0))
+		task.wait(1.6)
+	end)
+	STATE.escaping = false
+	if not ok then print("[SLIM] escape error: " .. tostring(err)) end
+end
+
+--// knocking -------------------------------------------------------------------
+local function firePrompt(prompt)
+	if not prompt or not prompt.Parent then return false end
+	if type(fireproximityprompt) == "function" then
+		local ok = pcall(fireproximityprompt, prompt)
+		if ok then return true end
+	end
+	local ok = pcall(function()
+		prompt:InputHoldBegin()
+		task.wait(prompt.HoldDuration or 0)
+		prompt:InputHoldEnd()
+	end)
+	return ok
+end
+
+--// lobby ----------------------------------------------------------------------
+local function queueRemote()
+	local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+	return remotes and remotes:FindFirstChild("QueueAction")
+end
+
+local function findQueueZone()
+	local lobby = Workspace:FindFirstChild("Lobby")
+	local elevators = lobby and lobby:FindFirstChild("Elevators")
+	if not elevators then return nil end
+	for _, model in ipairs(elevators:GetChildren()) do
+		local zone = model:FindFirstChild("QueueZone", true)
+		if zone and zone:IsA("BasePart") then return zone end
+	end
+	return nil
+end
+
+local function startMatch()
+	if not inLobby() then
+		setStatus("already in a match")
+		return
+	end
+	local remote = queueRemote()
+	if not remote then
+		setStatus("queue remote was not found")
+		return
+	end
+
+	local zone = findQueueZone()
+	if zone then
+		setStatus("stepping into the elevator...")
+		teleport(zone.Position + Vector3.new(0, 3, 0))
+		task.wait(0.5)
+	end
+
+	pcall(function() remote:FireServer("SetMode", CFG.mode) end)
+	task.wait(0.25)
+	pcall(function() remote:FireServer("SetDifficulty", CFG.difficulty) end)
+	task.wait(0.25)
+
+	local ok, err = pcall(function() remote:FireServer("Start") end)
+	if ok then
+		setStatus(string.format("queuing %s / %s...", CFG.mode, CFG.difficulty))
+	else
+		setStatus("queue failed: " .. tostring(err))
+	end
+end
+
+local function leaveQueue()
+	if not inLobby() then return end
+	local remote = queueRemote()
+	if remote then
+		pcall(function() remote:FireServer("Leave") end)
+		setStatus("left the queue")
+	end
+end
+
+local function runKnock(room)
+	if STATE.busy then return end
+	STATE.busy = true
+
+	local ok, err = pcall(function()
+		local before = done()
+		setStatus(string.format("knocking room %d", room.number))
+
+		teleport(room.spot.Position + Vector3.new(0, 3, 0))
+		task.wait(0.25)
+		firePrompt(room.prompt)
+		task.wait(0.45)
+
+		local after = done()
+		if after > before then
+			STATE.fail = 0
+			STATE.lastKnock = os.clock()
+			setStatus(string.format("door %d down  ·  %d/%d", room.number, after, needed()))
+			print(string.format("[SLIM] knocked room %d (%d/%d)", room.number, after, needed()))
+		else
+			STATE.fail += 1
+			setStatus(string.format("knock on room %d did not register", room.number))
+		end
+
+		if CFG.skyRetreat then
+			teleport(Vector3.new(0, CFG.safeY, 0))
+		else
+			task.wait(0.2)
+		end
+	end)
+
+	STATE.busy = false
+	if not ok then
+		STATE.fail += 1
+		print("[SLIM] knock error: " .. tostring(err))
+		if CFG.skyRetreat then teleport(Vector3.new(0, CFG.safeY, 0)) end
+	end
+end
+
+local function autoStep()
+	if not CFG.autoFarm then return end
+	if not info() then
+		setStatus("in the lobby  ·  press START MATCH to queue")
+		return
+	end
+
+	local state = matchState()
+	local d = done()
+	if STATE.lastDone and d < STATE.lastDone then
+		STATE.floorY = nil
+		STATE.voted = false
+		STATE.fail = 0
+		STATE.escaping = false
+	end
+	STATE.lastDone = d
+
+	if state == "Playing" then
+		if not isAlive() then
+			setStatus("caught - waiting for the round to end")
+			return
+		end
+
+		if exitOpen() then
+			if CFG.autoEscape then tryEscape() end
+			return
+		end
+
+		if STATE.busy then return end
+
+		local cd = cooldown()
+		if cd and cd > 0.1 then
+			setStatus(string.format("cooldown %.1fs  ·  %d/%d doors", cd, d, needed()))
+			if CFG.skyRetreat and getPos().Y < CFG.safeY - 20 then
+				teleport(Vector3.new(0, CFG.safeY, 0))
+			end
+			return
+		end
+
+		if STATE.fail >= 3 then
+			STATE.floorY = nil
+			STATE.fail = 0
+		end
+
+		local room = pickRoom()
+		if not room then
+			setStatus("no un-knocked rooms left on the map")
+			return
+		end
+		task.spawn(runKnock, room)
+		return
+	end
+
+	if state == "Ended" or matchResult() ~= "" then
+		local result = matchResult()
+		if result == "Win" then
+			setStatus(string.format("checked out  ·  %d doors  ·  $%s", d, stat("Cash")))
+		else
+			setStatus("round over  ·  " .. (result ~= "" and result or state))
+		end
+
+		if CFG.autoReplay and not STATE.voted then
+			STATE.voted = true
+			local remotes = ReplicatedStorage:FindFirstChild("MatchRemotes")
+			local remote = remotes and remotes:FindFirstChild("PlayAgainVote")
+			if remote then
+				pcall(function() remote:FireServer(true) end)
+				setStatus("voted play again  ·  the teleport will unload this panel")
+				print("[SLIM] play again vote sent")
+			end
+		end
+		return
+	end
+
+	setStatus("match state: " .. state)
+end
+
+--// body -----------------------------------------------------------------------
+local function applyBody()
+	local hum = getHum()
+	if not hum then return end
+	if not STATE.stock then
+		STATE.stock = {
+			walk = hum.WalkSpeed,
+			jumpPower = hum.JumpPower,
+			useJumpPower = hum.UseJumpPower,
+			jumpHeight = hum.JumpHeight,
+		}
+	end
+
+	hum.WalkSpeed = CFG.speed and CFG.speedVal or (STATE.stock.walk or STOCK_WALK)
+	if CFG.jump then
+		hum.UseJumpPower = true
+		hum.JumpPower = CFG.jumpVal
+	else
+		hum.UseJumpPower = STATE.stock.useJumpPower
+		hum.JumpPower = STATE.stock.jumpPower or STOCK_JUMP
+		hum.JumpHeight = STATE.stock.jumpHeight
+	end
+end
+
+local function destroyFlyBV()
+	if STATE.flyBV then
+		pcall(function() STATE.flyBV:Destroy() end)
+		STATE.flyBV = nil
+	end
+end
+
+local function ensureFlyBV()
+	if not CFG.fly then return end
+	local hrp = getHRP()
+	if not hrp then return end
+	if STATE.flyBV and STATE.flyBV.Parent == hrp then return end
+	destroyFlyBV()
+	local bv = Instance.new("BodyVelocity")
+	bv.Name = "SlimFly"
+	bv.MaxForce = Vector3.new(1e6, 1e6, 1e6)
+	bv.Velocity = Vector3.zero
+	bv.Parent = hrp
+	STATE.flyBV = bv
+end
+
+local function startFly()
+	if STATE.flyConn then return end
+	ensureFlyBV()
+	STATE.flyConn = RunService.RenderStepped:Connect(function(dt)
+		if not CFG.fly then return end
+		local hrp = getHRP()
+		local cam = Workspace.CurrentCamera
+		if not hrp or not cam then return end
+		ensureFlyBV()
+
+		local move = Vector3.zero
+		if UserInputService:IsKeyDown(Enum.KeyCode.W) then move += cam.CFrame.LookVector end
+		if UserInputService:IsKeyDown(Enum.KeyCode.S) then move -= cam.CFrame.LookVector end
+		if UserInputService:IsKeyDown(Enum.KeyCode.D) then move += cam.CFrame.RightVector end
+		if UserInputService:IsKeyDown(Enum.KeyCode.A) then move -= cam.CFrame.RightVector end
+		if UserInputService:IsKeyDown(Enum.KeyCode.Space) then move += Vector3.yAxis end
+		if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then move -= Vector3.yAxis end
+
+		if move.Magnitude > 0 then move = move.Unit end
+		if STATE.flyBV then
+			STATE.flyBV.Velocity = move * CFG.flySpeed
+		end
+	end)
+end
+
+local function stopFly()
+	if STATE.flyConn then
+		pcall(function() STATE.flyConn:Disconnect() end)
+		STATE.flyConn = nil
+	end
+	destroyFlyBV()
+end
+
+--// ESP ------------------------------------------------------------------------
+local HAS_DRAWING = type(Drawing) == "table" and type(Drawing.new) == "function"
+
+local function newGuestDraw()
+	if not HAS_DRAWING then return nil end
+	local box = Drawing.new("Square")
+	box.Thickness = 1.5
+	box.Filled = false
+
+	local label = Drawing.new("Text")
+	label.Size = 14
+	label.Center = true
+	label.Outline = true
+	label.OutlineColor = Color3.new(0, 0, 0)
+
+	local tracer = Drawing.new("Line")
+	tracer.Thickness = 1
+	tracer.Transparency = 0.65
+	return { box = box, label = label, tracer = tracer }
+end
+
+local function newRoomDraw()
+	if not HAS_DRAWING then return nil end
+	local label = Drawing.new("Text")
+	label.Size = 13
+	label.Center = true
+	label.Outline = true
+	label.OutlineColor = Color3.new(0, 0, 0)
+	return { label = label }
+end
+
+local function projectBox(model, cam)
+	local ok, cf, size = pcall(function()
+		local c, s = model:GetBoundingBox()
+		return c, s
+	end)
+	if not ok or not cf then return nil end
+	size = size * 0.5
+
+	local minX, minY = math.huge, math.huge
+	local maxX, maxY = -math.huge, -math.huge
+	local any = false
+
+	for _, sx in ipairs({ -1, 1 }) do
+		for _, sy in ipairs({ -1, 1 }) do
+			for _, sz in ipairs({ -1, 1 }) do
+				local world = cf * Vector3.new(size.X * sx, size.Y * sy, size.Z * sz)
+				local screen = cam:WorldToViewportPoint(world)
+				if screen.Z > 0 then
+					any = true
+					minX = math.min(minX, screen.X)
+					maxX = math.max(maxX, screen.X)
+					minY = math.min(minY, screen.Y)
+					maxY = math.max(maxY, screen.Y)
+				end
+			end
+		end
+	end
+
+	if not any then return nil end
+	return minX, minY, maxX, maxY
+end
+
+local function hideGuest(entry)
+	if entry.box then entry.box.Visible = false end
+	if entry.label then entry.label.Visible = false end
+	if entry.tracer then entry.tracer.Visible = false end
+end
+
+local function hideAll(tbl)
+	for _, entry in pairs(tbl) do
+		if entry.label then entry.label.Visible = false end
+		if entry.box then entry.box.Visible = false end
+		if entry.tracer then entry.tracer.Visible = false end
+	end
+end
+
+local function updateGuests(cam)
+	if not CFG.espGuests or not HAS_DRAWING then
+		hideAll(STATE.guestDraw)
+		return
+	end
+
+	local folder = guests()
+	local here = getPos()
+	local visible = {}
+
+	if folder then
+		for _, model in ipairs(folder:GetChildren()) do
+			local hum = model:FindFirstChildOfClass("Humanoid")
+			local root = model:FindFirstChild("HumanoidRootPart")
+			if hum and root and hum.Health > 0 then
+				local dist = (root.Position - here).Magnitude
+				if CFG.espDist <= 0 or dist <= CFG.espDist then
+					local entry = STATE.guestDraw[model]
+					if not entry then
+						entry = newGuestDraw()
+						STATE.guestDraw[model] = entry
+					end
+					if entry then
+						visible[model] = true
+
+						local name = hum.DisplayName
+						if not name or name == "" or name == "Humanoid" then
+							name = model.Name
+						end
+						local minX, minY, maxX, maxY = projectBox(model, cam)
+						local color = dist < 15 and Color3.fromRGB(255, 80, 70)
+							or dist < 35 and Color3.fromRGB(255, 170, 60)
+							or Color3.fromRGB(235, 235, 235)
+
+						if CFG.espBoxes and minX then
+							entry.box.Visible = true
+							entry.box.Color = color
+							entry.box.Position = Vector2.new(minX, minY)
+							entry.box.Size = Vector2.new(maxX - minX, maxY - minY)
+						else
+							entry.box.Visible = false
+						end
+
+						if CFG.espNames then
+							local pos2 = minX and Vector2.new((minX + maxX) / 2, minY - 16)
+								or Vector2.new(cam.ViewportSize.X / 2, cam.ViewportSize.Y / 2)
+							entry.label.Visible = true
+							entry.label.Color = color
+							entry.label.Text = string.format("%s  %dm", name, math.floor(dist))
+							entry.label.Position = pos2
+						else
+							entry.label.Visible = false
+						end
+
+						if CFG.espTracers and minX then
+							entry.tracer.Visible = true
+							entry.tracer.Color = color
+							entry.tracer.From = Vector2.new(cam.ViewportSize.X / 2, cam.ViewportSize.Y)
+							entry.tracer.To = Vector2.new((minX + maxX) / 2, maxY)
+						else
+							entry.tracer.Visible = false
+						end
+					end
+				end
+			end
+		end
+	end
+
+	for model, entry in pairs(STATE.guestDraw) do
+		if not visible[model] then hideGuest(entry) end
+	end
+end
+
+local function updateRooms(cam)
+	if not CFG.espRooms or not HAS_DRAWING then
+		hideAll(STATE.roomDraw)
+		return
+	end
+
+	local floorY = resolveFloorY()
+	if not floorY then
+		hideAll(STATE.roomDraw)
+		return
+	end
+
+	local here = getPos()
+	local visible = {}
+	for _, room in ipairs(rooms()) do
+		local knocked = isKnocked(room)
+		if (not knocked or CFG.espKnocked) and math.abs(room.spot.Position.Y - floorY) <= 6 then
+			local dist = (room.spot.Position - here).Magnitude
+			if CFG.espDist <= 0 or dist <= CFG.espDist then
+				local screen = cam:WorldToViewportPoint(room.spot.Position + Vector3.new(0, 5.5, 0))
+				if screen.Z > 0 then
+					local entry = STATE.roomDraw[room.model]
+					if not entry then
+						entry = newRoomDraw()
+						STATE.roomDraw[room.model] = entry
+					end
+					if entry then
+						visible[room.model] = true
+						entry.label.Visible = true
+						local dnd = isDND(room)
+						local suffix = knocked and "  ✓" or (dnd and "  !" or "")
+						entry.label.Text = tostring(room.number) .. suffix
+						entry.label.Color = knocked and Color3.fromRGB(90, 200, 120)
+							or dnd and Color3.fromRGB(255, 200, 70)
+							or Color3.fromRGB(240, 240, 240)
+						entry.label.Position = Vector2.new(screen.X, screen.Y)
+					end
+				end
+			end
+		end
+	end
+
+	for model, entry in pairs(STATE.roomDraw) do
+		if not visible[model] then entry.label.Visible = false end
+	end
+end
+
+local function updateExit(cam)
+	if not CFG.espExit or not HAS_DRAWING then
+		if STATE.exitDraw then STATE.exitDraw.Visible = false end
+		return
+	end
+
+	local m = map()
+	local esc = m and m:FindFirstChild("Escape")
+	local zone = esc and esc:FindFirstChild("EscapeZone")
+	if not zone then
+		if STATE.exitDraw then STATE.exitDraw.Visible = false end
+		return
+	end
+
+	if not STATE.exitDraw then
+		local label = Drawing.new("Text")
+		label.Size = 15
+		label.Center = true
+		label.Outline = true
+		label.OutlineColor = Color3.new(0, 0, 0)
+		STATE.exitDraw = label
+	end
+
+	local screen = cam:WorldToViewportPoint(zone.Position + Vector3.new(0, 8, 0))
+	local open = exitOpen()
+	STATE.exitDraw.Visible = screen.Z > 0
+	STATE.exitDraw.Text = open and "EXIT OPEN" or "EXIT"
+	STATE.exitDraw.Color = open and Color3.fromRGB(80, 255, 140) or Color3.fromRGB(255, 90, 80)
+	STATE.exitDraw.Position = Vector2.new(screen.X, screen.Y)
+end
+
+local function clearDrawings()
+	local function drop(entry)
+		for _, key in ipairs({ "box", "label", "tracer" }) do
+			local obj = entry[key]
+			if obj then pcall(function() obj:Remove() end) end
+		end
+	end
+	for _, entry in pairs(STATE.guestDraw) do drop(entry) end
+	for _, entry in pairs(STATE.roomDraw) do drop(entry) end
+	if STATE.exitDraw then pcall(function() STATE.exitDraw:Remove() end) end
+	STATE.guestDraw = {}
+	STATE.roomDraw = {}
+	STATE.exitDraw = nil
+end
+
+--// UI -------------------------------------------------------------------------
+local function setToggle(name, value)
+	local obj = ui[name]
+	if obj then pcall(function() obj:Set(value) end) end
+end
+
+local TOGGLE_NAMES = {
+	"autoFarm", "autoEscape", "autoReplay", "skyRetreat", "preferDND",
+	"espGuests", "espRooms", "espExit", "espNames", "espBoxes", "espTracers", "espKnocked",
+	"speed", "jump", "fly", "antiAfk",
+}
+
+local function panic()
+	CFG.autoFarm = false
+	CFG.autoEscape = false
+	CFG.autoReplay = false
+	CFG.espGuests = false
+	CFG.espRooms = false
+	CFG.espExit = false
+	CFG.speed = false
+	CFG.jump = false
+	CFG.fly = false
+
+	for _, name in ipairs(TOGGLE_NAMES) do setToggle(name, false) end
+	stopFly()
+	applyBody()
+	clearDrawings()
+	setStatus("panic  ·  everything off")
+	print("[SLIM] panic: farm/esp/body off")
+end
+
+local function shutdown()
+	CFG.autoFarm = false
+	CFG.espGuests = false
+	CFG.espRooms = false
+	CFG.espExit = false
+	CFG.speed = false
+	CFG.jump = false
+	CFG.fly = false
+
+	stopFly()
+	applyBody()
+	clearDrawings()
+
+	for _, conn in ipairs(STATE.connections) do
+		pcall(function() conn:Disconnect() end)
+	end
+	STATE.connections = {}
+
+	if window then
+		pcall(function() window:Unload() end)
+		window = nil
+	end
+	if _G.SlimDitch and _G.SlimDitch.shutdown == shutdown then
+		_G.SlimDitch = nil
+	end
+	print("[SLIM] unloaded")
+end
+
+local function buildUI()
+	local Rayfield
+	local okLoad, errLoad = pcall(function()
+		Rayfield = loadstring(game:HttpGet("https://sirius.menu/gen2"))()
+	end)
+	if not okLoad or not Rayfield then
+		warn("[SLIM] Rayfield failed to load: " .. tostring(errLoad))
+		return
+	end
+
+	local ok, err = pcall(function()
+		local w = Rayfield:CreateWindow({
+			name = "THE DITCH HOTEL",
+			subtitle = "SLIM · auto knock",
+			sidebarLayout = true,
+		})
+		window = w
+
+		-- FARM ---------------------------------------------------------------
+		local farm = w:CreateTab({ name = "FARM" })
+
+		farm:CreateSection({ name = "AUTO FARM" })
+		ui.autoFarm = farm:CreateToggle({
+			name = "auto farm",
+			description = "knock every un-knocked room, wait out the 8s cooldown above the map, then escape",
+			value = CFG.autoFarm,
+			callback = function(v)
+				CFG.autoFarm = v
+				if v then
+					STATE.voted = false
+					setStatus("auto farm armed")
+					print("[SLIM] auto farm armed")
+				else
+					setStatus("auto farm off")
+					print("[SLIM] auto farm off")
+				end
+			end,
+		})
+		ui.autoEscape = farm:CreateToggle({
+			name = "auto escape",
+			description = "teleport to the escape zone when the exit opens",
+			value = CFG.autoEscape,
+			callback = function(v) CFG.autoEscape = v end,
+		})
+		ui.autoReplay = farm:CreateToggle({
+			name = "auto replay",
+			description = "vote play again on the end screen; the requeue unloads this panel",
+			value = CFG.autoReplay,
+			callback = function(v) CFG.autoReplay = v end,
+		})
+		ui.skyRetreat = farm:CreateToggle({
+			name = "sky retreat",
+			description = "fly above the hotel between knocks so guests cannot reach you",
+			value = CFG.skyRetreat,
+			callback = function(v) CFG.skyRetreat = v end,
+		})
+		ui.preferDND = farm:CreateToggle({
+			name = "prefer DND doors",
+			description = "DND doors pay double, but wake more guests",
+			value = CFG.preferDND,
+			callback = function(v) CFG.preferDND = v end,
+		})
+		farm:CreateSlider({
+			name = "safe height",
+			description = "how high above the map the farm waits",
+			range = { 120, 400 },
+			increment = 10,
+			value = CFG.safeY,
+			suffix = " st",
+			callback = function(v) CFG.safeY = v end,
+		})
+
+		uiInfo = farm:CreateText({ name = "match", text = "waiting for a match..." })
+		uiStatus = farm:CreateText({ name = "status", text = "idle" })
+		farm:CreateText({
+			name = "note",
+			text = "the round ends back in the lobby, which unloads this panel. use auto-exec or re-run after each round.",
+		})
+
+		farm:CreateSection({ name = "MANUAL" })
+		farm:CreateButton({
+			name = "start a match (lobby)",
+			callback = startMatch,
+		})
+		farm:CreateButton({
+			name = "leave the queue (lobby)",
+			callback = leaveQueue,
+		})
+		farm:CreateText({
+			name = "queue",
+			text = "start uses " .. CFG.mode .. " / " .. CFG.difficulty .. ", from the first elevator queue zone.",
+		})
+		farm:CreateButton({
+			name = "knock the next door",
+			callback = function()
+				local room = pickRoom()
+				if room then task.spawn(runKnock, room) end
+			end,
+		})
+		farm:CreateButton({
+			name = "rescan my floor",
+			callback = function()
+				STATE.floorY = nil
+				setStatus("floor rescanned")
+			end,
+		})
+		farm:CreateButton({
+			name = "go to the exit",
+			callback = function()
+				task.spawn(tryEscape)
+			end,
+		})
+		farm:CreateButton({
+			name = "vote play again",
+			callback = function()
+				local remotes = ReplicatedStorage:FindFirstChild("MatchRemotes")
+				local remote = remotes and remotes:FindFirstChild("PlayAgainVote")
+				if remote then
+					pcall(function() remote:FireServer(true) end)
+					setStatus("play again vote sent")
+				end
+			end,
+		})
+
+		-- ESP ----------------------------------------------------------------
+		local esp = w:CreateTab({ name = "ESP" })
+
+		esp:CreateSection({ name = "MARKERS" })
+		ui.espGuests = esp:CreateToggle({
+			name = "guests",
+			description = "box every guest with a name and distance",
+			value = CFG.espGuests,
+			callback = function(v) CFG.espGuests = v end,
+		})
+		ui.espRooms = esp:CreateToggle({
+			name = "rooms",
+			description = "number every door on the current floor",
+			value = CFG.espRooms,
+			callback = function(v) CFG.espRooms = v end,
+		})
+		ui.espExit = esp:CreateToggle({
+			name = "exit",
+			value = CFG.espExit,
+			callback = function(v) CFG.espExit = v end,
+		})
+		ui.espKnocked = esp:CreateToggle({
+			name = "show knocked rooms",
+			description = "green ticks on doors that are already done",
+			value = CFG.espKnocked,
+			callback = function(v) CFG.espKnocked = v end,
+		})
+		ui.followFloor = esp:CreateToggle({
+			name = "follow my floor",
+			description = "move the room markers when you change floors",
+			value = CFG.followFloor,
+			callback = function(v) CFG.followFloor = v end,
+		})
+		esp:CreateSlider({
+			name = "ESP range",
+			description = "0 = the whole map",
+			range = { 0, 500 },
+			increment = 10,
+			value = CFG.espDist,
+			suffix = " st",
+			callback = function(v) CFG.espDist = v end,
+		})
+
+		esp:CreateSection({ name = "STYLE" })
+		ui.espNames = esp:CreateToggle({
+			name = "names + distance",
+			value = CFG.espNames,
+			callback = function(v) CFG.espNames = v end,
+		})
+		ui.espBoxes = esp:CreateToggle({
+			name = "boxes",
+			value = CFG.espBoxes,
+			callback = function(v) CFG.espBoxes = v end,
+		})
+		ui.espTracers = esp:CreateToggle({
+			name = "tracers",
+			value = CFG.espTracers,
+			callback = function(v) CFG.espTracers = v end,
+		})
+		uiEspInfo = esp:CreateText({ name = "scan", text = "scanning..." })
+
+		-- MOVE ---------------------------------------------------------------
+		local move = w:CreateTab({ name = "MOVE" })
+
+		move:CreateSection({ name = "MOVEMENT" })
+		ui.speed = move:CreateToggle({
+			name = "walk speed",
+			value = CFG.speed,
+			callback = function(v)
+				CFG.speed = v
+				applyBody()
+			end,
+		})
+		move:CreateSlider({
+			name = "speed",
+			range = { 16, 100 },
+			increment = 1,
+			value = CFG.speedVal,
+			suffix = " st/s",
+			callback = function(v)
+				CFG.speedVal = v
+				applyBody()
+			end,
+		})
+		ui.jump = move:CreateToggle({
+			name = "jump power",
+			value = CFG.jump,
+			callback = function(v)
+				CFG.jump = v
+				applyBody()
+			end,
+		})
+		move:CreateSlider({
+			name = "jump",
+			range = { 50, 200 },
+			increment = 5,
+			value = CFG.jumpVal,
+			callback = function(v)
+				CFG.jumpVal = v
+				applyBody()
+			end,
+		})
+		ui.fly = move:CreateToggle({
+			name = "fly",
+			description = "WASD + space / left ctrl",
+			value = CFG.fly,
+			callback = function(v)
+				CFG.fly = v
+				if v then
+					ensureFlyBV()
+					startFly()
+				else
+					stopFly()
+				end
+			end,
+		})
+		move:CreateSlider({
+			name = "fly speed",
+			range = { 20, 200 },
+			increment = 5,
+			value = CFG.flySpeed,
+			suffix = " st/s",
+			callback = function(v) CFG.flySpeed = v end,
+		})
+		move:CreateButton({
+			name = "reset the body",
+			callback = function()
+				CFG.speed = false
+				CFG.jump = false
+				CFG.fly = false
+				setToggle("speed", false)
+				setToggle("jump", false)
+				setToggle("fly", false)
+				stopFly()
+				applyBody()
+				setStatus("body restored")
+			end,
+		})
+
+		-- SYSTEM -------------------------------------------------------------
+		local sys = w:CreateTab({ name = "SYSTEM" })
+
+		sys:CreateSection({ name = "SESSION" })
+		ui.antiAfk = sys:CreateToggle({
+			name = "anti-AFK",
+			value = CFG.antiAfk,
+			callback = function(v) CFG.antiAfk = v end,
+		})
+		sys:CreateButton({
+			name = "panic (everything off)",
+			callback = panic,
+		})
+		sys:CreateButton({
+			name = "back to lobby (end screen)",
+			callback = function()
+				if matchState() == "Playing" then
+					setStatus("finish the round or get caught before leaving")
+					return
+				end
+				local remotes = ReplicatedStorage:FindFirstChild("MatchRemotes")
+				local remote = remotes and remotes:FindFirstChild("BackToLobby")
+				if remote then
+					pcall(function() remote:FireServer() end)
+					setStatus("returning to the lobby...")
+				end
+			end,
+		})
+		sys:CreateButton({
+			name = "unload the panel",
+			callback = shutdown,
+		})
+		sys:CreateText({
+			name = "build",
+			text = "The Ditch Hotel  ·  match 92551591080135  ·  lobby 83379330867218  ·  client-side only",
+		})
+	end)
+
+	if not ok then
+		warn("[SLIM] panel build failed: " .. tostring(err))
+	end
+end
+
+--// main -----------------------------------------------------------------------
+local prior = _G.SlimDitch
+if type(prior) == "table" and type(prior.shutdown) == "function" then
+	pcall(prior.shutdown)
+end
+
+buildUI()
+
+-- ESP and info loops
+local espAcc = 0
+local rconn = RunService.RenderStepped:Connect(function(dt)
+	espAcc += dt
+	if espAcc < 0.1 then return end
+	espAcc = 0
+
+	local cam = Workspace.CurrentCamera
+	if not cam then return end
+	if not (CFG.espGuests or CFG.espRooms or CFG.espExit) then
+		hideAll(STATE.guestDraw)
+		hideAll(STATE.roomDraw)
+		if STATE.exitDraw then STATE.exitDraw.Visible = false end
+		return
+	end
+	updateGuests(cam)
+	updateRooms(cam)
+	updateExit(cam)
+end)
+table.insert(STATE.connections, rconn)
+
+local acc = { auto = 0, info = 0, body = 0 }
+local hconn = RunService.Heartbeat:Connect(function(dt)
+	acc.auto += dt
+	if acc.auto >= 0.3 then
+		acc.auto = 0
+		if CFG.autoFarm then
+			local ok, err = pcall(autoStep)
+			if not ok then print("[SLIM] farm error: " .. tostring(err)) end
+		end
+	end
+
+	acc.info += dt
+	if acc.info >= 0.5 then
+		acc.info = 0
+
+		if CFG.followFloor then
+			local p = getPos()
+			if p.Y > 40 and p.Y < 170 then
+				local best, bestDy = nil, math.huge
+				for _, room in ipairs(rooms()) do
+					local dy = math.abs(room.spot.Position.Y - p.Y)
+					if dy < bestDy then best, bestDy = room.spot.Position.Y, dy end
+				end
+				if best and bestDy <= 8 and (not STATE.floorY or math.abs(best - STATE.floorY) > 6) then
+					STATE.floorY = best
+				end
+			end
+		end
+
+		if uiInfo then
+			local text
+			if inLobby() then
+				text = "in the lobby  ·  press START MATCH to queue"
+			else
+				local d = done()
+				local n = needed()
+				local cd = cooldown()
+				text = string.format(
+					"%s%s  ·  doors %d/%d  ·  cash %s  ·  guests %d\nfloor %s  ·  cooldown %s  ·  exit %s",
+					matchState(),
+					matchResult() ~= "" and (" / " .. matchResult()) or "",
+					d,
+					n,
+					stat("Cash"),
+					guestCount(),
+					STATE.floorY and tostring(math.floor(STATE.floorY)) or "--",
+					cd and string.format("%.1fs", cd) or "--",
+					exitOpen() and "open" or "closed"
+				)
+			end
+			if text ~= STATE.lastInfo then
+				STATE.lastInfo = text
+				pcall(function() uiInfo:Set(text) end)
+			end
+		end
+		if uiEspInfo then
+			local espText
+			if inLobby() then
+				espText = "in the lobby"
+			else
+				local left = 0
+				for _, r in ipairs(rooms()) do
+					if not isKnocked(r) then left += 1 end
+				end
+				espText = string.format("guests %d  ·  rooms left %d", guestCount(), left)
+			end
+			pcall(function() uiEspInfo:Set(espText) end)
+		end
+	end
+
+	acc.body += dt
+	if acc.body >= 0.5 then
+		acc.body = 0
+		if CFG.speed or CFG.jump then applyBody() end
+		if CFG.fly then ensureFlyBV() end
+	end
+end)
+table.insert(STATE.connections, hconn)
+
+-- character respawns
+local chconn = LocalPlayer.CharacterAdded:Connect(function()
+	STATE.stock = nil
+	STATE.busy = false
+	STATE.escaping = false
+	task.wait(0.8)
+	applyBody()
+	if CFG.fly then
+		ensureFlyBV()
+		startFly()
+	end
+end)
+table.insert(STATE.connections, chconn)
+
+-- anti-AFK
+local okVu, vu = pcall(function() return game:GetService("VirtualUser") end)
+if okVu and vu then
+	local iconn = LocalPlayer.Idled:Connect(function()
+		if not CFG.antiAfk then return end
+		pcall(function()
+			vu:CaptureController()
+			vu:ClickButton2(Vector2.new())
+		end)
+	end)
+	table.insert(STATE.connections, iconn)
+end
+
+_G.SlimDitch = {
+	cfg = CFG,
+	state = STATE,
+	ui = ui,
+	shutdown = shutdown,
+	panic = panic,
+	autoStep = function() task.spawn(autoStep) end,
+	startMatch = startMatch,
+	leaveQueue = leaveQueue,
+	knockNext = function()
+		local room = pickRoom()
+		if room then task.spawn(runKnock, room) end
+	end,
+	escape = function() task.spawn(tryEscape) end,
+	refresh = function()
+		STATE.lastInfo = ""
+	end,
+}
+
+print("[SLIM] The Ditch Hotel panel loaded")
 end
 
 --// dispatch -------------------------------------------------------------------
