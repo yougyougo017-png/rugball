@@ -8,7 +8,7 @@
 	place map
 		81469298413354   Rugball                  football
 		77844202849858   Rugball (place v2)       football
-		80119315919763   Throw A Football (Drive Duels)  qb aimbot
+		80119315919763   Drive Duels             qb_aimbot
 		124617195142196  Build An Anime Character anime
 		126424052816775  NBA: Heroes              nba, then swish
 		122283827051026  NBA: Heroes (place v144) nba
@@ -31,10 +31,10 @@
 		92551591080135   The Ditch Hotel (match)  ditch_hotel
 		83379330867218   The Ditch Hotel (lobby)  ditch_hotel
 
-	the taf bypass suite is standalone now. Throw A Football's Drive Duels and 7s
-	modes both run qb_aimbot, which carries the same MoveGuard/AnimGuard layers,
-	so loading taf_bypass there would install the same hooks twice. The football
-	panel is still used by the Rugball places.
+	the taf bypass suite is standalone now. Drive Duels and Throw A Football 7s both
+	run qb_aimbot, which carries the same MoveGuard/AnimGuard layers, so loading
+	taf_bypass there would install the same hooks twice. The football panel is
+	still used by the Rugball places.
 
 	every suite keeps its own replace-not-stack teardown, its own _G key and
 	its own Rayfield window, so suites sharing a place (nba + swish on
@@ -51,7 +51,7 @@ local Hub = {}
 Hub.ORDER = {
 	{ place = 81469298413354,  label = "RUGBALL",          suites = { "football" } },
 	{ place = 77844202849858,  label = "RUGBALL V2",       suites = { "football" } },
-	{ place = 80119315919763, label = "THROW A FOOTBALL DRIVE DUELS", suites = { "qb_aimbot" } },
+	{ place = 80119315919763, label = "DRIVE DUELS", suites = { "qb_aimbot" } },
 	{ place = 124617195142196, label = "BUILD AN ANIME",   suites = { "anime" } },
 	{ place = 126424052816775, label = "NBA HEROES",       suites = { "nba", "swish" } },
 	{ place = 122283827051026, label = "NBA HEROES V144",  suites = { "nba" } },
@@ -81,9 +81,10 @@ for _, g in ipairs(Hub.ORDER) do
 end
 
 -- fallback by universe id: an unwired sub-place of a known experience runs the
--- same suite chain. exact place ids above always win, so modes with their own
--- mapping (Drive Duels) keep it. Throw A Football / Albie's Arcade is
--- universe 10768235926; place 87966800745299 ("7s") is its live match place.
+-- same suite chain. exact place ids above always win, so games with their own
+-- mapping keep it. Throw A Football / Albie's Arcade is universe 10768235926;
+-- place 87966800745299 ("7s") is its live match place, while 80119315919763 is
+-- the separate Drive Duels experience.
 Hub.UNIVERSE = {
 	[10768235926] = { "qb_aimbot" },
 	[10774293033] = { "superhero" },
@@ -9477,7 +9478,7 @@ end
 --// embedded suite: qb_aimbot  (from qb_aimbot.luau) =========================
 Hub.SUITE.qb_aimbot = function()
 --[[
-	QB AIMBOT -- Throw A Football (place 125942529011157)
+	QB AIMBOT -- Throw A Football / Drive Duels (125942529011157 / 80119315919763)
 	Rayfield Gen2 | replace-not-stack via _G.SlimQbAim
 
 	how a throw actually works in this game
@@ -9542,8 +9543,16 @@ Hub.SUITE.qb_aimbot = function()
 	sprint, autoSprint.
 --]]
 
-if game.PlaceId ~= 125942529011157 then
-	warn("[QBAIM] this suite is built for Throw A Football (125942529011157); running on " .. tostring(game.PlaceId))
+local PLACE_INFO = {
+	[125942529011157] = { tag = "TAF", name = "THROW A FOOTBALL" },
+	[87966800745299] = { tag = "TAF 7S", name = "THROW A FOOTBALL 7S" },
+	[80119315919763] = { tag = "DRIVE DUELS", name = "DRIVE DUELS" },
+}
+
+local GAME = PLACE_INFO[game.PlaceId]
+if not GAME then
+	warn("[QBAIM] this suite targets Throw A Football / Drive Duels; running on " .. tostring(game.PlaceId))
+	GAME = PLACE_INFO[125942529011157]
 end
 
 local prev = _G.SlimQbAim
@@ -9636,6 +9645,13 @@ for key, value in pairs(DEFAULTS) do
 end
 
 local CFG_FILE = "slimhub-qbaim.cfg"
+local panicked = false
+
+local function removeCfg()
+	if delfile then
+		pcall(delfile, CFG_FILE)
+	end
+end
 
 local function loadCfg()
 	if not (isfile and readfile and isfile(CFG_FILE)) then return end
@@ -9656,6 +9672,12 @@ local function loadCfg()
 end
 
 local function saveCfg()
+	-- panic is a kill switch, not a saved preference set. keep the next load
+	-- at the suite defaults instead of restoring the all-off panic state.
+	if panicked then
+		removeCfg()
+		return
+	end
 	if not writefile then return end
 	local keys = {}
 	for k in pairs(CFG) do
@@ -9724,7 +9746,7 @@ local LOCK_COLOR = Color3.fromRGB(255, 221, 35)
 local dead = false
 local inputConn = nil
 local ui = { flags = {}, window = nil, status = nil, acState = nil, acCover = nil, acCounters = nil, acLogText = nil, farm = nil, lockDrop = nil, lockText = nil }
-local hooks = { launch = false, snap = false, powerSaved = false, rankSaved = false }
+local hooks = { launch = false, launchOrig = nil, launchWrapper = nil, snap = false, powerSaved = false, rankSaved = false }
 local stats = { throws = 0, aimed = 0, auto = 0, plays = 0, rebirths = 0, lastSpeed = 0, missed = 0 }
 local pick = nil
 local targetList = {}
@@ -10796,9 +10818,13 @@ local function autoFarmStep(now)
 			if mode ~= "Game" and now >= playAt and not playPending then
 				playAt = now + math.max(2, tonumber(CFG.playDelay) or 4)
 				local ok, can, reason = pcall(mc.CanStart, mc)
-				if ok and can then
+				if not ok then
+					-- Drive Duels' ModeController has no CanStart; StartGame
+					-- validates the state itself and returns a reason.
 					startMatch()
-				elseif ok then
+				elseif can then
+					startMatch()
+				else
 					statusLine = "auto play: " .. tostring(reason)
 				end
 			end
@@ -12013,7 +12039,10 @@ end
 --// hooks ---------------------------------------------------------------------
 
 local function installLaunch()
-	if hooks.launch or type(BC.Launch) ~= "function" then
+	if type(BC.Launch) ~= "function" then
+		return
+	end
+	if hooks.launch and BC.Launch == hooks.launchWrapper then
 		return
 	end
 	local orig = BC.Launch
@@ -12050,6 +12079,7 @@ local function installLaunch()
 	if ok and BC.Launch == wrapper then
 		hooks.launch = true
 		hooks.launchOrig = orig
+		hooks.launchWrapper = wrapper
 	else
 		warn("[QBAIM] could not hook BallController.Launch")
 	end
@@ -12119,10 +12149,15 @@ local function applyPower()
 end
 
 local function restoreAll()
-	if hooks.launch and hooks.launchOrig then
-		BC.Launch = hooks.launchOrig
+	if hooks.launch then
+		-- only put the original back if the game has not already replaced the
+		-- slot itself; otherwise we would clobber a newer game function.
+		if BC.Launch == hooks.launchWrapper then
+			BC.Launch = hooks.launchOrig
+		end
 		hooks.launch = false
 		hooks.launchOrig = nil
+		hooks.launchWrapper = nil
 	end
 	removeSnap()
 	restoreAssist()
@@ -12139,6 +12174,7 @@ end
 local function setEnabled(v)
 	CFG.enabled = v
 	if v then
+		panicked = false
 		installLaunch()
 		if CFG.snap then
 			installSnap()
@@ -12303,8 +12339,8 @@ local function buildUI()
 	end
 
 	local w = Rayfield:CreateWindow({
-		Name = "TAF // QB AIMBOT",
-		LoadingTitle = "THROW A FOOTBALL",
+		Name = GAME.tag .. " // QB AIMBOT",
+		LoadingTitle = GAME.name,
 		LoadingSubtitle = "qb aimbot  -  perfect ballistics",
 		KeySystem = false,
 	})
@@ -13436,7 +13472,27 @@ setEnabled(CFG.enabled)
 ac.installBypass()
 ac.applyBypassAll()
 
+-- Rayfield can replay its cached flag values one frame after the window is
+-- built, which fires the master callback and turns the suite back off. correct
+-- it twice after boot so the suite's own cfg is the source of truth.
+local function restoreBootCfg()
+	for k, v in pairs(bootCfg) do
+		CFG[k] = v
+	end
+	syncUi()
+	setEnabled(CFG.enabled)
+	saveCfg()
+end
+
+task.spawn(function()
+	task.wait(0.2)
+	if not dead then restoreBootCfg() end
+	task.wait(0.8)
+	if not dead then restoreBootCfg() end
+end)
+
 local function panic()
+	panicked = true
 	CFG.enabled = false
 	CFG.autoThrow = false
 	CFG.autoPlay = false
@@ -13610,6 +13666,8 @@ end)
 
 --// loop ----------------------------------------------------------------------
 
+local lastEnsure = 0
+
 RunService:BindToRenderStep(TAG, Enum.RenderPriority.Camera.Value + 2, function()
 	if dead then
 		return
@@ -13620,6 +13678,20 @@ RunService:BindToRenderStep(TAG, Enum.RenderPriority.Camera.Value + 2, function(
 		build(now)
 	end
 	if CFG.enabled then
+		-- Drive Duels loads its controllers after this suite, so the boot-time
+		-- Launch hook can silently miss. re-check once a second and reinstall
+		-- anything the game replaced or that was not ready at boot.
+		if now - lastEnsure >= 1 then
+			lastEnsure = now
+			-- installLaunch is a no-op while our wrapper still occupies the
+			-- slot, and re-hooks if the game swapped in a fresh function.
+			installLaunch()
+			if CFG.snap and not hooks.snap then
+				installSnap()
+				widenAssist()
+			end
+			applyPower()
+		end
 		drawVisuals()
 		drawRealEsp()
 		drawArc()
@@ -13663,7 +13735,11 @@ RunService:BindToRenderStep(TAG, Enum.RenderPriority.Camera.Value + 2, function(
 	end
 end)
 
-print("[QBAIM] loaded - RightShift on/off | F cycle | G auto | H visuals | T auto throw | E throw | P panic")
+if CFG.enabled then
+	print("[QBAIM] loaded - RightShift on/off | F cycle | G auto | H visuals | T auto throw | E throw | P panic")
+else
+	print("[QBAIM] loaded with master OFF (saved config) - press RightShift to enable")
+end
 end
 
 --// embedded suite: taf_bypass  (from taf_bypass.luau) =========================
