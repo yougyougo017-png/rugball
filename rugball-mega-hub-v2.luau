@@ -7715,24 +7715,31 @@ end
 --// embedded suite: duels  (from duels.luau) =========================
 Hub.SUITE.duels = function()
 --[[
-	BASKETBALL DUELS -- one-file script for the game you're in right now
+	BASKETBALL DUELS -- SLIM one-file panel
+	place 134954408729617 | universe 10773229738
 
-	place: 134954408729617  universe: 10773229738
+	PERFECT SHOT (the point of this build)
+	  Every release you send is rewritten to the exact centre of the game's
+	  green window: held = FE * gather.fill. Works for every finish type and
+	  every distance, including full-court heaves. The client sim's 36 ft cap
+	  is lifted while the feature is on, and the outgoing DuelIn payload gets
+	  a green judge so online shots past 36 ft still grade GREEN.
 
-	what's in it:
-	  ESP            highlight + nameplate on every rig in the match (or lobby players)
-	  perfect shot   forces the ShotRelease hold time into the green window
-	  auto-green     calls the game's own shoot release when the HUD meter enters green
-	  auto steal / smart steal / block / cross  press the game's own verbs with hand-reach timing
-	  auto guard     stand between the ball handler and the hoop
-	  court vision   hoop marker + live court distance chart
-	  speed / jump  lobby movement patches (the sim itself is server-authoritative)
-	  panic key      P: kill every toggle and put your body back to stock
-	  session stats  counters in _G.SlimDuelsStats
+	  Local / CPU matches are graded by the client's ISO sim, so the sim step
+	  hook is the authoritative one. Online matches are graded by the server,
+	  so the same green hold time is written into DuelIn:Fire as well.
 
-	everything is client-side, everything has a toggle, the window is one
-	Rayfield Gen2 panel and the whole thing tears itself down clean.
---]]
+	ALSO
+	  ESP, hoop marker, live shot chart, auto-green release, auto steal /
+	  block / cross / guard, lobby speed + jump, panic key, clean unload.
+	  STYLES tab: reads the real Iso.Styles.LIST catalog and lists every style.
+	  Styles already rolled into one of your slots equip through the game's own
+	  Profile.call("equip", slot). Any other style gets a local preview on the
+	  client profile + Style attribute; restore (or unload) puts your real style
+	  back. "unlock all" is client-side only; the server still owns inventory.
+
+	P = panic (kills every toggle and restores your body)
+]]
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -7743,51 +7750,99 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local LocalPlayer = Players.LocalPlayer
 local STOCK_WALK = 16
 local STOCK_JUMP = 7.2
+local STOCK_RANGE = 36
+local LONG_RANGE = 200
 
 local CFG = {
 	esp = true,
 	espNames = true,
-	espDist = 0, -- 0 = show everyone
+	espDist = 0,
 	rimEsp = true,
 	shotChart = true,
-	perfectShot = true, -- rewrite the release payload to the green point
-	autoGreen = false, -- release as soon as the HUD meter hits green
+
+	perfectShot = true,
+	fullCourt = true, -- attach the green judge to online shots past 36 ft
+	autoGreen = false,
+
 	autoSteal = false,
-	smartSteal = false,
 	autoBlock = false,
 	autoCross = false,
 	autoGuard = false,
+
 	speed = false,
 	speedVal = 26,
 	jump = false,
 	jumpVal = 18,
+
 	stealDist = 6.4,
 	blockDist = 8.6,
 	crossDist = 4.6,
-	guardDist = 2.4,
+	guardDist = 3.2,
 }
 CFG.speedVal = math.clamp(CFG.speedVal, 5, 60)
 CFG.jumpVal = math.clamp(CFG.jumpVal, 0, 50)
 
-local stats = _G.SlimDuelsStats or {}
-_G.SlimDuelsStats = stats
-local guardActive = false
-local guardMX, guardMY = 0, 0
-local stealNavActive = false
-local stealMX, stealMY = 0, 0
-stats.greenWrites = stats.greenWrites or 0
-stats.autoReleases = stats.autoReleases or 0
-stats.steals = stats.steals or 0
-stats.smartSteals = stats.smartSteals or 0
-stats.blocks = stats.blocks or 0
-stats.crosses = stats.crosses or 0
+local stats = {
+	greenWrites = 0,
+	autoReleases = 0,
+	steals = 0,
+	blocks = 0,
+	crosses = 0,
+	shots = 0,
+	greens = 0,
+	styleEquips = 0,
+	lastGrade = nil,
+	lastM = nil,
+	lastFin = nil,
+	lastDist = nil,
+	lastGradeDist = nil,
+	lastHeld = nil,
+}
 
+--// shared modules ---------------------------------------------------------------
+local Iso = ReplicatedStorage:WaitForChild("Iso", 8)
+local Config, Sim, Court, Input, Core
+
+local function tryRequire(name)
+	if not Iso then return nil end
+	local mod = Iso:FindFirstChild(name)
+	if not mod then return nil end
+	local ok, res = pcall(require, mod)
+	if ok then return res end
+	warn("[SLIM] require " .. name .. " failed: " .. tostring(res))
+	return nil
+end
+
+Config = tryRequire("Config")
+Sim = tryRequire("Sim")
+Court = tryRequire("Court")
+Input = tryRequire("Input")
+
+local okCore, coreRes = pcall(function()
+	local Packages = ReplicatedStorage:WaitForChild("Packages", 8)
+	local core = Packages and Packages:WaitForChild("Core", 8)
+	return require(core :: any)
+end)
+if okCore then Core = coreRes end
+
+local FE = (Config and tonumber(Config.FE)) or 0.8
+local verbs = Input and Input.verbs or nil
+
+local function getDuelIn()
+	if not Core then return nil end
+	local ok, svc = pcall(function() return Core.GetService("S_DuelGame") end)
+	if ok and type(svc) == "table" then return svc.DuelIn end
+	return nil
+end
+
+--// small helpers -----------------------------------------------------------------
 local function myChar()
 	local ch = LocalPlayer.Character
-	return ch and ch:FindFirstChildWhichIsA("Humanoid") and ch
+	return ch and ch:FindFirstChildWhichIsA("Humanoid") and ch or nil
 end
 local function myHumanoid()
-	return LocalPlayer.Character and LocalPlayer.Character:FindFirstChildWhichIsA("Humanoid")
+	local ch = LocalPlayer.Character
+	return ch and ch:FindFirstChildWhichIsA("Humanoid")
 end
 local function myRoot()
 	local courtRig = Workspace:FindFirstChild(LocalPlayer.Name .. "_Court")
@@ -7798,110 +7853,934 @@ local function myRoot()
 	local ch = myChar()
 	return ch and ch.PrimaryPart
 end
-local function distance(a, b) return (a - b).Magnitude end
-local function randomUnit()
-	local a = math.random() * math.pi * 2
-	return Vector3.new(math.cos(a), 0, math.sin(a))
+local function distance(a, b)
+	return (a - b).Magnitude
 end
 
---// Iso modules -----------------------------------------------------------------
-local Iso = ReplicatedStorage:WaitForChild("Iso", 5)
-local Input, InputOk = nil, false
-local Court, CourtOk = nil, false
-pcall(function()
-	if Iso then
-		InputOk, Input = pcall(require, Iso:WaitForChild("Input"))
-		CourtOk, Court = pcall(require, Iso:WaitForChild("Court"))
-	end
-end)
-local verbs = (InputOk and Input and Input.verbs) or nil
-
---// perfect-shot payload hook --------------------------------------------------
--- the ShotRelease hold time is client-filled, so when perfect shot is on we
--- rewrite just that number to the centre of the shot window right before the
--- game's own input poller sends it. distance / contest are still server-graded.
-local function meterValue()
-	local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
-	local root = pg and pg:FindFirstChild("IsoHUD") and pg.IsoHUD:FindFirstChild("Root")
-	local world = root and root:FindFirstChild("World")
-	local meter = world and world:FindFirstChild("ShotMeter")
-	local fill = meter and meter:FindFirstChildOfClass("Frame", true)
-	if fill and fill.Name ~= "Fill" then
-		for _, d in ipairs(meter:GetDescendants()) do
-			if d:IsA("Frame") and d.Name == "Fill" then fill = d break end
-		end
-	end
-	if fill and fill.Size then return fill.Size.X.Scale end
+local function courtXY()
+	if not (Court and Court.fromWorld) then return nil end
+	local root = myRoot()
+	if not root then return nil end
+	local ok, x, y = pcall(Court.fromWorld, root.Position)
+	if ok and tonumber(x) and tonumber(y) then return x, y end
 	return nil
 end
-local function meterGreenWindow()
-	local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
-	local root = pg and pg:FindFirstChild("IsoHUD") and pg.IsoHUD:FindFirstChild("Root")
-	local world = root and root:FindFirstChild("World")
-	local meter = world and world:FindFirstChild("ShotMeter")
-	local green = meter and meter:FindFirstChildOfClass("Frame", true)
-	if green and green.Name ~= "Green" then
-		for _, d in ipairs(meter:GetDescendants()) do
-			if d:IsA("Frame") and d.Name == "Green" then green = d break end
-		end
-	end
-	if green and green.Position and green.Size then
-		local c, hw = green.Position.X.Scale, green.Size.X.Scale / 2
-		return c - hw, c + hw
-	end
-	return nil, nil
+local function courtDistance()
+	local x, y = courtXY()
+	if not x then return nil end
+	return math.sqrt((x - 25) ^ 2 + (y - 5.25) ^ 2)
 end
-local function installPerfectShot()
-	if _G.SlimDuelsPollHook then
-		_G.SlimDuelsPollCfg = CFG
-		return true
+local function hoopWorldPosition()
+	if not (Court and Court.toWorld) then return nil end
+	local ok, pos = pcall(Court.toWorld, 25, 4, 5.25)
+	if ok and typeof(pos) == "Vector3" then return pos end
+	return nil
+end
+
+--// perfect shot hooks ------------------------------------------------------------
+local Hooks = {
+	installed = false,
+	ourIdx = nil,
+	stockRange = STOCK_RANGE,
+	origStep = nil,
+	origRelease = nil,
+	duelIn = nil,
+	origFire = nil,
+	fireWrapper = nil,
+	lastSim = nil,
+}
+
+local function fillForFin(fin)
+	local play = Config and Config.play
+	if not play then
+		if fin == "dunk" then return 0.75 end
+		if fin == "float" then return 0.5 end
+		if fin == "layup" or fin == "euro" then return 0.6125 end
+		return 0.6
 	end
-	if not (InputOk and Input and type(Input.poll) == "function") then return false end
-	local orig = Input.poll
-	local wrapper = function()
-		local v = orig()
-		local cfg = _G.SlimDuelsPollCfg or CFG
-		if cfg.autoGuard and guardActive and type(v) == "table" then
-			v.mx, v.my = guardMX, guardMY
-		elseif cfg.smartSteal and stealNavActive and type(v) == "table" then
-			v.mx, v.my = stealMX, stealMY
+	local layGround = tonumber(play.layGround) or 0.2
+	local jGround = tonumber(play.jGround) or 0.18
+	local jAir = tonumber(play.jAir) or 0.6
+	local layAir = tonumber(play.layAir) or 0.58
+	local dunkAir = tonumber(play.dunkAir) or 0.8
+	if fin == "dunk" then return (layGround + dunkAir / 2) / FE end
+	if fin == "float" then return (0.16 + 0.48 / 2) / FE end
+	if fin == "layup" or fin == "euro" then return (layGround + layAir / 2) / FE end
+	return (jGround + jAir / 2) / FE
+end
+
+local function fillFromAction(a)
+	if type(a.rg) == "table" and tonumber(a.rg.fill) then
+		return tonumber(a.rg.fill)
+	end
+	return fillForFin(a.fin)
+end
+
+local function recordFlash(ev)
+	if type(ev) ~= "table" then return end
+	stats.lastGrade = ev.grade
+	stats.lastM = tonumber(ev.m)
+	stats.lastFin = ev.fin or stats.lastFin
+	if ev.grade == "GREEN" then
+		stats.greens = stats.greens + 1
+	end
+end
+
+local function findMyIndex(players)
+	if type(players) ~= "table" then return nil end
+	local x, y = courtXY()
+	if not x then return nil end
+	local best, bestD = nil, 6
+	for i, p in ipairs(players) do
+		if type(p) == "table" then
+			local px, py = tonumber(p.x), tonumber(p.y)
+			if px and py then
+				local d = math.sqrt((px - x) ^ 2 + (py - y) ^ 2)
+				if d < bestD then
+					best, bestD = i, d
+				end
+			end
 		end
-		if cfg.perfectShot and type(v) == "table" and type(v.actions) == "table" then
-			for _, a in ipairs(v.actions) do
-				if type(a) == "table" and a.t == "holdEnd" and type(a.held) == "number" then
-					local m = meterValue()
-					if m and m > 0.02 then
-						local fill = a.held / m
-						if fill > 0.1 and fill < 2 then
-							a.held = 0.8 * fill
-							stats.greenWrites = stats.greenWrites + 1
+	end
+	return best, bestD
+end
+
+local function isMyPlayer(sim, p)
+	if type(p) ~= "table" then return false end
+	if p.idx and type(sim) == "table" and type(sim.players) == "table" then
+		local mine = findMyIndex(sim.players)
+		if mine then
+			Hooks.ourIdx = mine
+			return mine == p.idx
+		end
+		if Hooks.ourIdx and Hooks.ourIdx == p.idx then return true end
+	end
+	local x, y = courtXY()
+	if x and tonumber(p.x) and tonumber(p.y) then
+		local dx, dy = p.x - x, p.y - y
+		return dx * dx + dy * dy <= 9
+	end
+	return false
+end
+
+local function stateRef()
+	local ok, env = pcall(getfenv)
+	local s = ok and env and rawget(env, "STATE") or nil
+	if type(s) ~= "table" then s = rawget(_G, "STATE") end
+	return type(s) == "table" and s or nil
+end
+local STATE_REF = stateRef()
+
+local function overrideField(tbl, key, value)
+	local orig = tbl[key]
+	if STATE_REF and type(STATE_REF.override) == "function" then
+		STATE_REF.override(tbl, key, value)
+	else
+		tbl[key] = value
+	end
+	return orig
+end
+
+local function simStep(sim, inputs, events)
+	Hooks.lastSim = sim
+	if _G.SlimDuels then _G.SlimDuels.lastSim = sim end
+	if not Hooks.ourIdx and type(sim) == "table" and type(sim.players) == "table" then
+		Hooks.ourIdx = findMyIndex(sim.players)
+	end
+	local myIdx = nil
+	if CFG.perfectShot and type(inputs) == "table" and type(sim) == "table"
+		and type(sim.players) == "table" then
+		local candidates = {}
+		for k, inp in pairs(inputs) do
+			if type(inp) == "table" and type(inp.actions) == "table" then
+				for _, a in ipairs(inp.actions) do
+					if type(a) == "table" and a.t == "holdEnd" then
+						candidates[#candidates + 1] = k
+						break
+					end
+				end
+			end
+		end
+		if #candidates > 0 then
+			myIdx = findMyIndex(sim.players)
+			-- local CPU matches always drive slot 1; only use this when the rig
+			-- is temporarily unavailable, and only if there is one candidate.
+			if not myIdx and #candidates == 1 and LocalPlayer:GetAttribute("MatchId") == nil then
+				myIdx = candidates[1]
+			end
+			if myIdx then
+				Hooks.ourIdx = myIdx
+				local p = sim.players[myIdx]
+				local fill = p and p.gather and tonumber(p.gather.fill)
+				if fill and fill > 0 then
+					for k, inp in pairs(inputs) do
+						if k == myIdx and type(inp) == "table" and type(inp.actions) == "table" then
+							for _, a in ipairs(inp.actions) do
+								if type(a) == "table" and a.t == "holdEnd" then
+									a.held = FE * fill
+									stats.greenWrites = stats.greenWrites + 1
+									stats.shots = stats.shots + 1
+									stats.lastFin = p.gather.fin
+									stats.lastHeld = a.held
+									stats.lastDist = courtDistance()
+									local lw = p.gather.lockHw
+									if type(lw) == "table" then
+										stats.lastGradeDist = tonumber(lw[3])
+									end
+								end
+							end
 						end
 					end
 				end
 			end
 		end
-		return v
 	end
-	Input.poll = wrapper
-	_G.SlimDuelsPollHook = { input = Input, orig = orig, wrapper = wrapper }
-	_G.SlimDuelsPollCfg = CFG
-	return true
-end
-local function uninstallPerfectShot()
-	local hs = _G.SlimDuelsPollHook
-	if not hs then return end
-	pcall(function() if hs.input and hs.input.poll == hs.wrapper then hs.input.poll = hs.orig end end)
-	_G.SlimDuelsPollHook = nil
-	_G.SlimDuelsPollCfg = nil
+
+	local ok, result = pcall(Hooks.origStep, sim, inputs, events)
+	if not ok then
+		warn("[SLIM] sim step failed: " .. tostring(result))
+		return nil
+	end
+	if type(events) == "table" then
+		local mine = myIdx or Hooks.ourIdx
+		if mine then
+			for _, ev in ipairs(events) do
+				if type(ev) == "table" and ev.k == "flash" and ev.pi == mine then
+					recordFlash(ev)
+				end
+			end
+		end
+	end
+	return result
 end
 
---// ESP ------------------------------------------------------------------------
+local function simRelease(sim, p, held, events, judge)
+	if CFG.perfectShot and not judge and type(p) == "table" and type(p.gather) == "table" then
+		if isMyPlayer(sim, p) then
+			local fill = tonumber(p.gather.fill)
+			if fill and fill > 0 then
+				held = FE * fill
+			end
+		end
+	end
+	return Hooks.origRelease(sim, p, held, events, judge)
+end
+
+local function makeFakeJudge(fin)
+	local fakeDist = 30
+	return {
+		p = {
+			x = 25,
+			y = 5.25 + fakeDist,
+			z = 0,
+			gather = {
+				lockHw = { 0.12, 0, fakeDist, false, 0.12 },
+				fin = fin or "jumper",
+				fill = 0.6,
+				layup = false,
+			},
+		},
+	}
+end
+
+local function duelFire(orig, self, mx, my, actions, t, flip, own)
+	if CFG.perfectShot and type(actions) == "table" then
+		local hold = nil
+		for _, a in ipairs(actions) do
+			if type(a) == "table" and a.t == "holdEnd" then
+				hold = a
+				break
+			end
+		end
+		if hold then
+			local fill = fillFromAction(hold)
+			local fin = hold.fin or (type(hold.rg) == "table" and hold.rg.fin) or "jumper"
+			hold.held = FE * fill
+			stats.greenWrites = stats.greenWrites + 1
+			stats.lastFin = fin
+			stats.lastHeld = hold.held
+			stats.lastDist = courtDistance()
+
+			local d = stats.lastDist
+			if CFG.fullCourt and d and d > STOCK_RANGE
+				and (fin == "jumper" or fin == "float") then
+				-- the server still uses its own 36 ft greenWindow cap, so give
+				-- the remote action a judge that reports a 30 ft attempt. flight
+				-- and score still come from the real player; only the grade and
+				-- the 3-point line use this judge.
+				local out = table.clone(actions)
+				for i, a in ipairs(out) do
+					if type(a) == "table" and a.t == "holdEnd" then
+						local b = table.clone(a)
+						b.judge = makeFakeJudge(fin)
+						out[i] = b
+					end
+				end
+				actions = out
+			end
+		end
+	end
+	return orig(self, mx, my, actions, t, flip, own)
+end
+
+local function installShotHooks()
+	if Hooks.installed then return true end
+	if not (Sim and type(Sim.step) == "function" and type(Sim.release) == "function") then
+		return false
+	end
+	local r = Config and tonumber(Config.play and Config.play.range)
+	Hooks.stockRange = (r and r ~= LONG_RANGE and r) or STOCK_RANGE
+
+	Hooks.origStep = Sim.step
+	Hooks.origRelease = Sim.release
+	overrideField(Sim, "step", simStep)
+	overrideField(Sim, "release", simRelease)
+
+	local di = getDuelIn()
+	if di and type(di.Fire) == "function" then
+		Hooks.duelIn = di
+		Hooks.origFire = di.Fire
+		overrideField(di, "Fire", function(self, mx, my, actions, t, flip, own)
+			return duelFire(Hooks.origFire, self, mx, my, actions, t, flip, own)
+		end)
+		Hooks.fireWrapper = di.Fire
+	end
+
+	if Config and Config.play then
+		Config.play.range = LONG_RANGE
+	end
+	Hooks.installed = true
+	return true
+end
+
+local function uninstallShotHooks()
+	if not Hooks.installed then return end
+	if Hooks.origStep and Sim and Sim.step == simStep then Sim.step = Hooks.origStep end
+	if Hooks.origRelease and Sim and Sim.release == simRelease then Sim.release = Hooks.origRelease end
+	local di = Hooks.duelIn
+	if di and Hooks.origFire and Hooks.fireWrapper and di.Fire == Hooks.fireWrapper then
+		di.Fire = Hooks.origFire
+	end
+	if Config and Config.play then
+		Config.play.range = Hooks.stockRange or STOCK_RANGE
+	end
+	Hooks.installed = false
+	Hooks.duelIn = nil
+	Hooks.fireWrapper = nil
+end
+
+local function setPerfectShot(v)
+	CFG.perfectShot = v and true or false
+	if CFG.perfectShot then
+		if not installShotHooks() then
+			warn("[SLIM] perfect shot unavailable: Iso.Sim not loaded")
+		end
+	else
+		uninstallShotHooks()
+	end
+end
+
+--// styles ------------------------------------------------------------------------
+-- The real catalog is Iso.Styles.LIST / BY_ID. The game equips a style by slot:
+-- Profile.call("equip", slot). A style can only be server-equipped when it is
+-- already rolled into one of your slots. For every other style this tab applies
+-- a local preview to the client profile and the Style attribute; the server
+-- keeps your real style. Use "restore real style" (or unload) to undo it.
+local stylesTab, uiStyleStatus
+local StyleState = {
+	catalog = {},
+	byId = {},
+	byKey = {},
+	buttons = {},
+	sections = {},
+	scanned = false,
+	lastStatus = "not scanned",
+	manual = "",
+	override = nil,
+	watchConn = nil,
+	attrConn = nil,
+	applying = false,
+}
+local StyleModules = { styles = nil, profile = nil }
+
+local function styleLower(s)
+	return string.lower(tostring(s or ""))
+end
+
+local function getStyleModules()
+	if not StyleModules.styles then
+		StyleModules.styles = tryRequire("Styles")
+	end
+	if not StyleModules.profile then
+		StyleModules.profile = tryRequire("Profile")
+	end
+	return StyleModules.styles, StyleModules.profile
+end
+
+local function profileData()
+	local _, profile = getStyleModules()
+	return profile and profile.data or nil
+end
+
+local function waitProfileData(timeout)
+	local deadline = os.clock() + (tonumber(timeout) or 3)
+	local data = profileData()
+	while not data and os.clock() < deadline do
+		task.wait(0.1)
+		data = profileData()
+	end
+	return data
+end
+
+local function rarityOrder(rarity)
+	local styles = StyleModules.styles
+	local info = styles and styles.RARITY and styles.RARITY[rarity]
+	return info and tonumber(info.order) or 99
+end
+
+local function registerStyle(item)
+	if type(item) ~= "table" then return nil end
+	local id = tostring(item.id or "")
+	if id == "" then return nil end
+	local idKey = styleLower(id)
+	local existing = StyleState.byId[idKey]
+	if existing then return existing end
+	item.id = id
+	item.name = tostring(item.name or id)
+	item.idKey = idKey
+	StyleState.byId[idKey] = item
+	StyleState.byKey[idKey] = item
+	local nameKey = styleLower(item.name)
+	if nameKey ~= "" and not StyleState.byKey[nameKey] then
+		StyleState.byKey[nameKey] = item
+	end
+	StyleState.catalog[#StyleState.catalog + 1] = item
+	return item
+end
+
+local function styleItem(entry, source)
+	if type(entry) ~= "table" then return nil end
+	local id = entry.id or entry.Id or entry.styleId or entry.key
+	if type(id) ~= "string" or id == "" then return nil end
+	return registerStyle({
+		id = id,
+		name = entry.name or entry.Name or id,
+		rarity = entry.rarity or entry.Rarity,
+		height = tonumber(entry.height),
+		tagline = entry.tagline or entry.Tagline or "",
+		stats = entry.stats,
+		icon = entry.icon,
+		source = source or "Iso.Styles",
+		raw = entry,
+	})
+end
+
+local scanStyles, equipStyle, unlockAllStyles, restoreStyle, addStyleButtons, updateStyleStatus, dumpStyleDebug
+local setLocalStyle, watchOverride, clearStyleOverride
+
+local function styleDescription(item)
+	local bits = {}
+	if item.rarity then bits[#bits + 1] = tostring(item.rarity) end
+	if item.height then
+		local styles = StyleModules.styles
+		local h = styles and styles.heightText and styles.heightText(item.height) or tostring(item.height)
+		bits[#bits + 1] = tostring(h)
+	end
+	local tag = tostring(item.tagline or "")
+	if #tag > 64 then tag = tag:sub(1, 61) .. "..." end
+	if tag ~= "" then bits[#bits + 1] = tag end
+	return table.concat(bits, " | ")
+end
+
+local function findStyleSlot(data, id)
+	if type(data) ~= "table" or type(data.slots) ~= "table" then return nil end
+	local key = styleLower(id)
+	local count = math.max(#data.slots, tonumber(data.slotCount) or 0)
+	for i = 1, count do
+		local slot = data.slots[i]
+		if type(slot) == "table" and styleLower(slot.style) == key then
+			return i, slot
+		end
+	end
+	return nil
+end
+
+local function chooseSlot(data, preferred)
+	data.slots = data.slots or {}
+	local maxSlots = math.max(1, tonumber(data.slotCount) or #data.slots or 1)
+	local function usable(i)
+		if i < 1 or i > maxSlots then return false end
+		local slot = data.slots[i]
+		return not (type(slot) == "table" and slot.locked)
+	end
+	local pref = tonumber(preferred)
+	if pref and usable(pref) then return pref end
+	for i = 1, maxSlots do
+		local slot = data.slots[i]
+		if usable(i) and (type(slot) ~= "table" or slot.style == nil or slot.style == "") then
+			return i
+		end
+	end
+	local equipped = tonumber(data.equipped) or 1
+	if usable(equipped) then return equipped end
+	for i = 1, maxSlots do
+		if usable(i) then return i end
+	end
+	return math.clamp(equipped, 1, maxSlots)
+end
+
+local function snapshotStyle(data, slot)
+	local lp = LocalPlayer
+	return {
+		equipped = data.equipped,
+		slot = slot,
+		slotStyle = data.slots[slot] and data.slots[slot].style or "",
+		styleAttr = lp:GetAttribute("Style"),
+		skillsAttr = lp:GetAttribute("StyleSkills"),
+	}
+end
+
+setLocalStyle = function(item, slot, data)
+	StyleState.applying = true
+	local styles = StyleModules.styles
+	local lp = LocalPlayer
+	local order = (styles and styles.STATS) or { "handles", "shooting", "finishing", "defense", "speed" }
+	local skills = data.styleSkills and data.styleSkills[item.id] or nil
+	if type(skills) ~= "table" then
+		skills = {}
+		data.styleSkills = data.styleSkills or {}
+		data.styleSkills[item.id] = skills
+	end
+	for _, stat in ipairs(order) do
+		if tonumber(skills[stat]) == nil then skills[stat] = 0 end
+	end
+	for _, field in ipairs({ "height", "hp", "pts" }) do
+		if tonumber(skills[field]) == nil then skills[field] = 0 end
+	end
+	if tonumber(skills.slv) == nil then skills.slv = 1 end
+	if tonumber(skills.sxp) == nil then skills.sxp = 0 end
+	data.slots = data.slots or {}
+	local slotData = data.slots[slot]
+	if type(slotData) ~= "table" then
+		slotData = { locked = false }
+		data.slots[slot] = slotData
+	end
+	slotData.style = item.id
+	data.equipped = slot
+	pcall(function() lp:SetAttribute("Style", item.id) end)
+	local values = {}
+	for _, stat in ipairs(order) do
+		values[#values + 1] = tostring(math.floor((tonumber(skills[stat]) or 0) + 0.5))
+	end
+	values[#values + 1] = tostring(math.floor((tonumber(skills.height) or 0) + 0.5))
+	values[#values + 1] = tostring(math.floor((tonumber(skills.hp) or 0) + 0.5))
+	pcall(function() lp:SetAttribute("StyleSkills", table.concat(values, ",")) end)
+	local _, profile = getStyleModules()
+	if profile and profile.changed then
+		pcall(function() profile.changed:Fire(data) end)
+	end
+	StyleState.applying = false
+end
+
+local function reapplyOverride()
+	local ov = StyleState.override
+	if not ov or StyleState.applying then return end
+	local data = profileData()
+	if not data then return end
+	local slot = data.slots and data.slots[ov.slot]
+	if styleLower(slot and slot.style) ~= ov.idKey
+		or tonumber(data.equipped) ~= ov.slot
+		or styleLower(LocalPlayer:GetAttribute("Style")) ~= ov.idKey then
+		setLocalStyle(ov.item, ov.slot, data)
+	end
+end
+
+watchOverride = function()
+	if StyleState.watchConn then return end
+	local _, profile = getStyleModules()
+	if profile and profile.changed and profile.changed.Event then
+		StyleState.watchConn = profile.changed.Event:Connect(function()
+			if not StyleState.override or StyleState.applying then return end
+			task.defer(function()
+				if StyleState.override and not StyleState.applying then
+					reapplyOverride()
+				end
+			end)
+		end)
+	end
+	if not StyleState.attrConn then
+		StyleState.attrConn = LocalPlayer:GetAttributeChangedSignal("Style"):Connect(function()
+			local ov = StyleState.override
+			if not ov or StyleState.applying then return end
+			if styleLower(LocalPlayer:GetAttribute("Style")) ~= ov.idKey then
+				task.defer(function()
+					if StyleState.override and not StyleState.applying then
+						reapplyOverride()
+					end
+				end)
+			end
+		end)
+	end
+end
+
+clearStyleOverride = function(restore)
+	local ov = StyleState.override
+	if StyleState.watchConn then
+		pcall(function() StyleState.watchConn:Disconnect() end)
+		StyleState.watchConn = nil
+	end
+	if StyleState.attrConn then
+		pcall(function() StyleState.attrConn:Disconnect() end)
+		StyleState.attrConn = nil
+	end
+	StyleState.override = nil
+	if not (restore and ov) then return end
+	local data = profileData()
+	if not data then return end
+	if ov.original then
+		data.equipped = ov.original.equipped
+		local slotData = data.slots and data.slots[ov.original.slot]
+		if type(slotData) == "table" then
+			slotData.style = ov.original.slotStyle or ""
+		end
+		pcall(function() LocalPlayer:SetAttribute("Style", ov.original.styleAttr) end)
+		pcall(function() LocalPlayer:SetAttribute("StyleSkills", ov.original.skillsAttr) end)
+	end
+	StyleState.applying = true
+	local _, profile = getStyleModules()
+	if profile and profile.changed then
+		pcall(function() profile.changed:Fire(data) end)
+	end
+	StyleState.applying = false
+end
+
+scanStyles = function()
+	local styles = getStyleModules()
+	StyleState.catalog = {}
+	StyleState.byId = {}
+	StyleState.byKey = {}
+	StyleState.scanned = true
+	if type(styles) ~= "table" or type(styles.LIST) ~= "table" then
+		StyleState.lastStatus = "Iso.Styles.LIST not available"
+		updateStyleStatus()
+		return 0
+	end
+	for _, entry in ipairs(styles.LIST) do
+		styleItem(entry, "Iso.Styles.LIST")
+	end
+	table.sort(StyleState.catalog, function(a, b)
+		local ao, bo = rarityOrder(a.rarity), rarityOrder(b.rarity)
+		if ao ~= bo then return ao < bo end
+		return styleLower(a.name) < styleLower(b.name)
+	end)
+	StyleState.lastStatus = string.format("loaded %d styles from Iso.Styles", #StyleState.catalog)
+	addStyleButtons()
+	updateStyleStatus()
+	return #StyleState.catalog
+end
+
+equipStyle = function(target)
+	local item
+	if type(target) == "table" then
+		item = registerStyle(target)
+	else
+		local key = styleLower(target)
+		if key ~= "" then item = StyleState.byKey[key] end
+		if not item and key ~= "" then
+			local styles = getStyleModules()
+			local raw = styles and styles.BY_ID and (styles.BY_ID[tostring(target)] or styles.BY_ID[key])
+			if raw then item = styleItem(raw, "Iso.Styles.BY_ID") end
+		end
+	end
+	if not item then
+		StyleState.lastStatus = "unknown style: " .. tostring(target)
+		updateStyleStatus()
+		return false, StyleState.lastStatus
+	end
+	if not StyleState.scanned or #StyleState.catalog == 0 then scanStyles() end
+	local id, name = tostring(item.id), tostring(item.name or item.id)
+	local data = waitProfileData(3)
+	if not data then
+		StyleState.lastStatus = "profile not loaded yet; try again"
+		updateStyleStatus()
+		return false, StyleState.lastStatus
+	end
+	local slot, slotData = findStyleSlot(data, id)
+	local maxSlots = math.max(0, tonumber(data.slotCount) or (data.slots and #data.slots) or 0)
+	if slot and slot <= maxSlots and not (slotData and slotData.locked) then
+		if StyleState.override then clearStyleOverride(true) end
+		data = profileData() or data
+		if tonumber(data.equipped) == slot and styleLower(LocalPlayer:GetAttribute("Style")) == styleLower(id) then
+			StyleState.lastStatus = name .. " is already equipped in slot " .. slot
+			updateStyleStatus()
+			return true, StyleState.lastStatus
+		end
+		local _, profile = getStyleModules()
+		local ok, res = false, nil
+		if profile and type(profile.call) == "function" then
+			ok, res = pcall(function() return profile.call("equip", slot) end)
+		end
+		local failed = not ok or (type(res) == "table" and res.ok == false)
+		if not failed then
+			data.equipped = slot
+			if type(data.slots[slot]) == "table" then data.slots[slot].style = id end
+			pcall(function() LocalPlayer:SetAttribute("Style", id) end)
+			stats.styleEquips = stats.styleEquips + 1
+			StyleState.lastStatus = string.format("equipped %s in slot %d (server)", name, slot)
+			updateStyleStatus()
+			return true, StyleState.lastStatus
+		end
+		local reason = type(res) == "table" and res.msg or res
+		StyleState.lastStatus = string.format(
+			"server equip failed (%s); using local preview",
+			tostring(reason or "no response")
+		)
+	elseif slot and slot > maxSlots then
+		StyleState.lastStatus = string.format(
+			"%s is in slot %d, which is not unlocked; applying local preview",
+			name,
+			slot
+		)
+	elseif slot and slotData and slotData.locked then
+		StyleState.lastStatus = string.format(
+			"%s is in locked slot %d; applying local preview",
+			name,
+			slot
+		)
+	else
+		StyleState.lastStatus = name .. " is not in one of your slots; applying local preview"
+	end
+	if StyleState.override then clearStyleOverride(true) end
+	data = profileData() or data
+	local targetSlot = chooseSlot(data, nil)
+	StyleState.override = {
+		id = id,
+		idKey = styleLower(id),
+		name = name,
+		item = item,
+		slot = targetSlot,
+		original = snapshotStyle(data, targetSlot),
+	}
+	setLocalStyle(item, targetSlot, data)
+	watchOverride()
+	stats.styleEquips = stats.styleEquips + 1
+	StyleState.lastStatus = string.format(
+		"%s applied locally in slot %d (server keeps your real style)",
+		name,
+		targetSlot
+	)
+	updateStyleStatus()
+	return true, StyleState.lastStatus
+end
+
+restoreStyle = function()
+	if not StyleState.override then
+		StyleState.lastStatus = "no local style override"
+		updateStyleStatus()
+		return false, StyleState.lastStatus
+	end
+	clearStyleOverride(true)
+	StyleState.lastStatus = "restored your real style"
+	updateStyleStatus()
+	return true, StyleState.lastStatus
+end
+
+unlockAllStyles = function()
+	if not StyleState.scanned or #StyleState.catalog == 0 then scanStyles() end
+	local data = waitProfileData(3)
+	if not data then
+		StyleState.lastStatus = "profile not loaded yet; try again"
+		updateStyleStatus()
+		return 0, 0
+	end
+	data.counted = data.counted or {}
+	data.styleSkills = data.styleSkills or {}
+	local changed = 0
+	for _, item in ipairs(StyleState.catalog) do
+		local countedKey = "s:" .. tostring(item.id)
+		if data.counted[countedKey] == nil then
+			data.counted[countedKey] = 1
+			changed = changed + 1
+		end
+		if type(data.styleSkills[item.id]) ~= "table" then
+			data.styleSkills[item.id] = {
+				handles = 0,
+				shooting = 0,
+				finishing = 0,
+				defense = 0,
+				speed = 0,
+				height = 0,
+				hp = 0,
+				pts = 0,
+				slv = 1,
+				sxp = 0,
+			}
+			changed = changed + 1
+		end
+	end
+	if changed > 0 then
+		StyleState.applying = true
+		local _, profile = getStyleModules()
+		if profile and profile.changed then
+			pcall(function() profile.changed:Fire(data) end)
+		end
+		StyleState.applying = false
+	end
+	StyleState.lastStatus = string.format(
+		"client unlock: %d additions (server still owns the real inventory)",
+		changed
+	)
+	updateStyleStatus()
+	return changed, 1
+end
+
+updateStyleStatus = function()
+	if not uiStyleStatus then return end
+	local data = profileData()
+	local slotted = 0
+	local equippedName = "none"
+	if data then
+		for _, item in ipairs(StyleState.catalog) do
+			if findStyleSlot(data, item.id) then slotted = slotted + 1 end
+		end
+		local slot = data.slots and data.slots[tonumber(data.equipped) or 0]
+		local id = slot and slot.style
+		if id and id ~= "" then
+			local item = StyleState.byKey[styleLower(id)]
+			equippedName = item and item.name or tostring(id)
+		end
+	end
+	local txt = string.format(
+		"%d styles | %d in your slots | equipped: %s (slot %s)\n%s",
+		#StyleState.catalog,
+		slotted,
+		equippedName,
+		tostring(data and data.equipped or "?"),
+		StyleState.lastStatus
+	)
+	pcall(function() uiStyleStatus:Set(txt) end)
+end
+
+addStyleButtons = function()
+	if not stylesTab then return end
+	for _, item in ipairs(StyleState.catalog) do
+		local key = styleLower(item.id)
+		if not StyleState.buttons[key] then
+			StyleState.buttons[key] = true
+			local sectionKey = tostring(item.rarity or "OTHER")
+			if not StyleState.sections[sectionKey] then
+				StyleState.sections[sectionKey] = true
+				pcall(function()
+					stylesTab:CreateSection({ name = sectionKey:upper() })
+				end)
+			end
+			pcall(function()
+				stylesTab:CreateButton({
+					name = item.name,
+					description = styleDescription(item),
+					callback = function()
+						equipStyle(item)
+					end,
+				})
+			end)
+		end
+	end
+end
+
+dumpStyleDebug = function()
+	local data = profileData()
+	local lines = { string.format("[SLIM] styles: %d", #StyleState.catalog) }
+	for _, item in ipairs(StyleState.catalog) do
+		local slot = data and findStyleSlot(data, item.id)
+		lines[#lines + 1] = string.format(
+			"  %-14s %-10s %-18s %s",
+			tostring(item.id),
+			tostring(item.rarity or "?"),
+			tostring(item.name),
+			slot and ("slot " .. slot) or "no slot"
+		)
+	end
+	if data then
+		lines[#lines + 1] = string.format(
+			"[SLIM] equipped=%s style=%s styleSkills=%s slotCount=%s",
+			tostring(data.equipped),
+			tostring(LocalPlayer:GetAttribute("Style")),
+			tostring(LocalPlayer:GetAttribute("StyleSkills")),
+			tostring(data.slotCount)
+		)
+		local slotCount = math.max(#(data.slots or {}), tonumber(data.slotCount) or 0)
+		for i = 1, slotCount do
+			local slot = data.slots and data.slots[i]
+			lines[#lines + 1] = string.format(
+				"  slot %d: style=%s locked=%s",
+				i,
+				tostring(slot and slot.style or ""),
+				tostring(slot and slot.locked)
+			)
+		end
+	end
+	if StyleState.override then
+		lines[#lines + 1] = string.format(
+			"[SLIM] local override: %s in slot %d",
+			StyleState.override.name,
+			StyleState.override.slot
+		)
+	end
+	print(table.concat(lines, "\n"))
+	return #StyleState.catalog, data and #(data.slots or {}) or 0
+end
+--// HUD meter helpers (auto-green) ------------------------------------------------
+local function hudMeterPart(name)
+	local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+	local gui = pg and pg:FindFirstChild("IsoHUD")
+	local root = gui and gui:FindFirstChild("Root")
+	local meter = root and root:FindFirstChild("ShotMeter", true)
+	return meter and meter:FindFirstChild(name, true)
+end
+local function meterValue()
+	local fill = hudMeterPart("Fill")
+	if fill and fill:IsA("GuiObject") then return fill.Size.X.Scale end
+	return nil
+end
+local function meterGreenWindow()
+	local green = hudMeterPart("Green")
+	if green and green:IsA("GuiObject") then
+		local c, hw = green.Position.X.Scale, green.Size.X.Scale / 2
+		return c - hw, c + hw
+	end
+	return nil, nil
+end
+
+local autoGreenArmed = false
+local autoGreenStart = 0
+local function autoGreenTick()
+	if not CFG.autoGreen then return end
+	if not (Input and type(Input.holding) == "function" and Input.holding()) then
+		autoGreenArmed = false
+		autoGreenStart = 0
+		return
+	end
+	local now = os.clock()
+	if autoGreenStart == 0 then autoGreenStart = now end
+	local m = meterValue()
+	local lo, hi = meterGreenWindow()
+	if not (m and lo and hi) then return end
+	if m < lo - 0.05 then autoGreenArmed = true end
+	if autoGreenArmed and m >= lo and m <= hi and now - autoGreenStart >= 0.2 then
+		if verbs and type(verbs.shootUp) == "function" then pcall(verbs.shootUp) end
+		stats.autoReleases = stats.autoReleases + 1
+		autoGreenArmed = false
+		autoGreenStart = 0
+	end
+end
+
+--// ESP ---------------------------------------------------------------------------
 local espFolder = Instance.new("Folder")
 espFolder.Name = "SlimDuelsEsp"
 espFolder.Parent = Workspace
 local espTargets = {}
+
 local function makeTarget(name)
-	local t = { hl = nil, plate = nil, tag = nil }
 	local hl = Instance.new("Highlight")
 	hl.Name = "SlimDuelsEspHighlight"
 	hl.FillColor = Color3.fromRGB(90, 170, 255)
@@ -7911,15 +8790,16 @@ local function makeTarget(name)
 	hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
 	hl.Enabled = false
 	hl.Parent = espFolder
-	t.hl = hl
+
 	local gui = Instance.new("BillboardGui")
 	gui.Name = "SlimDuelsEspTag"
 	gui.Size = UDim2.new(0, 150, 0, 26)
 	gui.StudsOffset = Vector3.new(0, 3.4, 0)
 	gui.AlwaysOnTop = true
 	gui.Enabled = false
-	gui.MaxDistance = 180
+	gui.MaxDistance = 220
 	gui.Parent = espFolder
+
 	local lab = Instance.new("TextLabel")
 	lab.BackgroundTransparency = 1
 	lab.Size = UDim2.new(1, 0, 1, 0)
@@ -7929,10 +8809,10 @@ local function makeTarget(name)
 	lab.TextStrokeTransparency = 0.4
 	lab.Text = name or ""
 	lab.Parent = gui
-	t.plate = gui
-	t.tag = lab
-	return t
+
+	return { hl = hl, plate = gui, tag = lab }
 end
+
 local function ensureTarget(key, name)
 	local t = espTargets[key]
 	if t then return t end
@@ -7940,18 +8820,14 @@ local function ensureTarget(key, name)
 	espTargets[key] = t
 	return t
 end
-local function setTargetVisible(t, v)
-	if t and t.hl then t.hl.Enabled = v end
-	if t and t.plate then t.plate.Enabled = v end
-end
+
 local function rigModels()
 	local out = {}
 	local mineCourt = LocalPlayer.Name .. "_Court"
 	for _, m in ipairs(Workspace:GetChildren()) do
-		if m:IsA("Model") and m:FindFirstChild("HumanoidRootPart") and m:FindFirstChildWhichIsA("Humanoid") then
-			if m ~= LocalPlayer.Character and m.Name ~= mineCourt and m.Name ~= LocalPlayer.Name then
-				out[#out + 1] = m
-			end
+		if m:IsA("Model") and m.Name ~= mineCourt and m ~= LocalPlayer.Character
+			and m:FindFirstChild("HumanoidRootPart") and m:FindFirstChildWhichIsA("Humanoid") then
+			out[#out + 1] = m
 		end
 	end
 	if #out == 0 then
@@ -7961,8 +8837,12 @@ local function rigModels()
 	end
 	return out
 end
+
 local function refreshEsp()
-	for _, t in pairs(espTargets) do setTargetVisible(t, false) end
+	for _, t in pairs(espTargets) do
+		t.hl.Enabled = false
+		t.plate.Enabled = false
+	end
 	if not CFG.esp then return end
 	local myR = myRoot()
 	if not myR then return end
@@ -7970,117 +8850,134 @@ local function refreshEsp()
 		local root = m.PrimaryPart or m:FindFirstChild("HumanoidRootPart")
 		if root then
 			local dist = distance(root.Position, myR.Position)
-			local show = CFG.espDist <= 0 or dist <= CFG.espDist
-			local t = ensureTarget(m, m.Name)
-			if show then
+			if CFG.espDist <= 0 or dist <= CFG.espDist then
+				local t = ensureTarget(m, m.Name)
 				pcall(function()
 					t.hl.Adornee = m
 					t.plate.Adornee = root
 					t.tag.Text = string.format("%s  %.0f", CFG.espNames and m.Name or "?", dist)
 				end)
-				setTargetVisible(t, true)
+				t.hl.Enabled = true
+				t.plate.Enabled = true
 			end
 		end
 	end
 end
-Players.PlayerRemoving:Connect(function(removed)
-	local t = espTargets[removed.Character]
-	if t then pcall(function() t.hl:Destroy() t.plate:Destroy() end) espTargets[removed.Character] = nil end
-end)
 
---// court vision ----------------------------------------------------------------
-local hoopPart, hoopGui, hoopText
-local function hoopWorldPosition()
-	if CourtOk and Court then
-		local ok, x, y = pcall(Court.fromWorld, Vector3.new(25, 0, 5.25))
-		if ok then return nil end
-		local ok2, pt = pcall(Court.toWorld, 25, 0, 5.25)
-		if ok2 and pt and pt:IsA("Vector3") then return pt + Vector3.new(0, 10, 0) end
-	end
-	return Vector3.new(0, 10, -18.25)
-end
-local function ensureHoopEsp()
+--// hoop marker + shot chart ------------------------------------------------------
+local hoopPart, hoopGui
+local function ensureHoopMarker()
 	if hoopPart then return end
-	local pos = hoopWorldPosition()
 	hoopPart = Instance.new("Part")
-	hoopPart.Name = "SlimDuelsHoopMarker"
-	hoopPart.Size = Vector3.new(0.4, 0.4, 0.4)
-	hoopPart.Transparency = 1
+	hoopPart.Name = "SlimDuelsHoopMark"
 	hoopPart.Anchored = true
+	hoopPart.Massless = true
 	hoopPart.CanCollide = false
 	hoopPart.CanQuery = false
 	hoopPart.CanTouch = false
-	hoopPart.Massless = true
-	pcall(function() hoopPart.CFrame = CFrame.new(pos) end)
+	hoopPart.Transparency = 1
+	hoopPart.Size = Vector3.new(0.2, 0.2, 0.2)
 	hoopPart.Parent = Workspace
+
 	hoopGui = Instance.new("BillboardGui")
 	hoopGui.Name = "SlimDuelsHoopEsp"
-	hoopGui.Size = UDim2.new(0, 130, 0, 28)
-	hoopGui.StudsOffset = Vector3.new(0, 1, 0)
+	hoopGui.Size = UDim2.new(0, 150, 0, 30)
+	hoopGui.StudsOffset = Vector3.new(0, 1.2, 0)
 	hoopGui.AlwaysOnTop = true
-	hoopGui.Enabled = CFG.rimEsp
 	hoopGui.MaxDistance = 260
-	hoopText = Instance.new("TextLabel")
-	hoopText.BackgroundTransparency = 1
-	hoopText.Size = UDim2.new(1, 0, 1, 0)
-	hoopText.Font = Enum.Font.GothamBold
-	hoopText.TextSize = 14
-	hoopText.TextColor3 = Color3.fromRGB(255, 210, 70)
-	hoopText.TextStrokeTransparency = 0.3
-	hoopText.Text = "HOOP"
-	hoopText.Parent = hoopGui
+	hoopGui.Enabled = CFG.rimEsp
 	hoopGui.Parent = hoopPart
-end
-local shotChartGui, shotChartLabel
-local function courtDistance()
-	local ch = myChar()
-	local root = ch and ch.PrimaryPart
-	if not root or not CourtOk or not Court then return nil end
-	local ok, cx, cy = pcall(Court.fromWorld, root.Position)
-	if not ok or not cx or not cy then return nil end
-	return math.sqrt((cx - 25) ^ 2 + (cy - 5.25) ^ 2)
-end
-local function updateShotChart()
-	if not CFG.shotChart then if shotChartGui then shotChartGui.Enabled = false end return end
-	if not shotChartGui then
-		local g = Instance.new("ScreenGui")
-		g.Name = "SlimDuelsShotChart"
-		g.IgnoreGuiInset = true
-		g.ResetOnSpawn = false
-		g.DisplayOrder = 9998
-		pcall(function() g.Parent = game:GetService("CoreGui") end)
-		if not g.Parent then g.Parent = LocalPlayer:FindFirstChildOfClass("PlayerGui") end
-		local f = Instance.new("TextLabel")
-		f.Name = "Chart"
-		f.Size = UDim2.new(0, 210, 0, 44)
-		f.AnchorPoint = Vector2.new(1, 1)
-		f.Position = UDim2.new(1, -16, 1, -310)
-		f.BackgroundColor3 = Color3.fromRGB(14, 16, 22)
-		f.BackgroundTransparency = 0.35
-		f.Font = Enum.Font.Code
-		f.TextSize = 20
-		f.TextColor3 = Color3.fromRGB(230, 235, 245)
-		f.TextStrokeTransparency = 0.3
-		f.Text = "COURT"
-		f.Parent = g
-		local cor = Instance.new("UICorner")
-		cor.CornerRadius = UDim.new(0, 10)
-		cor.Parent = f
-		shotChartGui, shotChartLabel = g, f
-	end
-	shotChartGui.Enabled = true
-	local d = courtDistance()
-	shotChartLabel.Text = d and string.format("%.1f FT", d) or "COURT"
+
+	local lab = Instance.new("TextLabel")
+	lab.BackgroundTransparency = 1
+	lab.Size = UDim2.new(1, 0, 1, 0)
+	lab.Font = Enum.Font.GothamBold
+	lab.TextSize = 14
+	lab.TextColor3 = Color3.fromRGB(255, 210, 70)
+	lab.TextStrokeTransparency = 0.3
+	lab.Text = "HOOP"
+	lab.Parent = hoopGui
 end
 
---// input automation -------------------------------------------------------------
-local stealNext, blockNext, crossNext = 0, 0, 0
-local autoGreenArmed = false
-local autoGreenHoldStart = 0
+local function updateHoopMarker()
+	if not CFG.rimEsp then
+		if hoopGui then hoopGui.Enabled = false end
+		return
+	end
+	ensureHoopMarker()
+	if not hoopGui then return end
+	hoopGui.Enabled = true
+	local pos = hoopWorldPosition()
+	if pos and hoopPart then
+		hoopPart.CFrame = CFrame.new(pos)
+	end
+end
+
+local chartGui, chartLabel
+local function ensureChart()
+	if chartGui then return end
+	local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+	if not pg then return end
+	chartGui = Instance.new("ScreenGui")
+	chartGui.Name = "SlimDuelsShotChart"
+	chartGui.IgnoreGuiInset = true
+	chartGui.ResetOnSpawn = false
+	chartGui.DisplayOrder = 9998
+	chartGui.Parent = pg
+
+	chartLabel = Instance.new("TextLabel")
+	chartLabel.Name = "Chart"
+	chartLabel.Size = UDim2.new(0, 250, 0, 58)
+	chartLabel.AnchorPoint = Vector2.new(1, 1)
+	chartLabel.Position = UDim2.new(1, -16, 1, -310)
+	chartLabel.BackgroundColor3 = Color3.fromRGB(14, 16, 22)
+	chartLabel.BackgroundTransparency = 0.35
+	chartLabel.Font = Enum.Font.Code
+	chartLabel.TextSize = 17
+	chartLabel.TextXAlignment = Enum.TextXAlignment.Right
+	chartLabel.TextYAlignment = Enum.TextYAlignment.Center
+	chartLabel.TextColor3 = Color3.fromRGB(230, 235, 245)
+	chartLabel.TextStrokeTransparency = 0.3
+	chartLabel.Text = "COURT"
+	chartLabel.Parent = chartGui
+
+	local cor = Instance.new("UICorner")
+	cor.CornerRadius = UDim.new(0, 10)
+	cor.Parent = chartLabel
+end
+
+local function updateChart()
+	if not CFG.shotChart then
+		if chartGui then chartGui.Enabled = false end
+		return
+	end
+	ensureChart()
+	if not chartGui or not chartLabel then return end
+	chartGui.Enabled = true
+	local d = courtDistance()
+	local zone = ""
+	if d then zone = d >= 23.75 and " 3PT" or " 2PT" end
+	local line1 = d and string.format("%.1f FT%s", d, zone) or "COURT"
+	local grade = stats.lastGrade or "-"
+	local m = stats.lastM and string.format("%.3f", stats.lastM) or "-"
+	chartLabel.Text = line1 .. "\n" .. grade .. "  " .. m
+	if stats.lastGrade == "GREEN" then
+		chartLabel.TextColor3 = Color3.fromRGB(120, 255, 150)
+	elseif stats.lastGrade then
+		chartLabel.TextColor3 = Color3.fromRGB(255, 150, 120)
+	else
+		chartLabel.TextColor3 = Color3.fromRGB(230, 235, 245)
+	end
+end
+
+--// defensive automation ----------------------------------------------------------
+local stealNext, blockNext, crossNext, guardNext = 0, 0, 0, 0
+local guardActive, guardMX, guardMY = false, 0, 0
+
 local function nearestOtherRoot(limit)
 	local myR = myRoot()
 	if not myR then return nil, math.huge end
-	local best, bestD = nil, limit
+	local best, bestD = nil, limit or math.huge
 	for _, m in ipairs(rigModels()) do
 		local root = m.PrimaryPart or m:FindFirstChild("HumanoidRootPart")
 		if root then
@@ -8090,298 +8987,485 @@ local function nearestOtherRoot(limit)
 	end
 	return best, bestD
 end
+
 local function ballAnchor()
 	local cam = Workspace.CurrentCamera or Workspace:FindFirstChild("Camera")
 	return cam and cam:FindFirstChild("BallMarkAnchor")
-end
-local function ownRigModel()
-	return Workspace:FindFirstChild(LocalPlayer.Name .. "_Court")
-end
-local function rigModelOfRoot(root)
-	if not root then return nil end
-	for _, m in ipairs(rigModels()) do
-		if m.PrimaryPart == root or m:FindFirstChild("HumanoidRootPart") == root then return m end
-	end
-	return ownRigModel() and (ownRigModel().PrimaryPart == root or ownRigModel():FindFirstChild("HumanoidRootPart") == root) and ownRigModel() or nil
-end
-local function ballHolderModel()
-	local ball = ballAnchor()
-	if not ball or not ball:IsA("BasePart") then return nil end
-	local best, bestD = nil, 12
-	local myR = myRoot()
-	if myR then
-		local d = distance(ball.Position, myR.Position)
-		if d < bestD then best, bestD = ownRigModel(), d end
-	end
-	for _, m in ipairs(rigModels()) do
-		local root = m.PrimaryPart or m:FindFirstChild("HumanoidRootPart")
-		if root then
-			local d = distance(root.Position, ball.Position)
-			if d < bestD then best, bestD = m, d end
-		end
-	end
-	return best
 end
 local function ownHasBall()
 	local ball, myR = ballAnchor(), myRoot()
 	return ball and myR and distance(ball.Position, myR.Position) <= 4
 end
-local function rigClipIs(model, clip)
-	if not model or not clip then return false end
-	local hum = model:FindFirstChildOfClass("Humanoid")
-	local anim = hum and hum:FindFirstChildOfClass("Animator")
-	if not anim then return false end
-	for _, track in ipairs(anim:GetPlayingAnimationTracks()) do
-		local a = track.Animation
-		if track.Name == clip or (a and a.Name == clip) then return true end
-	end
-	return false
-end
-local function autoGreenTick()
-	if not CFG.autoGreen then return end
-	if not (InputOk and Input and verbs and Input.holding and Input.holding()) then
-		autoGreenArmed = false
-		autoGreenHoldStart = 0
-		return
-	end
-	local now = os.clock()
-	if autoGreenHoldStart == 0 then autoGreenHoldStart = now end
-	local m = meterValue()
-	local lo, hi = meterGreenWindow()
-	if not (m and lo and hi) then return end
-	if m < lo - 0.05 then
-		autoGreenArmed = true
-	end
-	if autoGreenArmed and m >= lo and m <= hi and now - autoGreenHoldStart >= 0.2 then
-		if verbs then pcall(verbs.shootUp) end
-		stats.autoReleases = stats.autoReleases + 1
-		autoGreenArmed = false
-		autoGreenHoldStart = 0
-	end
-end
-local function ballDistanceToMe()
-	local ball, myR = ballAnchor(), myRoot()
-	if not ball or not myR or not CourtOk or not Court then return nil end
-	local okX, rx, ry = pcall(Court.fromWorld, myR.Position)
-	local okB, bx, by = pcall(Court.fromWorld, ball.Position)
-	if not (okX and okB and rx and ry and bx and by) then return nil end
-	return math.sqrt((bx - rx) ^ 2 + (by - ry) ^ 2)
-end
-local function smartStealTick(now)
-	stealNavActive = false
-	stealMX, stealMY = 0, 0
-	if not CFG.smartSteal or ownHasBall() then return end
-	local d = ballDistanceToMe()
-	if not d then return end
-	if d > CFG.stealDist * 1.35 then
-		local myR = myRoot()
-		local ball = ballAnchor()
-		if myR and ball and CourtOk and Court then
-			local okX, rx, ry = pcall(Court.fromWorld, myR.Position)
-			local okB, bx, by = pcall(Court.fromWorld, ball.Position)
-			if okX and okB then
-				local dx, dy = bx - rx, by - ry
-				local dist = math.sqrt(dx * dx + dy * dy)
-				if dist > 0.8 then
-					stealMX, stealMY = math.clamp(dx, -1, 1), math.clamp(dy, -1.6, 1.6)
-					stealNavActive = true
-				end
-			end
+local function ballHolderRoot()
+	local ball = ballAnchor()
+	if not ball or not ball:IsA("BasePart") then return nearestOtherRoot(60) end
+	local best, bestD = nil, 60
+	for _, m in ipairs(rigModels()) do
+		local root = m.PrimaryPart or m:FindFirstChild("HumanoidRootPart")
+		if root then
+			local d = distance(root.Position, ball.Position)
+			if d < bestD then best, bestD = root, d end
 		end
 	end
-	if d <= CFG.stealDist and now >= stealNext then
-		stealNext = now + 0.8
-		if verbs then pcall(verbs.steal) end
-		stats.smartSteals = stats.smartSteals + 1
-	end
+	return best
 end
+
 local function autoInputTick(now)
-	guardActive = false
-	guardMX, guardMY = 0, 0
-	if now < stealNext and now < blockNext and now < crossNext then return end
 	local myR = myRoot()
 	if not myR then return end
 	local hasBall = ownHasBall()
-	local holderModel = ballHolderModel()
-	local holderRoot = holderModel and (holderModel.PrimaryPart or holderModel:FindFirstChild("HumanoidRootPart")) or nil
-	if not holderRoot then
-		holderRoot = nearestOtherRoot(10)
-	end
-	local near, d = nearestOtherRoot(8.5)
-	if not near then return end
-	if CFG.autoSteal and not hasBall and holderRoot and d <= CFG.stealDist and now >= stealNext then
-		stealNext = now + 0.78
-		if verbs then pcall(verbs.steal) end
-		stats.steals = stats.steals + 1
-	end
-	if CFG.autoBlock and not hasBall and holderModel and rigClipIs(holderModel, "JumpShot") and d <= CFG.blockDist and now >= blockNext then
-		blockNext = now + 0.72
-		if verbs then pcall(verbs.block) end
-		stats.blocks = stats.blocks + 1
-	end
-	if CFG.autoCross and hasBall and d <= CFG.crossDist and now >= crossNext then
-		crossNext = now + 0.45
-		if verbs then pcall(verbs.cross) end
-		stats.crosses = stats.crosses + 1
-	end
-end
-local guardNext = 0
-local function ballHandlerRoot(limit)
-	local ball = Workspace.Camera and Workspace.Camera:FindFirstChild("BallMarkAnchor")
-	if ball and ball:IsA("BasePart") then
-		local best, bestD = nil, limit or 60
-		for _, m in ipairs(rigModels()) do
-			local root = m.PrimaryPart or m:FindFirstChild("HumanoidRootPart")
-			if root then
-				local d = distance(root.Position, ball.Position)
-				if d < bestD then best, bestD = root, d end
-			end
+	local near, d = nearestOtherRoot(9)
+	if not near and not hasBall then return end
+	if verbs then
+		if CFG.autoSteal and not hasBall and near and d <= CFG.stealDist and now >= stealNext then
+			stealNext = now + 0.78
+			pcall(verbs.steal)
+			stats.steals = stats.steals + 1
 		end
-		if best then return best end
+		if CFG.autoBlock and not hasBall and near and d <= CFG.blockDist and now >= blockNext then
+			blockNext = now + 0.72
+			pcall(verbs.block)
+			stats.blocks = stats.blocks + 1
+		end
+		if CFG.autoCross and hasBall and near and d <= CFG.crossDist and now >= crossNext then
+			crossNext = now + 0.45
+			pcall(verbs.cross)
+			stats.crosses = stats.crosses + 1
+		end
 	end
-	return nearestOtherRoot(limit or 60)
 end
-local function autoGuardTick(now, _hum, root)
-	guardActive = false
-	guardMX, guardMY = 0, 0
-	if not CFG.autoGuard or not root or now < guardNext then return end
+
+local function autoGuardTick(now, root)
+	if not CFG.autoGuard then
+		guardActive, guardMX, guardMY = false, 0, 0
+		return
+	end
+	if not root or now < guardNext then return end
 	guardNext = now + 0.12
+	guardActive, guardMX, guardMY = false, 0, 0
 	if ownHasBall() then return end
-	local handler = ballHandlerRoot(60)
-	if not handler or not CourtOk or not Court then return end
+	local handler = ballHolderRoot()
 	local hoop = hoopWorldPosition()
+	if not handler or not hoop or not (Court and Court.fromWorld) then return end
 	local toHoop = Vector3.new(hoop.X - handler.Position.X, 0, hoop.Z - handler.Position.Z)
 	if toHoop.Magnitude < 0.5 then return end
 	local stand = handler.Position + toHoop.Unit * math.clamp(CFG.guardDist, 1.5, 8)
 	local okX, rx, ry = pcall(Court.fromWorld, root.Position)
 	local okS, sx, sy = pcall(Court.fromWorld, stand)
-	if not (okX and okS and rx and ry and sx and sy) then return end
+	if not (okX and okS and tonumber(rx) and tonumber(ry) and tonumber(sx) and tonumber(sy)) then return end
 	local dx, dy = sx - rx, sy - ry
-	local dist = math.sqrt(dx * dx + dy * dy)
-	if dist > 0.6 then
+	local mag = math.sqrt(dx * dx + dy * dy)
+	if mag > 0.6 then
 		guardMX = math.clamp(dx, -1, 1)
 		guardMY = math.clamp(dy, -1.6, 1.6)
 		guardActive = true
 	end
 end
 
---// body mods --------------------------------------------------------------------
+--// input.poll wrapper (guard steering) -------------------------------------------
+local origPoll, pollWrapper
+if Input and type(Input.poll) == "function" then
+	origPoll = Input.poll
+	pollWrapper = function(...)
+		local v = origPoll(...)
+		if type(v) == "table" and CFG.autoGuard and guardActive then
+			v.mx, v.my = guardMX, guardMY
+		end
+		return v
+	end
+	overrideField(Input, "poll", pollWrapper)
+end
+
+--// body mods ---------------------------------------------------------------------
 local function applyBodyMods()
 	local hum = myHumanoid()
 	if not hum then return end
-	if CFG.speed then hum.WalkSpeed = CFG.speedVal else hum.WalkSpeed = STOCK_WALK end
-	if CFG.jump then hum.JumpHeight = CFG.jumpVal else hum.JumpHeight = STOCK_JUMP end
+	hum.WalkSpeed = CFG.speed and CFG.speedVal or STOCK_WALK
+	hum.JumpHeight = CFG.jump and CFG.jumpVal or STOCK_JUMP
 end
 
---// lifecycle --------------------------------------------------------------------
-local window, statusBox
+--// lifecycle ---------------------------------------------------------------------
+local window
+local heartbeat
+local panicConn
 local shutOnce = false
 local shutdown
+
+local function panic()
+	CFG.speed, CFG.jump, CFG.esp = false, false, false
+	CFG.perfectShot, CFG.autoGreen = false, false
+	CFG.autoSteal, CFG.autoBlock, CFG.autoCross, CFG.autoGuard = false, false, false, false
+	CFG.rimEsp, CFG.shotChart = false, false
+	uninstallShotHooks()
+	applyBodyMods()
+	if espFolder then
+		for _, t in pairs(espTargets) do
+			pcall(function()
+				t.hl:Destroy()
+				t.plate:Destroy()
+			end)
+		end
+		table.clear(espTargets)
+	end
+	if hoopPart then
+		pcall(function() hoopPart:Destroy() end)
+		hoopPart = nil
+		hoopGui = nil
+	end
+	if chartGui then
+		pcall(function() chartGui:Destroy() end)
+		chartGui, chartLabel = nil, nil
+	end
+	print("[SLIM] panic: toggles off, body restored, hooks removed")
+end
+
 shutdown = function()
 	if shutOnce then return end
 	shutOnce = true
-	pcall(function() RunService:UnbindFromRenderStep("SlimDuels") end)
-	uninstallPerfectShot()
-	for _, t in pairs(espTargets) do pcall(function() t.hl:Destroy() t.plate:Destroy() end) end
+	if heartbeat then
+		pcall(function() heartbeat:Disconnect() end)
+		heartbeat = nil
+	end
+	if panicConn then
+		pcall(function() panicConn:Disconnect() end)
+		panicConn = nil
+	end
+	uninstallShotHooks()
+	if Input and origPoll and pollWrapper and Input.poll == pollWrapper then
+		Input.poll = origPoll
+	end
+	for _, t in pairs(espTargets) do
+		pcall(function()
+			t.hl:Destroy()
+			t.plate:Destroy()
+		end)
+	end
 	table.clear(espTargets)
-	pcall(function() espFolder:Destroy() end)
-	pcall(function() if hoopPart then hoopPart:Destroy() end end)
-	pcall(function() if shotChartGui then shotChartGui:Destroy() end end)
+	if espFolder then pcall(function() espFolder:Destroy() end) end
+	if hoopPart then
+		pcall(function() hoopPart:Destroy() end)
+		hoopPart = nil
+		hoopGui = nil
+	end
+	if chartGui then
+		pcall(function() chartGui:Destroy() end)
+		chartGui, chartLabel = nil, nil
+	end
 	local hum = myHumanoid()
-	if hum then hum.WalkSpeed = STOCK_WALK hum.JumpHeight = STOCK_JUMP end
+	if hum then
+		hum.WalkSpeed = STOCK_WALK
+		hum.JumpHeight = STOCK_JUMP
+	end
+	pcall(clearStyleOverride, true)
 	if window then
 		pcall(function() window:Unload() end)
-		pcall(function() if window.screenGui then window.screenGui:Destroy() end end)
 	end
-	_G.SlimDuels = nil
-	print("[SlimDuels] unloaded")
-end
-local function panic()
-	CFG.speed, CFG.jump, CFG.esp = false, false, false
-	CFG.perfectShot, CFG.autoGreen, CFG.autoSteal = false, false, false
-	CFG.autoBlock, CFG.autoCross, CFG.autoGuard = false, false, false
-	CFG.rimEsp, CFG.shotChart = false, false
-	applyBodyMods()
-	print("[SlimDuels] panic: all toggles killed, body restored to stock")
+	if _G.SlimDuels and _G.SlimDuels.shutdown == shutdown then
+		_G.SlimDuels = nil
+	end
+	print("[SLIM] unloaded")
 end
 
-local Rayfield
-pcall(function() Rayfield = loadstring(game:HttpGet("https://sirius.menu/gen2"))() end)
-
-local function buildUI()
-	if not Rayfield then return end
-	local w = Rayfield:CreateWindow({ Name = "BASKETBALL DUELS | SLIM", LoadingTitle = "SLIM DUELS", LoadingSubtitle = "one-file court panel", KeySystem = false })
-	window = w
-	local court = w:CreateTab({ name = "COURT" })
-	local sys = w:CreateTab({ name = "SYS" })
-	court:CreateToggle({ name = "esp", description = "see every rig through walls, with distance", flag = "esp", value = CFG.esp, callback = function(v) CFG.esp = v end })
-	court:CreateToggle({ name = "esp names", description = "show rig names over their heads", flag = "espNames", value = CFG.espNames, callback = function(v) CFG.espNames = v end })
-	court:CreateSlider({ name = "esp range", description = "0 = everyone, else studs", range = {0, 250}, increment = 10, value = CFG.espDist, suffix = " st", callback = function(v) CFG.espDist = v end })
-	court:CreateToggle({ name = "hoop ESP", description = "marker the sim hoop through walls", flag = "rimEsp", value = CFG.rimEsp, callback = function(v) CFG.rimEsp = v if hoopGui then hoopGui.Enabled = v end end })
-	court:CreateToggle({ name = "shot chart", description = "live feet-to-hoop readout", flag = "shotChart", value = CFG.shotChart, callback = function(v) CFG.shotChart = v end })
-
-	pcall(function() court:CreateSection({ name = "SCORING" }) end)
-	court:CreateToggle({ name = "perfect shot", description = "rewrite the release hold time into the green window", value = CFG.perfectShot, callback = function(v) CFG.perfectShot = v if v then installPerfectShot() end end })
-	court:CreateToggle({ name = "auto-green", description = "release yourself the moment the HUD meter enters green", value = CFG.autoGreen, callback = function(v) CFG.autoGreen = v end })
-
-	pcall(function() court:CreateSection({ name = "DEFENSE" }) end)
-	court:CreateToggle({ name = "auto steal", description = "press steal when a defender is inside your reach", value = CFG.autoSteal, callback = function(v) CFG.autoSteal = v end })
-	court:CreateToggle({ name = "smart steal", description = "close in on the ball and steal inside true hand reach", value = CFG.smartSteal, callback = function(v) CFG.smartSteal = v end })
-	court:CreateToggle({ name = "auto block", description = "press block when a defender gets near", value = CFG.autoBlock, callback = function(v) CFG.autoBlock = v end })
-	court:CreateToggle({ name = "auto cross", description = "press crossover when a defender presses you", value = CFG.autoCross, callback = function(v) CFG.autoCross = v end })
-	court:CreateToggle({ name = "auto guard", description = "stand between the ball handler and the hoop", flag = "autoGuard", value = CFG.autoGuard, callback = function(v) CFG.autoGuard = v end })
-	court:CreateSlider({ name = "guard space", description = "studs you stand off the ball handler - lower is tighter", range = {1.5, 8}, increment = .1, value = CFG.guardDist, suffix = " st", callback = function(v) CFG.guardDist = v end })
-	court:CreateSlider({ name = "steal reach", description = "studs before auto steal fires", range = {3, 8}, increment = .1, value = CFG.stealDist, suffix = " st", callback = function(v) CFG.stealDist = v end })
-	court:CreateSlider({ name = "block reach", description = "studs before auto block fires", range = {4, 10}, increment = .1, value = CFG.blockDist, suffix = " st", callback = function(v) CFG.blockDist = v end })
-
-	court:CreateToggle({ name = "speed boost", description = "lobby movement; the match sim ignores this", flag = "speed", value = CFG.speed, callback = function(v) CFG.speed = v end })
-	court:CreateSlider({ name = "walkspeed", description = "lobby only", range = {5, 60}, increment = 1, value = CFG.speedVal, suffix = " ws", callback = function(v) CFG.speedVal = v end })
-	court:CreateToggle({ name = "high jump", description = "lobby movement; the match sim ignores this", flag = "jump", value = CFG.jump, callback = function(v) CFG.jump = v end })
-	court:CreateSlider({ name = "jump height", description = "lobby only", range = {0, 50}, increment = 1, value = CFG.jumpVal, suffix = " st", callback = function(v) CFG.jumpVal = v end })
-
-	sys:CreateButton({ name = "panic (P)", description = "kill every toggle, put your body back to stock", callback = panic })
-	sys:CreateButton({ name = "unload panel", description = "tear everything down", callback = shutdown })
-	statusBox = sys:CreateConsole({ name = "log", height = 150, follow = false })
-	if statusBox then pcall(function() statusBox:Set("slim duels loaded | esp, scoring, defense, movement") end) end
+local prior = _G.SlimDuels
+if type(prior) == "table" and type(prior.shutdown) == "function" then
+	pcall(prior.shutdown)
 end
 
-installPerfectShot()
-local uiOk = pcall(buildUI)
-if not uiOk then warn("[SlimDuels] rayfield failed to load - running headless") end
+--// main loop ---------------------------------------------------------------------
+local uiStatus, uiStats
+local uiClock = 0
+local scheduler = { nextVisual = 0, nextBody = 0 }
+local function tick(dt)
+	local now = os.clock()
 
-local function renderFrame()
-	applyBodyMods()
-	refreshEsp()
-	ensureHoopEsp()
-	if hoopGui then hoopGui.Enabled = CFG.rimEsp end
-	updateShotChart()
+	if CFG.perfectShot then
+		if Config and Config.play and Config.play.range ~= LONG_RANGE then
+			Config.play.range = LONG_RANGE
+		end
+		if not Hooks.installed then installShotHooks() end
+	end
+
+	if now >= scheduler.nextVisual then
+		scheduler.nextVisual = now + 0.1
+		refreshEsp()
+		updateHoopMarker()
+		updateChart()
+	end
 	autoGreenTick()
-	smartStealTick(os.clock())
-	local ch = myChar()
-	local mineHum = ch and ch:FindFirstChildWhichIsA("Humanoid")
-	local mineRoot = ch and ch.PrimaryPart
-	if mineHum and mineRoot then
-		autoInputTick(os.clock())
-		autoGuardTick(os.clock(), mineHum, mineRoot)
+	autoInputTick(now)
+	autoGuardTick(now, myRoot())
+
+	if now >= scheduler.nextBody then
+		scheduler.nextBody = now + 1
+		applyBodyMods()
+	end
+
+	uiClock = uiClock + dt
+	if uiClock >= 0.2 then
+		uiClock = 0
+		local d = courtDistance()
+		local status = string.format(
+			"%.1f ft%s  |  last %s %s",
+			d or 0,
+			d and (d >= 23.75 and " (3PT)" or " (2PT)") or "",
+			stats.lastGrade or "-",
+			stats.lastM and string.format("%.3f", stats.lastM) or ""
+		)
+		if uiStatus then pcall(function() uiStatus:Set(status) end) end
+		if uiStats then
+			pcall(function()
+				uiStats:Set(string.format(
+					"green writes %d   shots %d   greens %d\nsteals %d   blocks %d   crosses %d   auto-rel %d   styles %d",
+					stats.greenWrites, stats.shots, stats.greens,
+					stats.steals, stats.blocks, stats.crosses, stats.autoReleases, stats.styleEquips
+				))
+			end)
+		end
 	end
 end
-RunService:BindToRenderStep("SlimDuels", Enum.RenderPriority.Camera.Value + 3, function() pcall(renderFrame) end)
 
-UserInputService.InputBegan:Connect(function(input, typing)
-	if typing then return end
-	if UserInputService:GetFocusedTextBox() then return end
+heartbeat = RunService.Heartbeat:Connect(tick)
+panicConn = UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if gameProcessed then return end
 	if input.KeyCode == Enum.KeyCode.P then
 		panic()
-		if window and window.Notify then pcall(function() window:Notify({ title = "SLIM", content = "panic - stock body", duration = 2 }) end) end
 	end
 end)
 
-_G.SlimDuels = { cfg = CFG, stats = stats, stop = shutdown, panic = panic }
-if window then
-	print("[SlimDuels] panel loaded - court vision, perfect shot, auto-green, defense, movement")
-else
-	print("[SlimDuels] modules loaded headless - no panel window")
+--// UI ----------------------------------------------------------------------------
+local function buildUI()
+	local Rayfield
+	local okLoad, errLoad = pcall(function()
+		Rayfield = loadstring(game:HttpGet("https://sirius.menu/gen2"))()
+	end)
+	if not okLoad or not Rayfield then
+		warn("[SLIM] Rayfield failed to load: " .. tostring(errLoad))
+		return
+	end
+	local ok, err = pcall(function()
+		local w = Rayfield:CreateWindow({
+			name = "BASKETBALL DUELS",
+			subtitle = "SLIM | perfect green",
+			sidebarLayout = true,
+		})
+		window = w
+
+		local court = w:CreateTab({ name = "COURT" })
+		local sys = w:CreateTab({ name = "SYS" })
+
+		court:CreateSection({ name = "VISUALS" })
+		court:CreateToggle({
+			name = "ESP",
+			description = "highlight every rig through walls",
+			value = CFG.esp,
+			callback = function(v) CFG.esp = v end,
+		})
+		court:CreateSlider({
+			name = "ESP range",
+			description = "0 = show everyone",
+			range = { 0, 250 },
+			increment = 10,
+			value = CFG.espDist,
+			suffix = " st",
+			callback = function(v) CFG.espDist = v end,
+		})
+		court:CreateToggle({
+			name = "ESP names",
+			value = CFG.espNames,
+			callback = function(v) CFG.espNames = v end,
+		})
+		court:CreateToggle({
+			name = "hoop marker",
+			description = "gold marker on the rim",
+			value = CFG.rimEsp,
+			callback = function(v) CFG.rimEsp = v end,
+		})
+		court:CreateToggle({
+			name = "shot chart",
+			description = "feet to hoop + last release grade",
+			value = CFG.shotChart,
+			callback = function(v) CFG.shotChart = v end,
+		})
+
+		court:CreateSection({ name = "PERFECT SHOT" })
+		court:CreateToggle({
+			name = "perfect shot",
+			description = "write every release to the exact green centre",
+			value = CFG.perfectShot,
+			callback = function(v) setPerfectShot(v) end,
+		})
+		court:CreateToggle({
+			name = "full-court judge",
+			description = "online only: green judge for shots past 36 ft",
+			value = CFG.fullCourt,
+			callback = function(v) CFG.fullCourt = v end,
+		})
+		court:CreateToggle({
+			name = "auto-green",
+			description = "release when the HUD meter enters green",
+			value = CFG.autoGreen,
+			callback = function(v) CFG.autoGreen = v end,
+		})
+		uiStatus = court:CreateText({ name = "status", text = "waiting for court..." })
+		uiStats = court:CreateText({ name = "session", text = "no shots yet" })
+
+		court:CreateSection({ name = "DEFENSE" })
+		court:CreateToggle({
+			name = "auto steal",
+			value = CFG.autoSteal,
+			callback = function(v) CFG.autoSteal = v end,
+		})
+		court:CreateToggle({
+			name = "auto block",
+			value = CFG.autoBlock,
+			callback = function(v) CFG.autoBlock = v end,
+		})
+		court:CreateToggle({
+			name = "auto cross",
+			value = CFG.autoCross,
+			callback = function(v) CFG.autoCross = v end,
+		})
+		court:CreateToggle({
+			name = "auto guard",
+			description = "stand between the ball handler and the rim",
+			value = CFG.autoGuard,
+			callback = function(v) CFG.autoGuard = v end,
+		})
+
+		sys:CreateSection({ name = "BODY" })
+		sys:CreateToggle({
+			name = "speed",
+			value = CFG.speed,
+			callback = function(v)
+				CFG.speed = v
+				applyBodyMods()
+			end,
+		})
+		sys:CreateSlider({
+			name = "walk speed",
+			range = { 5, 60 },
+			increment = 1,
+			value = CFG.speedVal,
+			callback = function(v)
+				CFG.speedVal = v
+				applyBodyMods()
+			end,
+		})
+		sys:CreateToggle({
+			name = "jump",
+			value = CFG.jump,
+			callback = function(v)
+				CFG.jump = v
+				applyBodyMods()
+			end,
+		})
+		sys:CreateSlider({
+			name = "jump height",
+			range = { 0, 50 },
+			increment = 1,
+			value = CFG.jumpVal,
+			callback = function(v)
+				CFG.jumpVal = v
+				applyBodyMods()
+			end,
+		})
+
+		sys:CreateSection({ name = "SESSION" })
+		sys:CreateButton({
+			name = "panic (P)",
+			description = "kill every toggle and restore stock",
+			callback = panic,
+		})
+		sys:CreateButton({
+			name = "unload",
+			description = "remove the panel and every hook",
+			callback = shutdown,
+		})
+
+		local styles = w:CreateTab({ name = "STYLES" })
+		stylesTab = styles
+		styles:CreateSection({ name = "STYLE PICKER" })
+		uiStyleStatus = styles:CreateText({ name = "status", text = "loading Iso.Styles..." })
+		styles:CreateButton({
+			name = "scan game styles",
+			description = "read Iso.Styles.LIST and list every style",
+			callback = function()
+				scanStyles()
+			end,
+		})
+		styles:CreateButton({
+			name = "dump style debug",
+			description = "print the real catalog, slots, and active local override",
+			callback = dumpStyleDebug,
+		})
+		styles:CreateText({
+			name = "note",
+			text = "Server equip only works for styles already rolled into one of your slots. Anything else is applied locally; use restore to undo.",
+		})
+		scanStyles()
+		styles:CreateSection({ name = "MANUAL EQUIP" })
+		styles:CreateInput({
+			name = "style id",
+			placeholder = "type a style, then press enter",
+			value = "",
+			callback = function(v) StyleState.manual = tostring(v or "") end,
+		})
+		styles:CreateButton({
+			name = "equip typed style",
+			description = "server-equips if slotted; otherwise applies a local preview",
+			callback = function()
+				equipStyle(StyleState.manual)
+			end,
+		})
+		styles:CreateButton({
+			name = "restore real style",
+			description = "undo the local preview and put your server style back",
+			callback = function()
+				restoreStyle()
+			end,
+		})
+		styles:CreateButton({
+			name = "unlock all styles (client)",
+			description = "best effort client profile only; the server still owns the real inventory",
+			callback = function()
+				local changed, tables = unlockAllStyles()
+				print(string.format("[SLIM] unlock all: %d additions across %d tables", changed, tables))
+			end,
+		})
+	end)
+	if not ok then
+		warn("[SLIM] UI build failed: " .. tostring(err))
+	end
+	if stylesTab then
+		task.spawn(function()
+			task.wait(0.4)
+			pcall(scanStyles)
+		end)
+	end
 end
+
+_G.SlimDuels = {
+	shutdown = shutdown,
+	panic = panic,
+	setPerfectShot = setPerfectShot,
+	scanStyles = scanStyles,
+	equipStyle = equipStyle,
+	restoreStyle = restoreStyle,
+	unlockAllStyles = unlockAllStyles,
+	styles = StyleState,
+	cfg = CFG,
+	stats = stats,
+}
+
+if STATE_REF and type(STATE_REF.onCleanup) == "function" then
+	STATE_REF.onCleanup(shutdown)
+end
+
+setPerfectShot(CFG.perfectShot)
+task.spawn(function()
+	task.wait(0.2)
+	buildUI()
+end)
 end
 
 --// embedded suite: qb_aimbot  (from qb_aimbot.luau) =========================
