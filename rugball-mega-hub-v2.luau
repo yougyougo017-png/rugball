@@ -36498,9 +36498,10 @@ Hub.SUITE.ditch_hotel = function()
 
 	  FARM    auto farm: finds un-knocked rooms, knocks them on the game's
 	          cooldown, retreats above the map between knocks, then teleports
-	          to the escape zone when the exit opens. In the lobby, START
-	          MATCH steps into an elevator queue and uses the game's own
-	          QueueAction remote.
+	          to the escape zone when the exit opens. Party rooms (the pink
+	          PARTY ROOM sign, x5 cash) are picked before normal doors. In the
+	          lobby, START MATCH steps into an elevator queue and uses the
+	          game's own QueueAction remote.
 	  ESP     guests, un-knocked rooms and the exit, with names/distances.
 	  MOVE    walk speed, jump power, camera fly.
 	  SYSTEM  anti-AFK, panic, unload.
@@ -36557,6 +36558,7 @@ local CFG = {
 	autoReplay = false,
 	skyRetreat = true,
 	preferDND = false,
+	preferParty = true,
 	mode = "Hotel",
 	difficulty = "Easy",
 	safeY = 220,
@@ -36717,6 +36719,10 @@ local function isDND(room)
 	return room.prompt:GetAttribute("DND") == true
 end
 
+local function isParty(room)
+	return room.model:GetAttribute("Party") == true
+end
+
 local function distanceTo(room)
 	return (room.spot.Position - getPos()).Magnitude
 end
@@ -36753,6 +36759,26 @@ local function pickRoom()
 	local floorY = resolveFloorY()
 	if not floorY then return nil end
 
+	local function byDistance(a, b)
+		return distanceTo(a) < distanceTo(b)
+	end
+
+	-- Party rooms pay x5 cash, so they outrank every normal door even when
+	-- they are on another floor. The game only marks them with the Party
+	-- attribute once a round starts; knocked rooms are never eligible.
+	if CFG.preferParty then
+		local parties = {}
+		for _, room in ipairs(rooms()) do
+			if not isKnocked(room) and isParty(room) then
+				parties[#parties + 1] = room
+			end
+		end
+		if #parties > 0 then
+			table.sort(parties, byDistance)
+			return parties[1]
+		end
+	end
+
 	local list = {}
 	for _, room in ipairs(rooms()) do
 		if not isKnocked(room) and math.abs(room.spot.Position.Y - floorY) <= 6 then
@@ -36765,7 +36791,7 @@ local function pickRoom()
 			if not isKnocked(room) then list[#list + 1] = room end
 		end
 		if #list > 0 then
-			table.sort(list, function(a, b) return distanceTo(a) < distanceTo(b) end)
+			table.sort(list, byDistance)
 			STATE.floorY = list[1].spot.Position.Y
 		end
 	end
@@ -36897,7 +36923,8 @@ local function runKnock(room)
 
 	local ok, err = pcall(function()
 		local before = done()
-		setStatus(string.format("knocking room %d", room.number))
+		local party = isParty(room)
+		setStatus(string.format("knocking room %d%s", room.number, party and "  ·  x5 party" or ""))
 
 		teleport(room.spot.Position + Vector3.new(0, 3, 0))
 		task.wait(0.25)
@@ -36908,8 +36935,8 @@ local function runKnock(room)
 		if after > before then
 			STATE.fail = 0
 			STATE.lastKnock = os.clock()
-			setStatus(string.format("door %d down  ·  %d/%d", room.number, after, needed()))
-			print(string.format("[SLIM] knocked room %d (%d/%d)", room.number, after, needed()))
+			setStatus(string.format("door %d down%s  ·  %d/%d", room.number, party and " (x5)" or "", after, needed()))
+			print(string.format("[SLIM] knocked room %d%s (%d/%d)", room.number, party and " (party x5)" or "", after, needed()))
 		else
 			STATE.fail += 1
 			setStatus(string.format("knock on room %d did not register", room.number))
@@ -37251,7 +37278,9 @@ local function updateRooms(cam)
 	local visible = {}
 	for _, room in ipairs(rooms()) do
 		local knocked = isKnocked(room)
-		if (not knocked or CFG.espKnocked) and math.abs(room.spot.Position.Y - floorY) <= 6 then
+		local party = isParty(room)
+		local onFloor = math.abs(room.spot.Position.Y - floorY) <= 6
+		if (not knocked or CFG.espKnocked) and (onFloor or (CFG.preferParty and party)) then
 			local dist = (room.spot.Position - here).Magnitude
 			if CFG.espDist <= 0 or dist <= CFG.espDist then
 				local screen = cam:WorldToViewportPoint(room.spot.Position + Vector3.new(0, 5.5, 0))
@@ -37265,9 +37294,10 @@ local function updateRooms(cam)
 						visible[room.model] = true
 						entry.label.Visible = true
 						local dnd = isDND(room)
-						local suffix = knocked and "  ✓" or (dnd and "  !" or "")
+						local suffix = knocked and "  ✓" or (party and "  x5" or (dnd and "  !" or ""))
 						entry.label.Text = tostring(room.number) .. suffix
 						entry.label.Color = knocked and Color3.fromRGB(90, 200, 120)
+							or party and Color3.fromRGB(255, 90, 160)
 							or dnd and Color3.fromRGB(255, 200, 70)
 							or Color3.fromRGB(240, 240, 240)
 						entry.label.Position = Vector2.new(screen.X, screen.Y)
@@ -37411,7 +37441,7 @@ local function buildUI()
 		farm:CreateSection({ name = "AUTO FARM" })
 		ui.autoFarm = farm:CreateToggle({
 			name = "auto farm",
-			description = "knock every un-knocked room, wait out the 8s cooldown above the map, then escape",
+			description = "knock every un-knocked room (party x5 first), wait out the 8s cooldown above the map, then escape",
 			value = CFG.autoFarm,
 			callback = function(v)
 				CFG.autoFarm = v
@@ -37442,6 +37472,12 @@ local function buildUI()
 			description = "fly above the hotel between knocks so guests cannot reach you",
 			value = CFG.skyRetreat,
 			callback = function(v) CFG.skyRetreat = v end,
+		})
+		ui.preferParty = farm:CreateToggle({
+			name = "best door first (party x5)",
+			description = "pick any un-knocked PARTY ROOM before normal doors; the pink sign pays x5 cash",
+			value = CFG.preferParty,
+			callback = function(v) CFG.preferParty = v end,
 		})
 		ui.preferDND = farm:CreateToggle({
 			name = "prefer DND doors",
