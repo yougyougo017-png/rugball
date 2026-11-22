@@ -36579,6 +36579,7 @@ local STATE = {
 	guestDraw = {},
 	roomDraw = {},
 	exitDraw = nil,
+	doneRooms = {},
 	connections = {},
 	lastStatus = "",
 	lastInfo = "",
@@ -36712,7 +36713,12 @@ local function rooms()
 end
 
 local function isKnocked(room)
-	return room.model:GetAttribute("Knocked") == true
+	if STATE.doneRooms[room.model] then return true end
+	if room.model:GetAttribute("Knocked") == true then
+		STATE.doneRooms[room.model] = true
+		return true
+	end
+	return false
 end
 
 local function isDND(room)
@@ -36935,6 +36941,7 @@ local function runKnock(room)
 		if after > before then
 			STATE.fail = 0
 			STATE.lastKnock = os.clock()
+			STATE.doneRooms[room.model] = true
 			setStatus(string.format("door %d down%s  ·  %d/%d", room.number, party and " (x5)" or "", after, needed()))
 			print(string.format("[SLIM] knocked room %d%s (%d/%d)", room.number, party and " (party x5)" or "", after, needed()))
 		else
@@ -36971,6 +36978,7 @@ local function autoStep()
 		STATE.voted = false
 		STATE.fail = 0
 		STATE.escaping = false
+		STATE.doneRooms = {}
 	end
 	STATE.lastDone = d
 
