@@ -30,6 +30,7 @@
 		92640845955320   HITBLOX MULTIPLAYER     hitblox
 		92551591080135   The Ditch Hotel (match)  ditch_hotel
 		83379330867218   The Ditch Hotel (lobby)  ditch_hotel
+		12497348201      FNAF: Co-op - FNAF 1    fnaf_coop
 
 	the taf bypass suite is standalone now. Drive Duels and Throw A Football 7s both
 	run qb_aimbot, which carries the same MoveGuard/AnimGuard layers, so loading
@@ -73,6 +74,7 @@ Hub.ORDER = {
 	{ place = 92640845955320,  label = "HITBLOX", suites = { "hitblox" } },
 	{ place = 92551591080135,  label = "THE DITCH HOTEL", suites = { "ditch_hotel" } },
 	{ place = 83379330867218,  label = "THE DITCH HOTEL", suites = { "ditch_hotel" } },
+	{ place = 12497348201,     label = "FNAF CO-OP - FNAF 1", suites = { "fnaf_coop" } },
 }
 
 Hub.GAMES = {}
@@ -91,9 +93,10 @@ Hub.UNIVERSE = {
 	[10769851460] = { "criminal" },
 	[10774632516] = { "hitblox" },
 	[10773912080] = { "ditch_hotel" },
+	[4391829435] = { "fnaf_coop" },
 }
 
-Hub.SUITE_ORDER = { "football", "anime", "nba", "swish", "duels", "qb_aimbot", "taf_bypass", "physbox", "tps", "track", "rss", "mma", "carsoccer", "skyview", "superhero", "criminal", "hitblox", "ditch_hotel" }
+Hub.SUITE_ORDER = { "football", "anime", "nba", "swish", "duels", "qb_aimbot", "taf_bypass", "physbox", "tps", "track", "rss", "mma", "carsoccer", "skyview", "superhero", "criminal", "hitblox", "ditch_hotel", "fnaf_coop" }
 
 Hub.SUITE_NAMES = {
 	football   = "football panel    |  aim / tackle / block",
@@ -114,6 +117,7 @@ Hub.SUITE_NAMES = {
 	criminal   = "criminal simulator |  loot esp / prompt sniper / grab / movement",
 	hitblox    = "hitblox panel     |  contract / payout / combat / esp / stealth",
 	ditch_hotel = "ditch hotel       |  auto knock / escape / esp",
+	fnaf_coop  = "fnaf coop         |  esp / night guard doors / movement / teleports",
 }
 
 Hub.SUITE = {}
@@ -9581,7 +9585,10 @@ _G.SlimTafBypass = nil
 
 --// config --------------------------------------------------------------------
 
+local CFG_REV = 2
+
 local DEFAULTS = {
+	cfgRev = CFG_REV,
 	enabled = true,
 	autoTarget = true,
 	perfect = true,
@@ -9612,6 +9619,11 @@ local DEFAULTS = {
 	maxDistance = 300,
 	speedCap = 110,
 	lead = true,
+	-- run-game auto block (off until the user turns it on)
+	autoBlock = false,
+	autoBlockDef = true,
+	blockRange = 6,
+	blockMove = true,
 	-- anti-cheat bypass (MoveGuard + AnimGuard + movement)
 	closure = true,
 	block = true,
@@ -9646,6 +9658,7 @@ end
 
 local CFG_FILE = "slimhub-qbaim.cfg"
 local panicked = false
+local cfgLocked = true
 
 local function removeCfg()
 	if delfile then
@@ -9654,11 +9667,15 @@ local function removeCfg()
 end
 
 local function loadCfg()
-	if not (isfile and readfile and isfile(CFG_FILE)) then return end
+	if not (isfile and readfile and isfile(CFG_FILE)) then return nil end
 	local ok, data = pcall(readfile, CFG_FILE)
-	if not ok or type(data) ~= "string" then return end
+	if not ok or type(data) ~= "string" then return nil end
+	local rev = 0
 	for line in string.gmatch(data, "[^\r\n]+") do
 		local k, v = string.match(line, "^([%w_]+)=(.*)$")
+		if k == "cfgRev" then
+			rev = tonumber(v) or 0
+		end
 		if k and CFG[k] ~= nil then
 			if v == "true" then
 				CFG[k] = true
@@ -9669,6 +9686,22 @@ local function loadCfg()
 			end
 		end
 	end
+	return rev
+end
+
+local loadedRev = loadCfg()
+
+-- Older configs could be written while Rayfield replayed its own saved flags
+-- during the window build, which persisted the solver toggles as off even
+-- when they were never turned off in the panel. Those layers are not a
+-- preference worth preserving across that bug: put the exact throw solver back
+-- on once, then let the regular toggles own them again.
+if loadedRev and loadedRev < CFG_REV then
+	CFG.lead = true
+	CFG.idealSpeed = true
+	CFG.snap = true
+	CFG.perfect = true
+	CFG.cfgRev = CFG_REV
 end
 
 local function saveCfg()
@@ -9678,6 +9711,7 @@ local function saveCfg()
 		removeCfg()
 		return
 	end
+	if cfgLocked then return end
 	if not writefile then return end
 	local keys = {}
 	for k in pairs(CFG) do
@@ -9690,8 +9724,6 @@ local function saveCfg()
 	end
 	pcall(writefile, CFG_FILE, table.concat(out, "\n"))
 end
-
-loadCfg()
 
 --// services ------------------------------------------------------------------
 
@@ -9746,8 +9778,21 @@ local LOCK_COLOR = Color3.fromRGB(255, 221, 35)
 local dead = false
 local inputConn = nil
 local ui = { flags = {}, window = nil, status = nil, acState = nil, acCover = nil, acCounters = nil, acLogText = nil, farm = nil, lockDrop = nil, lockText = nil }
-local hooks = { launch = false, launchOrig = nil, launchWrapper = nil, snap = false, powerSaved = false, rankSaved = false }
-local stats = { throws = 0, aimed = 0, auto = 0, plays = 0, rebirths = 0, lastSpeed = 0, missed = 0 }
+local hooks = {
+	launch = false,
+	launchOrig = nil,
+	launchWrapper = nil,
+	snap = false,
+	powerSaved = false,
+	rankSaved = false,
+	relay = false,
+	relayOrig = nil,
+	relayWrapper = nil,
+	style = false,
+	styleOrig = nil,
+	styleWrapper = nil,
+}
+local stats = { throws = 0, aimed = 0, auto = 0, plays = 0, rebirths = 0, lastSpeed = 0, missed = 0, relays = 0, blocks = 0 }
 local pick = nil
 local targetList = {}
 local cycle = 0
@@ -9766,6 +9811,9 @@ local nextClick = 0
 local autoAt = 0
 local holdAt = 0
 local statusLine = "starting"
+local blockHeld = false
+local blockMoveAt = 0
+local blockName = nil
 
 --// anti-cheat bypass ---------------------------------------------------------
 -- ported from the standalone taf_bypass suite so one script covers both jobs.
@@ -10612,6 +10660,7 @@ local Controllers = PlayerScripts and (PlayerScripts:FindFirstChild("Controllers
 
 local TC = softRequire(Controllers and Controllers:FindFirstChild("ThrowController"))
 local GR = softRequire(Controllers and Controllers:FindFirstChild("GameRigs"))
+local MC = softRequire(Controllers and Controllers:FindFirstChild("MatchController"))
 local DC = softRequire(Controllers and Controllers:FindFirstChild("DataController"))
 local CamCtl = softRequire(Controllers and Controllers:FindFirstChild("CameraController"))
 local BC = softRequire(Controllers and Controllers:FindFirstChild("BallController"))
@@ -10619,6 +10668,7 @@ local BC = softRequire(Controllers and Controllers:FindFirstChild("BallControlle
 local TAF = ReplicatedStorage:FindFirstChild("TAF_Shared")
 local Shared = TAF and TAF:FindFirstChild("Shared")
 local TCfg = softRequire(Shared and Shared:FindFirstChild("ThrowConfig"))
+local TX = softRequire(Shared and Shared:FindFirstChild("ThrowStyles"))
 local GCfg = softRequire(Shared and Shared:FindFirstChild("GameConfig"))
 local Formulas = softRequire(Shared and Shared:FindFirstChild("Formulas"))
 
@@ -10646,6 +10696,7 @@ if not (TC and BC and TCfg) then
 		TAF = TAF or ReplicatedStorage:FindFirstChild("TAF_Shared")
 		Shared = Shared or (TAF and TAF:FindFirstChild("Shared"))
 		TCfg = TCfg or softRequire(Shared and Shared:FindFirstChild("ThrowConfig"))
+		TX = TX or softRequire(Shared and Shared:FindFirstChild("ThrowStyles"))
 	until (TC and BC and TCfg) or os.clock() > deadline
 end
 
@@ -10875,28 +10926,92 @@ local function catchOf(r, base)
 		end
 	end
 	local scale = tonumber(r.Scale) or 1
-	return Vector3.new(base.X, base.Y + (3 + HANDS) * scale, base.Z)
+	local lift = tonumber(r.Lift) or 0
+	return Vector3.new(base.X, base.Y + (3 + HANDS) * scale + lift, base.Z)
 end
+
+-- Drive Duels moves its receivers by CFrame, so AssemblyLinearVelocity stays
+-- at zero and the aim has to be led from position history. a single-frame
+-- difference is far too noisy, and the old 0.35 lerp took ~0.2s to reach the
+-- real route speed - long enough for a throw released at the snap to land
+-- behind a receiver who is already running. use the same windowed estimator
+-- the game's own ThrowStyleDD uses (0.134s window, 60 studs/s cap, teleport
+-- guard), plus a short-window reset the first time a rig starts moving.
+local VEL_WINDOW = 0.134
+local VEL_MAX = 60
+local VEL_TELEPORT = 8
 
 local function velOf(r, base, now)
 	local v = r.Vel
 	if typeof(v) == "Vector3" and v.Magnitude > 0.5 then
 		return v
 	end
+	local root = r.Root
+	if typeof(root) == "Instance" and root:IsA("BasePart") then
+		local alv = root.AssemblyLinearVelocity
+		if typeof(alv) == "Vector3" and alv.Magnitude > 0.5 then
+			return Vector3.new(alv.X, 0, alv.Z)
+		end
+	end
 	local t = trackers[r]
 	if not t then
-		trackers[r] = { p = base, t = now, v = Vector3.zero }
-		return Vector3.zero
+		t = { hist = { { now, base } }, v = Vector3.zero, stillAt = now }
+		trackers[r] = t
+		return t.v
 	end
-	local dt = now - t.t
-	if dt >= 0.05 then
-		local raw = (base - t.p) / dt
-		if raw.Magnitude > 120 then
+	local hist = t.hist
+	local last = hist[#hist]
+	if not last then
+		hist[1] = { now, base }
+		return t.v
+	end
+	local gap = now - last[1]
+	local jump = (base - last[2]).Magnitude
+	if gap > 0.5 or (jump > VEL_TELEPORT and jump / math.max(gap, 0.001) > VEL_MAX) then
+		table.clear(hist)
+		hist[1] = { now, base }
+		t.v = Vector3.zero
+		t.stillAt = now
+		return t.v
+	end
+	if jump <= 0.0001 then
+		t.stillAt = t.stillAt or now
+		if now - t.stillAt >= 0.1 then
+			t.v = Vector3.zero
+			table.clear(hist)
+			hist[1] = { now, base }
+		end
+		return t.v
+	end
+	local wasStill = t.stillAt ~= nil and now - t.stillAt >= 0.1
+	t.stillAt = nil
+	if wasStill then
+		-- keep only the last stationary frame + this moving frame, so the idle
+		-- time does not water the first real route speed down.
+		table.clear(hist)
+		hist[1] = last
+		hist[2] = { now, base }
+	else
+		hist[#hist + 1] = { now, base }
+	end
+	local first = 1
+	while first < #hist and now - hist[first + 1][1] >= VEL_WINDOW do
+		first = first + 1
+	end
+	if first > 1 then
+		table.move(hist, first, #hist, 1)
+		for i = #hist - first + 2, #hist do
+			hist[i] = nil
+		end
+	end
+	local oldest = hist[1]
+	local dt = now - oldest[1]
+	if dt >= 0.03 then
+		local raw = (base - oldest[2]) / dt
+		if raw.Magnitude > VEL_MAX then
 			raw = Vector3.zero
 		end
-		t.v = t.v:Lerp(raw, 0.35)
-		t.p = base
-		t.t = now
+		t.v = raw
 	end
 	return t.v
 end
@@ -10921,6 +11036,171 @@ local function leadPoint(from, point, vel)
 		p = point + vel * ((Vector3.new(p.X - from.X, 0, p.Z - from.Z)).Magnitude / horiz)
 	end
 	return p
+end
+
+local function flatDist(a, b)
+	return (Vector3.new(b.X - a.X, 0, b.Z - a.Z)).Magnitude
+end
+
+-- a straight lead assumes the receiver keeps running forever, which is wrong on
+-- every route with a break or a shallow depth: the throw then lands where the
+-- receiver would have been if the route never ended. Drive Duels keeps the
+-- play's absolute route waypoints in MatchController.Setup.Routes, keyed by
+-- receiver slot, so walk the route itself and clamp at its last waypoint. the
+-- flight time is iterated because the aim point changes the required speed.
+local function routeAim(r, base, from, aim, vel, slot)
+	local routes = MC and MC.Setup and MC.Setup.Routes
+	if type(routes) ~= "table" then
+		return aim
+	end
+	local key = tonumber(slot) or tonumber(r.Name) or tonumber(r.Slot)
+	if not key and r.Name ~= nil then
+		key = tonumber((tostring(r.Name):gsub("^R", "")))
+	end
+	local pts = key and (routes[key] or routes[tostring(key)])
+	if type(pts) ~= "table" or #pts == 0 then
+		return aim
+	end
+	local path = {}
+	local catchY = aim.Y
+	for i = 1, #pts do
+		local v = pts[i]
+		if typeof(v) == "Vector3" then
+			path[#path + 1] = Vector3.new(v.X, catchY, v.Z)
+		end
+	end
+	if #path == 0 then
+		return aim
+	end
+	local speed = Vector3.new(vel.X, 0, vel.Z).Magnitude
+	if speed < 1 then
+		return aim
+	end
+	local best, bestSeg, bestT = math.huge, 1, 0
+	if #path == 1 then
+		best = flatDist(base, path[1])
+	else
+		for i = 1, #path - 1 do
+			local a, b = path[i], path[i + 1]
+			local abx, abz = b.X - a.X, b.Z - a.Z
+			local len2 = abx * abx + abz * abz
+			local t = 0
+			if len2 > 0.0001 then
+				t = math.clamp(((base.X - a.X) * abx + (base.Z - a.Z) * abz) / len2, 0, 1)
+			end
+			local q = Vector3.new(a.X + abx * t, catchY, a.Z + abz * t)
+			local d = flatDist(base, q)
+			if d < best then
+				best, bestSeg, bestT = d, i, t
+			end
+		end
+	end
+	local walk = { base }
+	if #path > 1 and bestT > 0.0001 and bestT < 0.9999 then
+		local a, b = path[bestSeg], path[bestSeg + 1]
+		walk[#walk + 1] = Vector3.new(
+			a.X + (b.X - a.X) * bestT,
+			catchY,
+			a.Z + (b.Z - a.Z) * bestT
+		)
+		for i = bestSeg + 1, #path do
+			walk[#walk + 1] = path[i]
+		end
+	else
+		local first = bestSeg
+		if #path > 1 and bestT >= 0.9999 then
+			first = bestSeg + 1
+		end
+		for i = first, #path do
+			walk[#walk + 1] = path[i]
+		end
+	end
+	if #walk < 2 then
+		return aim
+	end
+	local function timeTo(p)
+		local dir = TCfg.launchDirection(from, p)
+		local s = TCfg.idealSpeed(from, p, dir)
+		if not s then
+			return nil
+		end
+		local h = math.sqrt(dir.X * dir.X + dir.Z * dir.Z)
+		if h < 0.01 then
+			return nil
+		end
+		return flatDist(from, p) / (s * h)
+	end
+	local t = timeTo(aim)
+	if not t then
+		return aim
+	end
+	local out = aim
+	for _ = 1, 3 do
+		local travel = speed * t
+		local used = 0
+		local point = walk[1]
+		for i = 2, #walk do
+			local a, b = walk[i - 1], walk[i]
+			local seg = flatDist(a, b)
+			if seg > 0.0001 then
+				if used + seg >= travel then
+					local f = (travel - used) / seg
+					point = Vector3.new(
+						a.X + (b.X - a.X) * f,
+						catchY,
+						a.Z + (b.Z - a.Z) * f
+					)
+					used = travel
+					break
+				end
+				used = used + seg
+			end
+			point = b
+		end
+		out = point
+		local nextT = timeTo(out)
+		if not nextT or math.abs(nextT - t) < 0.02 then
+			break
+		end
+		t = nextT
+	end
+	return out
+end
+
+-- the render loop rebuilds the pick every 50ms, but Launch can land anywhere
+-- inside that window. re-run the solve against the actual launch origin so a
+-- release at the snap still gets the newest route velocity instead of the
+-- pre-snap zero.
+local function refreshAim(e, from)
+	if not e or not e.rig then
+		return e
+	end
+	local base = baseOf(e.rig)
+	if not base then
+		return e
+	end
+	local spot = catchOf(e.rig, base)
+	if not spot then
+		return e
+	end
+	local vel = velOf(e.rig, base, os.clock())
+	local aim = spot
+	if CFG.lead then
+		aim = leadPoint(from, spot, vel)
+		aim = routeAim(e.rig, base, from, aim, vel, e.slot)
+	end
+	local dir = TCfg.launchDirection(from, aim)
+	local speed = TCfg.idealSpeed(from, aim, dir)
+	if not speed then
+		return e
+	end
+	e.base = base
+	e.raw = spot
+	e.point = aim
+	e.vel = vel
+	e.dir = dir
+	e.speed = speed
+	return e
 end
 
 -- real players are not guaranteed to be in GameRigs.Home.Receivers. the game
@@ -11496,6 +11776,7 @@ local function build(now)
 					local aim = spot
 					if CFG.lead then
 						aim = leadPoint(origin, spot, vel)
+						aim = routeAim(r, base, origin, aim, vel, tonumber(r.Slot) or i)
 					end
 					local dir = TCfg.launchDirection(origin, aim)
 					local speed = TCfg.idealSpeed(origin, aim, dir)
@@ -12026,6 +12307,14 @@ local function updateHud(now)
 		"throws %d   aimed %d   auto %d",
 		stats.throws, stats.aimed, stats.auto
 	)
+	if CFG.autoBlock then
+		lines[#lines + 1] = string.format(
+			"block %s   %d   %s",
+			blockHeld and "HELD" or "ready",
+			stats.blocks,
+			blockName or "no chaser"
+		)
+	end
 
 	if hudBody then
 		hudBody.Text = table.concat(lines, "\n")
@@ -12049,7 +12338,9 @@ local function installLaunch()
 	local wrapper = function(self, pos, vel, grav, perfect, wobble, drift)
 		stats.throws = stats.throws + 1
 		local e = pick
+		local origVel = vel
 		if CFG.enabled and e and typeof(pos) == "Vector3" then
+			e = refreshAim(e, pos)
 			if CFG.idealSpeed then
 				local dir = TCfg.launchDirection(pos, e.point)
 				local speed = TCfg.idealSpeed(pos, e.point, dir)
@@ -12070,8 +12361,18 @@ local function installLaunch()
 		stats.lastPos = pos
 		stats.lastVel = vel
 		stats.lastPoint = e and e.point or nil
+		stats.lastRaw = e and e.raw or nil
+		stats.lastBase = e and e.base or nil
+		stats.lastLead = e and e.vel or nil
 		stats.lastName = e and e.name or nil
-		return orig(self, pos, vel, grav, perfect, wobble, drift)
+		stats.lastRig = e and e.rig or nil
+		stats.lastAt = os.clock()
+		stats.lastGrav = grav
+		stats.lastOrigVel = origVel
+		local ball, flight = orig(self, pos, vel, grav, perfect, wobble, drift)
+		stats.lastBall = ball
+		stats.lastFlight = flight
+		return ball, flight
 	end
 	local ok = pcall(function()
 		BC.Launch = wrapper
@@ -12085,6 +12386,154 @@ local function installLaunch()
 	end
 end
 
+-- the duel throw path solves the velocity inside ThrowController, launches the
+-- local ball with it, and relays that same vector to the server. wrapping only
+-- BallController.Launch fixes the ball you see and leaves the authoritative
+-- throw aimed at the pre-hook point - a perfect-looking bot/practice throw that
+-- still misses online. SetRelay is where MatchController hands its relayThrow
+-- (and the commit) to the controller, so wrap the callback and re-solve the
+-- server-bound vector onto the same route-aware point, wire payload included.
+-- the server rejects any wire whose Velocity.Magnitude is above the thrower's
+-- arm Top, and the game's own perfect solve clamps to the same number. mirror
+-- that clamp so a route-aware solve is never thrown out as a speed cheat; the
+-- ball then lands exactly where the game would have put a max-arm throw.
+local armCache = { at = 0, top = nil }
+
+local function armTop()
+	local now = os.clock()
+	if armCache.top and now - armCache.at < 1 then
+		return armCache.top
+	end
+	armCache.at = now
+	armCache.top = nil
+	if type(TC) == "table" and type(TC.StyleState) == "function" and TX and type(TX.armFromRanks) == "function" then
+		local okState, st = pcall(TC.StyleState, TC)
+		if okState and type(st) == "table" then
+			local okArm, arm = pcall(TX.armFromRanks, st.Power, st.Accuracy)
+			if okArm and type(arm) == "table" and tonumber(arm.Top) then
+				armCache.top = tonumber(arm.Top)
+			end
+		end
+	end
+	return armCache.top
+end
+
+local function serverAim(pos, e)
+	if not e.reachable then
+		return nil
+	end
+	local dir = TCfg.launchDirection(pos, e.point)
+	local speed = TCfg.idealSpeed(pos, e.point, dir)
+	if not speed or speed > CFG.speedCap then
+		return nil
+	end
+	local top = armTop()
+	if top and speed > top then
+		speed = top
+	end
+	return dir * speed, speed
+end
+
+local function installRelay()
+	if hooks.relay or type(TC) ~= "table" or type(TC.SetRelay) ~= "function" then
+		return
+	end
+	if TC.SetRelay == hooks.relayWrapper then
+		hooks.relay = true
+		return
+	end
+	local orig = TC.SetRelay
+	-- The style path already sends the wire (Net.ThrowStyle) before this relay
+	-- runs, so rewriting the vector here alone could make the two disagree. The
+	-- solve itself is fixed in installStyle, which runs before the wire is
+	-- built; this wrapper only keeps a non-style relay (no Style table at all)
+	-- on the same solution.
+	local wrapper = function(self, fn, commit)
+		if type(fn) ~= "function" then
+			return orig(self, fn, commit)
+		end
+		local relay = function(pos, vel, perfect, wire)
+			if CFG.enabled and CFG.idealSpeed and typeof(pos) == "Vector3" and type(wire) ~= "table" then
+				local e = pick
+				if e then
+					e = refreshAim(e, pos)
+					local v, speed = serverAim(pos, e)
+					if v then
+						vel = v
+						stats.relays = stats.relays + 1
+						stats.lastSpeed = speed
+					end
+				end
+			end
+			stats.lastRelay = vel
+			return fn(pos, vel, perfect, wire)
+		end
+		return orig(self, relay, commit)
+	end
+	local ok = pcall(function()
+		TC.SetRelay = wrapper
+	end)
+	if ok and TC.SetRelay == wrapper then
+		hooks.relay = true
+		hooks.relayOrig = orig
+		hooks.relayWrapper = wrapper
+	end
+end
+
+-- the wire payload (Net.ThrowStyle) is built from the style object's own
+-- Velocity/Aim before the relay is called, so patching the relay alone would
+-- leave that message aimed at the old point. StyleThrow hands us the style
+-- object once per throw; wrap its Solve so the first solve - the one that fills
+-- Style.Velocity and therefore the wire - is already the route-aware one.
+local function installStyle()
+	if hooks.style or type(TC) ~= "table" or type(TC.StyleThrow) ~= "function" then
+		return
+	end
+	if TC.StyleThrow == hooks.styleWrapper then
+		hooks.style = true
+		return
+	end
+	local orig = TC.StyleThrow
+	local wrapper = function(self, style)
+		if type(style) == "table" and type(style.Solve) == "function" then
+			local baseSolve = style.Solve
+			style.Solve = function(pos)
+				if CFG.enabled and CFG.idealSpeed and typeof(pos) == "Vector3" then
+					local e = pick
+					if e then
+						e = refreshAim(e, pos)
+						local v = serverAim(pos, e)
+						if v then
+							style.Aim = e.point
+							if CFG.perfect then
+								style.Perfect = true
+							end
+							return v
+						end
+					end
+				end
+				return baseSolve(pos)
+			end
+		end
+		return orig(self, style)
+	end
+	local ok = pcall(function()
+		TC.StyleThrow = wrapper
+	end)
+	if ok and TC.StyleThrow == wrapper then
+		hooks.style = true
+		hooks.styleOrig = orig
+		hooks.styleWrapper = wrapper
+	end
+end
+
+-- the online ThrowStyle path does its own lead from the target table's
+-- Position history (ThrowStyleDD.estimate). it keys that history by the table
+-- identity, so returning a fresh table every frame starves the estimator and
+-- every online throw goes out with zero lead. keep one table per rig and only
+-- move its Position.
+local snapTargets = setmetatable({}, { __mode = "k" })
+
 local function installSnap()
 	if hooks.snap or type(TC.SetAimTargets) ~= "function" then
 		return
@@ -12094,7 +12543,13 @@ local function installSnap()
 		if not e or not e.reachable then
 			return nil
 		end
-		return { { Position = e.raw, Velocity = e.vel or Vector3.zero } }
+		local t = snapTargets[e.rig]
+		if not t then
+			t = { Position = e.raw, Velocity = e.vel or Vector3.zero }
+			snapTargets[e.rig] = t
+		end
+		t.Position = e.raw
+		return { t }
 	end
 	pcall(TC.SetAimTargets, TC, resolver)
 	hooks.snap = true
@@ -12161,6 +12616,29 @@ local function restoreAll()
 	end
 	removeSnap()
 	restoreAssist()
+	if hooks.relay then
+		-- the relay callback the game is holding stays ours and forwards
+		-- untouched while the master switch is off; only the setter goes back
+		-- so the next SetRelay from MatchController lands on the real one.
+		pcall(function()
+			if TC and TC.SetRelay == hooks.relayWrapper then
+				TC.SetRelay = hooks.relayOrig
+			end
+		end)
+		hooks.relay = false
+		hooks.relayOrig = nil
+		hooks.relayWrapper = nil
+	end
+	if hooks.style then
+		pcall(function()
+			if TC and TC.StyleThrow == hooks.styleWrapper then
+				TC.StyleThrow = hooks.styleOrig
+			end
+		end)
+		hooks.style = false
+		hooks.styleOrig = nil
+		hooks.styleWrapper = nil
+	end
 	if hooks.powerSaved then
 		TC.PowerAssist = hooks.powerOrig
 		hooks.powerSaved = false
@@ -12176,6 +12654,8 @@ local function setEnabled(v)
 	if v then
 		panicked = false
 		installLaunch()
+		installRelay()
+		installStyle()
 		if CFG.snap then
 			installSnap()
 			widenAssist()
@@ -12308,6 +12788,272 @@ local function autoThrowStep(now, force)
 		autoAt = now
 		nextClick = now + 0.3
 		mouseClick()
+	end
+end
+
+--// auto block ----------------------------------------------------------------
+-- Drive Duels keeps its action gate on the controller's private table, exposed
+-- as MatchController._K2: canBlock()/block(held) runs the real Block action
+-- (Net.Match "Action"/"Block", MatchConfig.BlockHold, the procedural Block
+-- move) after every server-side precondition, and tryHit() performs the game's
+-- own tackle (auto-aimed "HitStick"). Driving those two instead of firing the
+-- remotes by hand means the feature cannot desync the controller's state or
+-- send an action the game would have refused.
+--
+-- On offense the loop walks you onto the carrier/nearest-chaser line and holds
+-- Block while canBlock() says the server will take it. On defense it runs the
+-- carrier's intercept point and calls tryHit() inside tackle range. It re-picks
+-- every tick, so it works through every chaser in turn.
+
+-- _K2 is a plain field on the controller table, not a closure, so holding onto
+-- it is safe and it is rebuilt with the controller on every rejoin.
+local function actionTable()
+	local k = MC and MC._K2
+	if type(k) == "table" then
+		return k
+	end
+	return nil
+end
+
+local function slotPosOf(name)
+	local k = actionTable()
+	if not k or type(name) ~= "string" or type(k.slotPos) ~= "function" then
+		return nil
+	end
+	local ok, pos = pcall(k.slotPos, name)
+	if ok and typeof(pos) == "Vector3" then
+		return pos
+	end
+	return nil
+end
+
+-- closest defender to the carrier, skipping the slot we stand in. anyone
+-- behind the runner is ranked back so the body goes where the run is going
+-- instead of trailing it, and it re-picks every tick so each new chaser gets
+-- met in turn.
+local function nearestChaser(rows, carrierPos, carrierVel, skipSlot)
+	local best, bestName, bestScore = nil, nil, math.huge
+	local moving = carrierVel and carrierVel.Magnitude > 2
+	for name in pairs(rows) do
+		if type(name) == "string" and string.sub(name, 1, 2) == "D." and name ~= skipSlot then
+			local pos = slotPosOf(name)
+			if pos then
+				local delta = pos - carrierPos
+				local flat = Vector3.new(delta.X, 0, delta.Z)
+				local dist = flat.Magnitude
+				if dist <= 60 then
+					local score = dist
+					if moving and dist > 0.1 and flat.Unit:Dot(carrierVel.Unit) < 0 then
+						score = score * 2.2
+					end
+					if score < bestScore then
+						best, bestName, bestScore = pos, name, score
+					end
+				end
+			end
+		end
+	end
+	return best, bestName
+end
+
+local function setBlock(on)
+	local live = MC and MC._live
+	if type(live) ~= "table" then
+		return
+	end
+	local k = actionTable()
+	if on then
+		if blockHeld or live.Blocking == true or live.Phase ~= "Live" then
+			return
+		end
+		if not k or type(k.block) ~= "function" then
+			return
+		end
+		local okCan, can = pcall(k.canBlock)
+		if not okCan or not can then
+			return
+		end
+		pcall(k.block, true)
+		-- block() only sets the flag once the action was actually sent, so it
+		-- doubles as confirmation the server-bound message went out.
+		if live.Blocking == true then
+			blockHeld = true
+			stats.blocks = stats.blocks + 1
+		end
+	elseif blockHeld then
+		blockHeld = false
+		if k and type(k.block) == "function" then
+			pcall(k.block, false)
+		else
+			live.Blocking = false
+		end
+	end
+end
+
+-- drive the humanoid to a point, but step aside the moment the player steers
+-- somewhere clearly different. MoveTo is re-issued on a timer because the target
+-- is a live slot position, not a fixed spot.
+local function steerTo(hum, root, point, now)
+	if not CFG.blockMove then
+		return
+	end
+	local mine = Vector3.new(root.Position.X, 0, root.Position.Z)
+	local flat = Vector3.new(point.X, 0, point.Z)
+	local delta = flat - mine
+	local dist = delta.Magnitude
+	if dist <= 0.6 then
+		if blockMoveAt ~= 0 then
+			blockMoveAt = 0
+			pcall(function()
+				hum:MoveTo(root.Position)
+			end)
+		end
+		return
+	end
+	local want = delta.Unit
+	local steer = hum.MoveDirection
+	if steer.Magnitude >= 0.15 and steer.Unit:Dot(want) < 0.7 then
+		-- the player is driving somewhere else; never fight a real input.
+		return
+	end
+	local ours = blockMoveAt ~= 0 and (now - blockMoveAt) < 0.5
+	if not ours and steer.Magnitude >= 0.15 then
+		return
+	end
+	if now - blockMoveAt >= 0.15 then
+		blockMoveAt = now
+		pcall(function()
+			hum:MoveTo(Vector3.new(point.X, root.Position.Y, point.Z))
+		end)
+	end
+end
+
+local blockPrev = nil
+local blockPrevAt = 0
+local hitAt = 0
+
+local function autoBlockStep(now)
+	local live = MC and MC._live
+	local state = MC and MC.State
+	if not CFG.autoBlock or dead or type(live) ~= "table" or type(state) ~= "table" or live.Phase ~= "Live" then
+		setBlock(false)
+		blockName = nil
+		blockPrev = nil
+		return
+	end
+	if CFG.respectUi and uiOpen() then
+		setBlock(false)
+		return
+	end
+	local ch = LP.Character
+	local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+	local root = ch and ch:FindFirstChild("HumanoidRootPart")
+	if not hum or not root or hum.Health <= 0 then
+		setBlock(false)
+		return
+	end
+	local k = actionTable()
+	if not k then
+		setBlock(false)
+		return
+	end
+	local carrierSlot = live.Carrier
+	if type(carrierSlot) ~= "string" then
+		setBlock(false)
+		blockName = nil
+		return
+	end
+	-- we are the one with the ball: there is nothing to block, and tryHit would
+	-- be swinging at our own runner.
+	if carrierSlot == state.MySlot then
+		setBlock(false)
+		blockName = "carrying"
+		return
+	end
+	local carrier = slotPosOf(carrierSlot)
+	if not carrier then
+		setBlock(false)
+		blockName = nil
+		return
+	end
+	-- horizontal carrier velocity from the slot sample, the same source the
+	-- game's own tackle aim reads.
+	local cvel = Vector3.zero
+	local dt = now - blockPrevAt
+	if blockPrev and dt > 0 and dt < 0.5 then
+		local d = carrier - blockPrev
+		cvel = Vector3.new(d.X, 0, d.Z) / dt
+		if cvel.Magnitude > 80 then
+			cvel = Vector3.zero
+		end
+	end
+	blockPrev, blockPrevAt = carrier, now
+	local myTeam = tonumber(state.MyTeam)
+	local off = tonumber(live.Offense)
+	local onOffense = off ~= nil and myTeam ~= nil and off == myTeam
+	if onOffense then
+		-- the snap is not out, or we still hold it: no blocking yet.
+		if live.Holding == true then
+			setBlock(false)
+			blockName = nil
+			return
+		end
+		-- a pass in flight is not a run: wait until somebody has it in hand.
+		if live.BallInHand ~= true then
+			setBlock(false)
+			blockName = nil
+			return
+		end
+		local rows = MC.Setup and MC.Setup.Slots
+		if type(rows) ~= "table" then
+			setBlock(false)
+			blockName = nil
+			return
+		end
+		local chaser, chaserName = nearestChaser(rows, carrier, cvel, state.MySlot)
+		if not chaser then
+			setBlock(false)
+			blockName = nil
+			return
+		end
+		blockName = chaserName
+		local between = carrier - chaser
+		between = Vector3.new(between.X, 0, between.Z)
+		local point = chaser
+		if between.Magnitude > 0.1 then
+			-- stand on the runner's side of the chaser so the body meets him on
+			-- the way through rather than once he has gone by.
+			point = chaser + between.Unit * 2
+		end
+		steerTo(hum, root, point, now)
+		local okCan, can = pcall(k.canBlock)
+		if okCan and can and (chaser - root.Position).Magnitude <= CFG.blockRange then
+			setBlock(true)
+		else
+			setBlock(false)
+		end
+		return
+	end
+	if not CFG.autoBlockDef then
+		setBlock(false)
+		blockName = nil
+		return
+	end
+	if live.Holding == true then
+		setBlock(false)
+		blockName = nil
+		return
+	end
+	-- defense: run the carrier's intercept point, then let the game's own hit
+	-- stick take over once he is inside tackle range.
+	steerTo(hum, root, carrier + cvel * 0.2, now)
+	blockName = carrierSlot
+	setBlock(false)
+	if (carrier - root.Position).Magnitude <= CFG.blockRange + 4 and now - hitAt >= 0.25 then
+		hitAt = now
+		if type(k.tryHit) == "function" then
+			pcall(k.tryHit)
+		end
 	end
 end
 
@@ -12842,6 +13588,62 @@ local function buildUI()
 		Description = "one RebirthPanel request, even if auto rebirth is off.",
 		Callback = function()
 			requestRebirth()
+		end,
+	})
+
+	autoTab:CreateSection({ Name = "AUTO BLOCK" })
+	autoTab:CreateText({
+		Name = "auto block note",
+		Text = "uses the game's own actions, so every server check still applies. on offense it walks you onto the line between the ball carrier and the nearest chaser (the linebacker first) and holds Block whenever the game says the block is legal; on defense it runs the carrier's intercept point and fires the game's hit-stick tackle once he is in range. it re-picks every tick, so it works through every chaser in turn, and it never steers against your own movement keys.",
+	})
+	reg("qb_block_auto", "autoBlock")
+	autoTab:CreateToggle({
+		Name = "auto block",
+		Description = "blocks for the running back on run plays, and auto-tackles the carrier when you are on defense.",
+		Flag = "qb_block_auto",
+		Value = CFG.autoBlock,
+		Callback = function(v)
+			CFG.autoBlock = v
+			if not v then
+				setBlock(false)
+			end
+			saveCfg()
+		end,
+	})
+	reg("qb_block_def", "autoBlockDef")
+	autoTab:CreateToggle({
+		Name = "auto tackle",
+		Description = "when the other team has the ball, run the carrier down and use the game's hit stick. off means the feature only works on offense.",
+		Flag = "qb_block_def",
+		Value = CFG.autoBlockDef,
+		Callback = function(v)
+			CFG.autoBlockDef = v
+			saveCfg()
+		end,
+	})
+	reg("qb_block_move", "blockMove")
+	autoTab:CreateToggle({
+		Name = "steer me there",
+		Description = "drives your humanoid onto the block point. off leaves you to move and only fires Block / hit stick when a chaser is already in range.",
+		Flag = "qb_block_move",
+		Value = CFG.blockMove,
+		Callback = function(v)
+			CFG.blockMove = v
+			saveCfg()
+		end,
+	})
+	reg("qb_block_range", "blockRange")
+	autoTab:CreateSlider({
+		Name = "block range",
+		Description = "distance to a chaser that counts as contact for the Block action and for the hit stick.",
+		Range = { 3, 14 },
+		Increment = 0.5,
+		Value = CFG.blockRange,
+		Suffix = " st",
+		Flag = "qb_block_range",
+		Callback = function(v)
+			CFG.blockRange = v
+			saveCfg()
 		end,
 	})
 
@@ -13481,7 +14283,6 @@ local function restoreBootCfg()
 	end
 	syncUi()
 	setEnabled(CFG.enabled)
-	saveCfg()
 end
 
 task.spawn(function()
@@ -13489,6 +14290,10 @@ task.spawn(function()
 	if not dead then restoreBootCfg() end
 	task.wait(0.8)
 	if not dead then restoreBootCfg() end
+	-- keep callbacks fired by Rayfield's flag replay from writing their stale
+	-- values over the boot config. only the settled config is persisted.
+	cfgLocked = false
+	saveCfg()
 end)
 
 local function panic()
@@ -13515,6 +14320,8 @@ local function panic()
 	CFG.walkSpeed = false
 	CFG.infSprint = false
 	CFG.autoSprint = false
+	CFG.autoBlock = false
+	setBlock(false)
 	restoreAll()
 	ac.stopBypass()
 	clearVisuals()
@@ -13686,6 +14493,8 @@ RunService:BindToRenderStep(TAG, Enum.RenderPriority.Camera.Value + 2, function(
 			-- installLaunch is a no-op while our wrapper still occupies the
 			-- slot, and re-hooks if the game swapped in a fresh function.
 			installLaunch()
+			installRelay()
+			installStyle()
 			if CFG.snap and not hooks.snap then
 				installSnap()
 				widenAssist()
@@ -13701,6 +14510,7 @@ RunService:BindToRenderStep(TAG, Enum.RenderPriority.Camera.Value + 2, function(
 	else
 		clearVisuals()
 	end
+	autoBlockStep(now)
 	updateHud(now)
 
 	if ui.status and now - lastStatus >= 0.4 then
@@ -37968,6 +38778,2187 @@ _G.SlimDitch = {
 }
 
 print("[SLIM] The Ditch Hotel panel loaded")
+end
+
+--// embedded suite: fnaf_coop  (from fnaf_coop.luau) =========================
+Hub.SUITE.fnaf_coop = function()
+--[[
+    FNAF CO-OP TOOLKIT
+    Standalone client-side helper for FNAF: Co-op - FNAF 1 (place 12497348201).
+    Menu: WindUI (loaded remotely).
+    Toggle: RightShift.
+
+    Features
+      - Live status overlay: night, hour, power, doors, lights, AI rooms
+      - Movement: speed, jump, noclip, fly, infinite jump
+      - Teleports: lobby, office, every camera room, near animatronics
+      - ESP: animatronics, players, camera markers, office doors
+      - Night Guard: door/light toggles, camera switching, auto-door defense,
+        Foxy camera-pulse guard (holds him in Pirate Cove without the tablet)
+      - Misc: fullbright, rejoin, debug info, unload
+
+    Notes
+      - Door and light remotes only work in Night Guard mode and with the
+        camera tablet closed. The toolkit closes the tablet automatically
+        when operating controls (toggleable for auto-defense).
+      - This is a client-side helper. The server still owns the AI and power.
+]]
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TeleportService = game:GetService("TeleportService")
+local Lighting = game:GetService("Lighting")
+
+local LocalPlayer = Players.LocalPlayer
+local Workspace = workspace
+local RS = ReplicatedStorage
+
+-- Tear down a previous execution of this toolkit (handy with live-reload).
+do
+    local ok, genv = pcall(function() return getgenv() end)
+    if ok and type(genv) == "table" then
+        if type(genv.__FNAFToolkitCleanup) == "function" then
+            pcall(genv.__FNAFToolkitCleanup)
+        end
+        genv.__FNAFToolkitCleanup = nil
+        -- The prison toolkit belongs to a different game; stop it if it is
+        -- still running so its loops and menu do not overlap this one.
+        if type(genv.__PrisonToolkitCleanup) == "function" then
+            pcall(genv.__PrisonToolkitCleanup)
+        end
+    end
+end
+
+--// ---------------------------------------------------------------- config ---
+local CFG = {
+    Theme = "Dark",
+    ToggleKey = Enum.KeyCode.RightShift,
+    Title = "FNAF Co-op Toolkit",
+}
+
+-- Office door reference points (XZ only - the doors are ceiling-high).
+local DOOR_LEFT_XZ = Vector2.new(12, -79)
+local DOOR_RIGHT_XZ = Vector2.new(1, -79)
+
+local CAM_CODES = {
+    "CAM1A", "CAM1B", "CAM1C", "CAM2A", "CAM2B",
+    "CAM3", "CAM4A", "CAM4B", "CAM5", "CAM6", "CAM7",
+}
+
+-- Camera positions are the game's own trigger parts.
+local WAYPOINTS = {
+    ["Lobby / Spawn"] = Vector3.new(5.8, 4.2, 53.6),
+    ["Office Entrance"] = Vector3.new(6.5, 4.2, -78.5),
+    ["Office Chair"] = Vector3.new(6.6, 4.0, -83.2),
+    ["Show Stage (CAM1A)"] = Vector3.new(14.4, 9.5, 17.8),
+    ["Dining Area (CAM1B)"] = Vector3.new(42.1, 7.5, -8.1),
+    ["Pirate Cove (CAM1C)"] = Vector3.new(34.0, 9.0, -21.3),
+    ["West Hall (CAM2A)"] = Vector3.new(13.0, 7.0, -65.7),
+    ["W. Hall Corner (CAM2B)"] = Vector3.new(13.0, 7.0, -80.7),
+    ["Supply Closet (CAM3)"] = Vector3.new(27.8, 9.0, -56.6),
+    ["East Hall (CAM4A)"] = Vector3.new(0.0, 7.0, -65.3),
+    ["E. Hall Corner (CAM4B)"] = Vector3.new(0.0, 7.0, -80.7),
+    ["Backstage (CAM5)"] = Vector3.new(45.5, 8.0, -4.2),
+    ["Kitchen (CAM6)"] = Vector3.new(-49.6, 7.0, -42.1),
+    ["Restrooms (CAM7)"] = Vector3.new(-31.2, 8.0, 17.7),
+    ["Entrance (CAM0)"] = Vector3.new(-25.1, 7.5, 37.6),
+}
+
+local WAYPOINT_ORDER = {
+    "Lobby / Spawn",
+    "Office Entrance",
+    "Office Chair",
+    "Show Stage (CAM1A)",
+    "Dining Area (CAM1B)",
+    "Pirate Cove (CAM1C)",
+    "West Hall (CAM2A)",
+    "W. Hall Corner (CAM2B)",
+    "Supply Closet (CAM3)",
+    "East Hall (CAM4A)",
+    "E. Hall Corner (CAM4B)",
+    "Backstage (CAM5)",
+    "Kitchen (CAM6)",
+    "Restrooms (CAM7)",
+    "Entrance (CAM0)",
+}
+
+local ANIMATRONIC_NAMES = { "Bonnie", "Chica", "Freddy", "Foxy", "GoldenFreddy", "Blackout" }
+
+--// ----------------------------------------------------------------- state ---
+local State = {
+    running = true,
+    overlay = true,
+    esp = {
+        animatronics = true,
+        players = false,
+        cameras = false,
+        officeDoors = false,
+        names = true,
+        boxes = true,
+        tracers = false,
+        maxDist = 600,
+    },
+    speed = { enabled = false, value = 32 },
+    jump = { enabled = false, value = 60 },
+    noclip = false,
+    fly = { enabled = false, speed = 45 },
+    infiniteJump = false,
+    fullbright = false,
+    autoDoor = false,
+    autoRadius = 15,
+    autoReopen = true,
+    autoCloseCams = true,
+    autoNotify = false,
+    lowPowerWarn = true,
+    goldenAutoCam = false,
+    -- Foxy's "camera usage" demand can be satisfied by pinging the game's own
+    -- playerSwitchCamsEvent with CAM1C. That sets lockedState server-side
+    -- without opening the tablet, so it costs no camera power.
+    foxyGuard = true,
+    foxyInterval = 2,
+    foxyHoldDoor = true,
+    foxyNotify = true,
+    selectedWaypoint = "Lobby / Spawn",
+    selectedCamera = "CAM1A",
+    selectedAnim = "Bonnie",
+}
+
+local ESP_COLORS = {
+    player = Color3.fromRGB(255, 255, 255),
+    camera = Color3.fromRGB(80, 210, 255),
+    doorOpen = Color3.fromRGB(90, 255, 160),
+    doorClosed = Color3.fromRGB(255, 90, 90),
+    default = Color3.fromRGB(255, 170, 40),
+}
+
+local ANIM_COLORS = {
+    Bonnie = Color3.fromRGB(165, 120, 255),
+    Chica = Color3.fromRGB(255, 225, 90),
+    Freddy = Color3.fromRGB(205, 145, 90),
+    Foxy = Color3.fromRGB(255, 90, 70),
+    GoldenFreddy = Color3.fromRGB(255, 215, 80),
+    Blackout = Color3.fromRGB(150, 150, 160),
+}
+
+local Connections = {}
+local espObjects = {}      -- [model/part] = { box, name, tracer, lastSeen }
+local hashCache = {}       -- [model] = { t, cf, size }
+local animCache = { t = 0, list = {} }
+local noclipOriginal = {}
+local overlayObjects = {}
+local running = true
+local windUI, Window, uiFolder
+local flyVelocity
+local doorCooldown = { left = 0, right = 0 }
+local lastAutoNote = { left = 0, right = 0 }
+local lastFullbright = 0
+local lastFullbrightState = false
+local originalWalkSpeed = nil
+local originalJumpPower, originalUseJumpPower = nil, nil
+local warned = {}
+local foxyLastPulse = 0
+local foxyWasOut = false
+local foxyClosedDoor = false
+local foxyPulsing = false
+
+--// --------------------------------------------------------------- helpers ---
+local function log(...)
+    print("[FNAFToolkit]", ...)
+end
+
+local function notify(title, content, duration)
+    if windUI then
+        pcall(function()
+            windUI:Notify({
+                Title = tostring(title),
+                Content = tostring(content),
+                Duration = duration or 4,
+                Icon = "info",
+            })
+        end)
+    else
+        print("[FNAFToolkit]", title, content)
+    end
+end
+
+local function getChar()
+    return LocalPlayer.Character
+end
+
+local function getHum()
+    local char = getChar()
+    return char and char:FindFirstChildOfClass("Humanoid")
+end
+
+local function getHRP()
+    local char = getChar()
+    return char and char:FindFirstChild("HumanoidRootPart")
+end
+
+local function alive()
+    local hum = getHum()
+    local hrp = getHRP()
+    return hum ~= nil and hrp ~= nil and hum.Health > 0
+end
+
+local function posString(p)
+    return string.format("%.0f, %.0f, %.0f", p.X, p.Y, p.Z)
+end
+
+local function myPosition()
+    local hrp = getHRP()
+    return hrp and hrp.Position or Vector3.zero
+end
+
+local function attrBool(name)
+    local value = RS:GetAttribute(name)
+    return value == true or value == "true"
+end
+
+local function attrNumber(name, fallback)
+    return tonumber(RS:GetAttribute(name)) or fallback or 0
+end
+
+local function inGuardMode()
+    return LocalPlayer:GetAttribute("inNightGuardMode") == true
+end
+
+local function getCameraGui()
+    local pg = LocalPlayer:FindFirstChild("PlayerGui")
+    return pg and pg:FindFirstChild("CameraGui")
+end
+
+local function cameraOpen()
+    local gui = getCameraGui()
+    return gui ~= nil and gui.Enabled == true
+end
+
+local function getOfficeEvents()
+    local re = RS:FindFirstChild("RemoteEvents")
+    return re and re:FindFirstChild("OfficeControls")
+end
+
+local HOUR_LABELS = { "12 AM", "1 AM", "2 AM", "3 AM", "4 AM", "5 AM", "6 AM" }
+
+local function hourLabel()
+    local h = math.clamp(math.floor(attrNumber("nightTimeProgression", 0)), 0, 6)
+    return HOUR_LABELS[h + 1] or (tostring(h) .. " AM")
+end
+
+--// ---------------------------------------------------------- animatronics ---
+local function getAnimEntries()
+    local list = {}
+    local folder = Workspace:FindFirstChild("Animatronics")
+    if not folder then return list end
+
+    for _, model in ipairs(folder:GetChildren()) do
+        local npc = model:FindFirstChild(model.Name .. "NPC")
+        if not npc then
+            for _, child in ipairs(model:GetChildren()) do
+                if child:IsA("Model") and child:FindFirstChildOfClass("Humanoid") then
+                    npc = child
+                    break
+                end
+            end
+        end
+
+        local root = (npc and npc:FindFirstChild("HumanoidRootPart"))
+            or model:FindFirstChild("HumanoidRootPart", true)
+        local humanoid = (npc and npc:FindFirstChildOfClass("Humanoid"))
+            or model:FindFirstChildOfClass("Humanoid")
+        -- The AI scripts live inside <Name>NPC, not on the outer folder.
+        local scriptName = model.Name:lower() .. "Script"
+        local scriptObj = model:FindFirstChild(scriptName)
+            or (npc and npc:FindFirstChild(scriptName))
+            or model:FindFirstChild(scriptName, true)
+
+        local ai = nil
+        local room = ""
+        if scriptObj then
+            ai = tonumber(scriptObj:GetAttribute("AI"))
+            local currentRoom = scriptObj:GetAttribute("currentRoom")
+            if currentRoom ~= nil then
+                room = tostring(currentRoom)
+            else
+                local currentState = scriptObj:GetAttribute("currentState")
+                if currentState ~= nil then room = "state " .. tostring(currentState) end
+            end
+        end
+
+        list[#list + 1] = {
+            name = model.Name,
+            model = model,
+            npc = npc,
+            root = root,
+            humanoid = humanoid,
+            scriptObj = scriptObj,
+            ai = ai,
+            room = room,
+            stunned = npc ~= nil and npc:GetAttribute("stunned") == true,
+            jammed = npc ~= nil and npc:GetAttribute("jammerJammed") == true,
+        }
+    end
+
+    return list
+end
+
+local function refreshAnims(force)
+    local now = os.clock()
+    if not force and now - animCache.t < 0.2 then
+        return animCache.list
+    end
+    animCache.t = now
+    animCache.list = getAnimEntries()
+    return animCache.list
+end
+
+local function findAnimEntry(name)
+    for _, entry in ipairs(animCache.list) do
+        if entry.name == name then return entry end
+    end
+    return nil
+end
+
+-- Foxy's state: 0/1 = still around Pirate Cove, 2+ = out and heading for the
+-- left door. forceMove is set while the server is pushing him along the path.
+local function getFoxyStatus()
+    refreshAnims()
+    local entry = findAnimEntry("Foxy")
+    local scriptObj = entry and entry.scriptObj
+    if not scriptObj then
+        return { entry = entry, out = false, state = nil }
+    end
+    local state = tonumber(scriptObj:GetAttribute("currentState"))
+    local force = scriptObj:GetAttribute("forceMove") == true
+    return {
+        entry = entry,
+        scriptObj = scriptObj,
+        state = state,
+        force = force,
+        out = (state ~= nil and state >= 2) or force,
+        locked = scriptObj:GetAttribute("lockedState") == true,
+        ai = tonumber(scriptObj:GetAttribute("AI")),
+    }
+end
+
+--// --------------------------------------------------------------- cameras ---
+local function closeCameras()
+    local gui = getCameraGui()
+    if not gui or not gui.Enabled then return true end
+
+    local frame = gui:FindFirstChild("Frame")
+    local button = frame and frame:FindFirstChild("CloseCamsButton")
+    local hitbox = button and button:FindFirstChild("CloseCamsHitbox")
+    if hitbox then
+        local ok, conns = pcall(getconnections, hitbox.MouseEnter)
+        if ok and conns then
+            for _, conn in ipairs(conns) do
+                if conn.Enabled and conn.Function then
+                    pcall(conn.Function)
+                end
+            end
+        end
+    end
+
+    task.wait(0.25)
+    if gui.Enabled then
+        pcall(function() gui.Enabled = false end)
+        task.wait(0.1)
+    end
+    return gui.Enabled == false
+end
+
+local function openCameras()
+    local gui = getCameraGui()
+    if not gui then return false end
+    if gui.Enabled then return true end
+    pcall(function() gui:SetAttribute("forceCamOpen", true) end)
+    task.wait(0.45)
+    return gui.Enabled == true
+end
+
+local function switchCamera(code)
+    local gui = getCameraGui()
+    if not gui then return false end
+    if not gui.Enabled then
+        if not openCameras() then return false end
+        task.wait(0.15)
+    end
+
+    local frame = gui:FindFirstChild("Frame")
+    local minimap = frame and frame:FindFirstChild("Minimap")
+    local camFrame = minimap and minimap:FindFirstChild(code)
+    local button = camFrame and camFrame:FindFirstChildWhichIsA("TextButton", true)
+    if not button then return false end
+
+    local ok, conns = pcall(getconnections, button.Activated)
+    if ok and conns then
+        for _, conn in ipairs(conns) do
+            if conn.Enabled and conn.Function then
+                pcall(conn.Function)
+            end
+        end
+    end
+    task.wait(0.4)
+    return true
+end
+
+-- Fires the same remote the camera tablet uses, but without enabling the
+-- tablet GUI. The server marks Foxy lockedState and holds him in the cove.
+local function foxyPulse()
+    if foxyPulsing or cameraOpen() then return false end
+    if not inGuardMode() then return false end
+    local current = LocalPlayer:GetAttribute("currentCamera")
+    if current ~= nil and tostring(current) ~= "" then return false end
+
+    local re = RS:FindFirstChild("RemoteEvents")
+    local event = re and re:FindFirstChild("playerSwitchCamsEvent")
+    if not event then return false end
+
+    foxyPulsing = true
+    local ok = pcall(function() event:FireServer("CAM1C") end)
+    task.wait(0.06)
+    pcall(function() event:FireServer("") end)
+    foxyPulsing = false
+    return ok
+end
+
+-- If cleanup interrupts a pulse, do not leave currentCamera stuck on CAM1C.
+local function clearFakeCameraState()
+    if cameraOpen() then return end
+    local re = RS:FindFirstChild("RemoteEvents")
+    local event = re and re:FindFirstChild("playerSwitchCamsEvent")
+    if not event then return end
+    if tostring(LocalPlayer:GetAttribute("currentCamera") or "") == "CAM1C" then
+        pcall(function() event:FireServer("") end)
+    end
+end
+
+local function exitGuardMode()
+    local re = RS:FindFirstChild("RemoteEvents")
+    local event = re and re:FindFirstChild("triggerNightGuardModeEvent")
+    if event then
+        pcall(function() event:FireServer(false) end)
+    end
+
+    local hum = getHum()
+    if hum and hum.Sit then
+        hum.Sit = false
+        hum.Jump = true
+    end
+    task.wait(0.35)
+end
+
+--// ----------------------------------------------------------- night guard ---
+local lightCooldown = { left = 0, right = 0 }
+
+local function operateDoor(side, closed, silent)
+    local attr = side == "left" and "leftDoorClosed" or "rightDoorClosed"
+    if RS:GetAttribute(attr) == closed then return true end
+    if not inGuardMode() then
+        if not silent then
+            notify("Night Guard", "Sit in the office chair first (Home -> Enter Office).", 4)
+        end
+        return false
+    end
+    if os.clock() < doorCooldown[side] then
+        if silent then return false end
+        task.wait(doorCooldown[side] - os.clock() + 0.05)
+    end
+
+    if cameraOpen() then
+        if silent and not State.autoCloseCams then return false end
+        closeCameras()
+        if cameraOpen() then
+            if not silent then
+                notify("Night Guard", "Close the camera tablet to use the doors.", 3)
+            end
+            return false
+        end
+    end
+
+    local events = getOfficeEvents()
+    local event = events and events:FindFirstChild(side .. "DoorEvent")
+    if not event then return false end
+
+    event:FireServer()
+    doorCooldown[side] = os.clock() + 0.6
+    task.wait(0.2)
+    return RS:GetAttribute(attr) == closed
+end
+
+local function operateLight(side, on, silent)
+    local attr = side == "left" and "leftLightOn" or "rightLightOn"
+    if RS:GetAttribute(attr) == on then return true end
+    if not inGuardMode() then
+        if not silent then
+            notify("Night Guard", "Sit in the office chair first (Home -> Enter Office).", 4)
+        end
+        return false
+    end
+    if os.clock() < lightCooldown[side] then
+        if silent then return false end
+        task.wait(lightCooldown[side] - os.clock() + 0.05)
+    end
+
+    if cameraOpen() then
+        if silent and not State.autoCloseCams then return false end
+        closeCameras()
+        if cameraOpen() then
+            if not silent then
+                notify("Night Guard", "Close the camera tablet to use the lights.", 3)
+            end
+            return false
+        end
+    end
+
+    local events = getOfficeEvents()
+    local event = events and events:FindFirstChild(side .. "LightEvent")
+    if not event then return false end
+
+    event:FireServer()
+    lightCooldown[side] = os.clock() + 0.5
+    task.wait(0.15)
+    return RS:GetAttribute(attr) == on
+end
+
+local function toggleDoor(side)
+    local attr = side == "left" and "leftDoorClosed" or "rightDoorClosed"
+    local current = RS:GetAttribute(attr) == true
+    local ok = operateDoor(side, not current, false)
+    if ok then
+        local now = RS:GetAttribute(attr) == true
+        notify("Night Guard", string.format("%s door: %s", side == "left" and "LEFT" or "RIGHT", now and "CLOSED" or "OPEN"), 2)
+    end
+    return ok
+end
+
+local function toggleLight(side)
+    local attr = side == "left" and "leftLightOn" or "rightLightOn"
+    local current = RS:GetAttribute(attr) == true
+    local ok = operateLight(side, not current, false)
+    if ok then
+        local now = RS:GetAttribute(attr) == true
+        notify("Night Guard", string.format("%s light: %s", side == "left" and "LEFT" or "RIGHT", now and "ON" or "OFF"), 2)
+    end
+    return ok
+end
+
+local function setBothDoors(closed)
+    local okLeft = operateDoor("left", closed, false)
+    task.wait(0.2)
+    local okRight = operateDoor("right", closed, false)
+    if okLeft or okRight then
+        notify("Night Guard", closed and "Both doors: CLOSED" or "Both doors: OPEN", 2)
+    end
+end
+
+-- Returns the animatronics that are within door range of each side. A closed
+-- door uses a larger release radius, which stops the door flapping open and
+-- shut while an animatronic waits in the hall.
+local function getDoorThreats(leftClosed, rightClosed)
+    refreshAnims()
+    local left, right = {}, {}
+    local base = State.autoRadius
+
+    for _, entry in ipairs(animCache.list) do
+        -- Foxy is handled below by state. Once he leaves Pirate Cove he is a
+        -- left-door threat no matter how far away the server has him.
+        if entry.name ~= "Foxy" and entry.humanoid and entry.root
+            and not entry.stunned and not entry.jammed then
+            local pos = entry.root.Position
+            local xz = Vector2.new(pos.X, pos.Z)
+            local dLeft = (xz - DOOR_LEFT_XZ).Magnitude
+            local dRight = (xz - DOOR_RIGHT_XZ).Magnitude
+            local leftRange = leftClosed and (base + 6) or base
+            local rightRange = rightClosed and (base + 6) or base
+            if dLeft <= dRight then
+                if dLeft <= leftRange then left[#left + 1] = entry end
+            else
+                if dRight <= rightRange then right[#right + 1] = entry end
+            end
+        end
+    end
+
+    local foxy = findAnimEntry("Foxy")
+    if foxy and foxy.scriptObj then
+        local state = tonumber(foxy.scriptObj:GetAttribute("currentState"))
+        local force = foxy.scriptObj:GetAttribute("forceMove") == true
+        if (state ~= nil and state >= 2) or force then
+            left[#left + 1] = foxy
+        end
+    end
+
+    return left, right
+end
+
+local function threatLabel(list)
+    if #list == 0 then return "" end
+    local first = list[1].name
+    if #list > 1 then return first .. "+" .. tostring(#list - 1) end
+    return first
+end
+
+--// ------------------------------------------------------------- teleports ---
+local function teleportRaw(pos)
+    local hrp = getHRP()
+    if not hrp then return false end
+
+    local hum = getHum()
+    if hum and hum.Sit then
+        hum.Sit = false
+        hum.Jump = true
+        task.wait(0.25)
+    end
+
+    hrp = getHRP()
+    if not hrp then return false end
+    hrp.CFrame = CFrame.new(pos + Vector3.new(0, 1, 0))
+    task.wait(0.15)
+    hrp = getHRP()
+    if hrp then hrp.CFrame = CFrame.new(pos + Vector3.new(0, 1, 0)) end
+    return true
+end
+
+local function teleportTo(pos, keepGuardMode)
+    if not keepGuardMode and inGuardMode() then
+        exitGuardMode()
+        task.wait(0.15)
+    end
+    return teleportRaw(pos)
+end
+
+local function enterOffice()
+    local triggers = Workspace:FindFirstChild("GameTriggers")
+    local chair = triggers and triggers:FindFirstChild("OfficeChair")
+    local proxPart = chair and chair:FindFirstChild("ProxPart")
+    local prompt = proxPart and proxPart:FindFirstChild("ProximityPrompt")
+    if not prompt then
+        notify("Night Guard", "Office chair prompt was not found.", 4)
+        return false
+    end
+
+    if not teleportTo(Vector3.new(6.6, 4.0, -83.2), true) then
+        notify("Night Guard", "No living character to move.", 3)
+        return false
+    end
+    task.wait(0.45)
+    pcall(fireproximityprompt, prompt)
+    task.wait(1.1)
+
+    local hum = getHum()
+    local ok = inGuardMode() or (hum ~= nil and hum.Sit == true)
+    if ok then
+        notify("Night Guard", "Seated in the office. Door controls are live.", 3)
+    else
+        notify("Night Guard", "Could not sit in the chair.", 3)
+    end
+    return ok
+end
+
+local function leaveToLobby()
+    if inGuardMode() then
+        exitGuardMode()
+        task.wait(0.2)
+    end
+    local ok = teleportRaw(Vector3.new(5.8, 4.2, 53.6))
+    if ok then notify("Teleport", "Left the office. Lobby / Spawn.", 3) end
+    return ok
+end
+
+local function tpWaypoint(name)
+    if name == "Office Chair" then
+        return enterOffice()
+    end
+
+    local pos = WAYPOINTS[name]
+    if not pos then
+        notify("Teleport", "Unknown waypoint: " .. tostring(name), 3)
+        return false
+    end
+
+    local ok = teleportTo(pos)
+    if ok then
+        notify("Teleport", name .. "  ·  " .. posString(pos), 2)
+    else
+        notify("Teleport", "No living character.", 3)
+    end
+    return ok
+end
+
+local function tpAnimatronic(name)
+    refreshAnims(true)
+    local entry = findAnimEntry(name)
+    if not entry or not entry.root then
+        notify("Teleport", tostring(name) .. " was not found.", 3)
+        return false
+    end
+
+    local target = entry.root.Position - entry.root.CFrame.LookVector * 8 + Vector3.new(0, 1.5, 0)
+    local ok = teleportTo(target)
+    if ok then
+        notify("Teleport", string.format("Near %s  ·  %s", name, posString(target)), 3)
+    end
+    return ok
+end
+
+--// -------------------------------------------------------------- movement ---
+local function applySpeed()
+    local hum = getHum()
+    if not hum then return end
+    if State.speed.enabled then
+        if originalWalkSpeed == nil then originalWalkSpeed = hum.WalkSpeed end
+        hum.WalkSpeed = State.speed.value
+    else
+        hum.WalkSpeed = originalWalkSpeed or hum.WalkSpeed
+        originalWalkSpeed = nil
+    end
+end
+
+local function applyJump()
+    local hum = getHum()
+    if not hum then return end
+    if State.jump.enabled then
+        if originalJumpPower == nil then
+            originalJumpPower = hum.JumpPower
+            originalUseJumpPower = hum.UseJumpPower
+        end
+        hum.UseJumpPower = true
+        hum.JumpPower = State.jump.value
+    else
+        if originalUseJumpPower ~= nil then
+            hum.UseJumpPower = originalUseJumpPower
+        end
+        hum.JumpPower = originalJumpPower or hum.JumpPower
+        originalJumpPower, originalUseJumpPower = nil, nil
+    end
+end
+
+local function makeFly(hrp)
+    if flyVelocity then
+        pcall(function() flyVelocity:Destroy() end)
+    end
+    flyVelocity = Instance.new("BodyVelocity")
+    flyVelocity.Name = "FNAFToolkitFly"
+    flyVelocity.MaxForce = Vector3.new(1e6, 1e6, 1e6)
+    flyVelocity.P = 1e4
+    flyVelocity.Velocity = Vector3.zero
+    flyVelocity.Parent = hrp
+end
+
+local function setFly(enabled)
+    State.fly.enabled = enabled
+    if enabled then
+        local hrp = getHRP()
+        if hrp then makeFly(hrp) end
+    else
+        if flyVelocity then
+            flyVelocity:Destroy()
+            flyVelocity = nil
+        end
+    end
+end
+
+local function noclipCharacter()
+    local char = getChar()
+    if not char then return end
+    if State.noclip then
+        for _, part in ipairs(char:GetDescendants()) do
+            if part:IsA("BasePart") then
+                if noclipOriginal[part] == nil then
+                    noclipOriginal[part] = part.CanCollide
+                end
+                part.CanCollide = false
+            end
+        end
+    else
+        for part, original in pairs(noclipOriginal) do
+            if part and part.Parent then
+                pcall(function() part.CanCollide = original end)
+            end
+        end
+        table.clear(noclipOriginal)
+    end
+end
+
+local function flyTick()
+    if not State.fly.enabled then
+        if flyVelocity then
+            pcall(function() flyVelocity:Destroy() end)
+            flyVelocity = nil
+        end
+        return
+    end
+    if not alive() then return end
+    local hrp = getHRP()
+    if not hrp then return end
+
+    if not flyVelocity or not flyVelocity.Parent then
+        makeFly(hrp)
+    elseif flyVelocity.Parent ~= hrp then
+        flyVelocity.Parent = hrp
+    end
+
+    local hum = getHum()
+    local direction = hum and hum.MoveDirection or Vector3.zero
+    local vertical = 0
+    if UserInputService:IsKeyDown(Enum.KeyCode.Space) then vertical = 1 end
+    if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then vertical = -1 end
+    flyVelocity.Velocity = direction * State.fly.speed
+        + Vector3.new(0, vertical * State.fly.speed, 0)
+end
+
+--// ------------------------------------------------------------- fullbright ---
+local LIGHT_PROPS = {
+    "Brightness", "ClockTime", "Ambient", "OutdoorAmbient", "GlobalShadows",
+    "FogEnd", "FogStart", "ExposureCompensation",
+}
+
+local lightOriginal = {}
+for _, prop in ipairs(LIGHT_PROPS) do
+    local ok, value = pcall(function() return Lighting[prop] end)
+    if ok then lightOriginal[prop] = value end
+end
+
+local function applyFullbright()
+    pcall(function()
+        Lighting.Brightness = 3
+        Lighting.ClockTime = 14
+        Lighting.Ambient = Color3.fromRGB(150, 150, 150)
+        Lighting.OutdoorAmbient = Color3.fromRGB(150, 150, 150)
+        Lighting.GlobalShadows = false
+        Lighting.FogEnd = 100000
+        Lighting.FogStart = 0
+        Lighting.ExposureCompensation = 0.4
+    end)
+end
+
+local function restoreLighting()
+    for prop, value in pairs(lightOriginal) do
+        pcall(function() Lighting[prop] = value end)
+    end
+end
+
+--// ------------------------------------------------------------------- ESP ---
+local cameraMarkers = nil
+
+local function getCameraMarkers()
+    if cameraMarkers then return cameraMarkers end
+    cameraMarkers = {}
+    local triggers = Workspace:FindFirstChild("GameTriggers")
+    local folder = triggers and triggers:FindFirstChild("Cameras")
+    if folder then
+        for _, value in ipairs(folder:GetChildren()) do
+            local part = value:IsA("BasePart") and value
+                or value:FindFirstChildWhichIsA("BasePart", true)
+            if part then
+                cameraMarkers[#cameraMarkers + 1] = { code = value.Name, part = part }
+            end
+        end
+    end
+    return cameraMarkers
+end
+
+local function getDrawing()
+    local ok, drawing = pcall(function() return Drawing end)
+    if ok and drawing then return drawing end
+    return nil
+end
+
+local function worldBox(model)
+    if not model then return nil end
+    if not model:IsA("Model") then
+        local part = model:FindFirstChildWhichIsA("BasePart", true)
+        if not part then return nil end
+        return part.CFrame, part.Size
+    end
+
+    local now = os.clock()
+    local cached = hashCache[model]
+    if cached and now - cached.t < 1.2 then
+        return cached.cf, cached.size
+    end
+    local ok, cf, size = pcall(model.GetBoundingBox, model)
+    if not ok or not cf then return nil end
+    hashCache[model] = { t = now, cf = cf, size = size }
+    return cf, size
+end
+
+local function projectBox(cf, size)
+    local cam = Workspace.CurrentCamera
+    if not cam then return nil end
+    local minX, minY = math.huge, math.huge
+    local maxX, maxY = -math.huge, -math.huge
+    local any = false
+
+    for sx = -1, 1, 2 do
+        for sy = -1, 1, 2 do
+            for sz = -1, 1, 2 do
+                local world = cf:PointToWorldSpace(Vector3.new(
+                    sx * size.X / 2,
+                    sy * size.Y / 2,
+                    sz * size.Z / 2
+                ))
+                local screen, visible = cam:WorldToViewportPoint(world)
+                if visible and screen.Z > 0 then
+                    any = true
+                    if screen.X < minX then minX = screen.X end
+                    if screen.Y < minY then minY = screen.Y end
+                    if screen.X > maxX then maxX = screen.X end
+                    if screen.Y > maxY then maxY = screen.Y end
+                end
+            end
+        end
+    end
+
+    if not any then return nil end
+    return Vector2.new(minX, minY), Vector2.new(maxX - minX, maxY - minY)
+end
+
+local function getEsp(key)
+    local obj = espObjects[key]
+    if obj then return obj end
+    local D = getDrawing()
+    if not D then return nil end
+
+    obj = {
+        box = D.new("Square"),
+        name = D.new("Text"),
+        tracer = D.new("Line"),
+    }
+    obj.box.Thickness = 1
+    obj.box.Filled = false
+    obj.box.Transparency = 0.15
+    obj.name.Size = 14
+    obj.name.Center = true
+    obj.name.Outline = true
+    obj.name.OutlineColor = Color3.fromRGB(0, 0, 0)
+    obj.tracer.Thickness = 1
+    obj.tracer.Transparency = 0.35
+    espObjects[key] = obj
+    return obj
+end
+
+local function hideEsp(key)
+    local obj = espObjects[key]
+    if not obj then return end
+    if obj.box then obj.box.Visible = false end
+    if obj.name then obj.name.Visible = false end
+    if obj.tracer then obj.tracer.Visible = false end
+    obj.lastSeen = 0
+end
+
+local function drawTarget(model, root, color, label)
+    if not model or not model.Parent or not root or not root.Parent then
+        if model then hideEsp(model) end
+        return
+    end
+
+    local dist = (root.Position - myPosition()).Magnitude
+    if dist > State.esp.maxDist then hideEsp(model) return end
+
+    local cf, size = worldBox(model)
+    if not cf then hideEsp(model) return end
+
+    local screenPos, screenSize = projectBox(cf, size)
+    if not screenPos then hideEsp(model) return end
+
+    local obj = getEsp(model)
+    if not obj then return end
+    obj.lastSeen = os.clock()
+
+    if State.esp.boxes then
+        obj.box.Visible = true
+        obj.box.Size = screenSize
+        obj.box.Position = screenPos
+        obj.box.Color = color
+    else
+        obj.box.Visible = false
+    end
+
+    if State.esp.names then
+        obj.name.Visible = true
+        obj.name.Text = string.format("%s  %.0fm", label or model.Name, dist)
+        obj.name.Position = Vector2.new(screenPos.X + screenSize.X / 2, screenPos.Y - 17)
+        obj.name.Color = color
+    else
+        obj.name.Visible = false
+    end
+
+    if State.esp.tracers then
+        local cam = Workspace.CurrentCamera
+        local viewport = cam and cam.ViewportSize or Vector2.new(1280, 720)
+        obj.tracer.Visible = true
+        obj.tracer.From = Vector2.new(viewport.X / 2, viewport.Y)
+        obj.tracer.To = Vector2.new(screenPos.X + screenSize.X / 2, screenPos.Y + screenSize.Y)
+        obj.tracer.Color = color
+    else
+        obj.tracer.Visible = false
+    end
+end
+
+local function drawWorldLabel(part, text, color)
+    if not part or not part.Parent then return end
+    local cam = Workspace.CurrentCamera
+    if not cam then return end
+    local screen, visible = cam:WorldToViewportPoint(part.Position + Vector3.new(0, 1.5, 0))
+    if not visible or screen.Z <= 0 then return end
+
+    local obj = espObjects[part]
+    local D = getDrawing()
+    if not D then return end
+    if not obj then
+        obj = { name = D.new("Text") }
+        obj.name.Size = 14
+        obj.name.Center = true
+        obj.name.Outline = true
+        obj.name.OutlineColor = Color3.fromRGB(0, 0, 0)
+        espObjects[part] = obj
+    end
+
+    obj.name.Visible = true
+    obj.name.Text = text
+    obj.name.Position = Vector2.new(screen.X, screen.Y)
+    obj.name.Color = color
+    obj.lastSeen = os.clock()
+end
+
+local function clearEsp()
+    for _, obj in pairs(espObjects) do
+        for _, drawing in pairs(obj) do
+            if type(drawing) == "table" and drawing.Remove then
+                pcall(function() drawing:Remove() end)
+            elseif type(drawing) == "userdata" and drawing.Remove then
+                pcall(function() drawing:Remove() end)
+            end
+        end
+    end
+    table.clear(espObjects)
+    table.clear(hashCache)
+end
+
+local function updateEsp()
+    if not getDrawing() then return end
+
+    local anims = animCache.list
+    if State.esp.animatronics then
+        for _, entry in ipairs(anims) do
+            local boxModel = entry.npc or entry.model
+            local color = ANIM_COLORS[entry.name] or ESP_COLORS.default
+            local bits = { entry.name }
+            if entry.room and entry.room ~= "" then bits[#bits + 1] = "[" .. entry.room .. "]" end
+            if entry.ai ~= nil then bits[#bits + 1] = "AI" .. tostring(entry.ai) end
+            if entry.stunned then bits[#bits + 1] = "STUN" end
+            if entry.jammed then bits[#bits + 1] = "JAM" end
+            local label = table.concat(bits, " ")
+
+            if entry.root and entry.root.Parent and boxModel:IsA("Model") then
+                drawTarget(boxModel, entry.root, color, label)
+            else
+                local part = entry.root
+                if not part and entry.model:IsA("Model") then
+                    part = entry.model.PrimaryPart
+                end
+                part = part or entry.model:FindFirstChildWhichIsA("BasePart", true)
+                if part then drawWorldLabel(part, label, color) end
+            end
+        end
+    end
+
+    if State.esp.players then
+        for _, player in ipairs(Players:GetPlayers()) do
+            if player ~= LocalPlayer then
+                local char = player.Character
+                local hum = char and char:FindFirstChildOfClass("Humanoid")
+                local root = char and char:FindFirstChild("HumanoidRootPart")
+                if char and hum and hum.Health > 0 and root then
+                    local role = tostring(player:GetAttribute("Role") or "PLAYER")
+                    drawTarget(char, root, ESP_COLORS.player, player.Name .. " [" .. role .. "]")
+                end
+            end
+        end
+    end
+
+    if State.esp.cameras then
+        for _, marker in ipairs(getCameraMarkers()) do
+            local dist = (marker.part.Position - myPosition()).Magnitude
+            if dist <= State.esp.maxDist then
+                drawWorldLabel(marker.part, marker.code, ESP_COLORS.camera)
+            end
+        end
+    end
+
+    if State.esp.officeDoors then
+        local triggers = Workspace:FindFirstChild("GameTriggers")
+        local buttons = triggers and triggers:FindFirstChild("OfficeButtons")
+        local left = buttons and buttons:FindFirstChild("LeftDoor")
+        local right = buttons and buttons:FindFirstChild("RightDoor")
+
+        if left then
+            local closed = attrBool("leftDoorClosed")
+            local light = attrBool("leftLightOn")
+            drawWorldLabel(left, string.format("LEFT DOOR %s  LIGHT %s",
+                closed and "CLOSED" or "OPEN", light and "ON" or "OFF"),
+                closed and ESP_COLORS.doorClosed or ESP_COLORS.doorOpen)
+        end
+        if right then
+            local closed = attrBool("rightDoorClosed")
+            local light = attrBool("rightLightOn")
+            drawWorldLabel(right, string.format("RIGHT DOOR %s  LIGHT %s",
+                closed and "CLOSED" or "OPEN", light and "ON" or "OFF"),
+                closed and ESP_COLORS.doorClosed or ESP_COLORS.doorOpen)
+        end
+    end
+
+    -- Hide anything that has not been drawn for a while.
+    local now = os.clock()
+    for key, obj in pairs(espObjects) do
+        if obj.lastSeen and now - obj.lastSeen > 1.5 then
+            if obj.box then obj.box.Visible = false end
+            if obj.name then obj.name.Visible = false end
+            if obj.tracer then obj.tracer.Visible = false end
+            if not key.Parent then
+                for _, drawing in pairs(obj) do
+                    local kind = type(drawing)
+                    if (kind == "table" or kind == "userdata") and drawing.Remove then
+                        pcall(function() drawing:Remove() end)
+                    end
+                end
+                espObjects[key] = nil
+            end
+        end
+    end
+end
+
+--// --------------------------------------------------------------- overlay ---
+local function ensureOverlay()
+    if #overlayObjects > 0 then return true end
+    local D = getDrawing()
+    if not D then return false end
+
+    local bg = D.new("Square")
+    bg.Color = Color3.fromRGB(15, 15, 20)
+    bg.Filled = true
+    bg.Transparency = 0.35
+    bg.Size = Vector2.new(1100, 48)
+    bg.Position = Vector2.new(12, 60)
+
+    local line1 = D.new("Text")
+    line1.Size = 15
+    line1.Outline = true
+    line1.OutlineColor = Color3.fromRGB(0, 0, 0)
+    line1.Position = Vector2.new(18, 65)
+
+    local line2 = D.new("Text")
+    line2.Size = 14
+    line2.Outline = true
+    line2.OutlineColor = Color3.fromRGB(0, 0, 0)
+    line2.Position = Vector2.new(18, 84)
+
+    overlayObjects[1] = bg
+    overlayObjects[2] = line1
+    overlayObjects[3] = line2
+    return true
+end
+
+local function clearOverlay()
+    for _, drawing in ipairs(overlayObjects) do
+        pcall(function() drawing:Remove() end)
+    end
+    table.clear(overlayObjects)
+end
+
+local function doorStateText(side)
+    local closedAttr = side == "left" and "leftDoorClosed" or "rightDoorClosed"
+    local lightAttr = side == "left" and "leftLightOn" or "rightLightOn"
+    local closed = attrBool(closedAttr)
+    local light = attrBool(lightAttr)
+    return string.format("%s door:%s light:%s",
+        side == "left" and "L" or "R",
+        closed and "CLOSED" or "OPEN",
+        light and "ON" or "OFF")
+end
+
+local function updateOverlay()
+    if not State.overlay then
+        for _, drawing in ipairs(overlayObjects) do drawing.Visible = false end
+        return
+    end
+    if not ensureOverlay() then return end
+
+    local bg, line1, line2 = overlayObjects[1], overlayObjects[2], overlayObjects[3]
+    local night = RS:GetAttribute("Night") or 1
+    local power = attrNumber("powerPercentage", 100)
+    local leftClosed = attrBool("leftDoorClosed")
+    local rightClosed = attrBool("rightDoorClosed")
+    local leftThreats, rightThreats = getDoorThreats(leftClosed, rightClosed)
+    local golden = attrBool("goldenFreddyInOffice")
+    local blackout = attrBool("powerBlackout")
+
+    local threatText = ""
+    if #leftThreats > 0 then threatText = threatText .. "  !L:" .. threatLabel(leftThreats) end
+    if #rightThreats > 0 then threatText = threatText .. "  !R:" .. threatLabel(rightThreats) end
+    if golden then threatText = threatText .. "  !GOLDEN IN OFFICE" end
+
+    line1.Text = string.format(
+        "FNAF Co-op  |  Night %s  %s  |  Power %d%%  |  %s  |  %s%s",
+        tostring(night), hourLabel(), power, doorStateText("left"),
+        doorStateText("right"), blackout and "  |  BLACKOUT" or threatText
+    )
+
+    local bits = {}
+    for _, entry in ipairs(animCache.list) do
+        local piece = entry.name
+        if entry.name == "Foxy" and entry.scriptObj then
+            local foxyState = tonumber(entry.scriptObj:GetAttribute("currentState"))
+            piece = "Foxy " .. ((foxyState ~= nil and foxyState >= 2) and "OUT" or "COVE")
+        elseif entry.room and entry.room ~= "" then
+            piece = piece .. " " .. entry.room
+        end
+        if entry.ai ~= nil then piece = piece .. " AI" .. tostring(entry.ai) end
+        if entry.stunned then piece = piece .. " STUN" end
+        if entry.jammed then piece = piece .. " JAM" end
+        bits[#bits + 1] = piece
+    end
+    line2.Text = #bits > 0 and table.concat(bits, "  |  ") or "No animatronics detected."
+
+    local color = Color3.fromRGB(90, 255, 160)
+    if blackout then
+        color = Color3.fromRGB(255, 80, 80)
+    elseif #leftThreats > 0 or #rightThreats > 0 or golden then
+        color = Color3.fromRGB(255, 90, 90)
+    elseif power <= 20 then
+        color = Color3.fromRGB(255, 200, 80)
+    end
+
+    local cam = Workspace.CurrentCamera
+    local viewport = cam and cam.ViewportSize or Vector2.new(1280, 720)
+    bg.Size = Vector2.new(math.min(1100, viewport.X - 24), 48)
+    bg.Visible = true
+    line1.Visible = true
+    line2.Visible = true
+    line1.Color = color
+    line2.Color = color
+end
+
+--// ----------------------------------------------------------------- loops ---
+local function foxyLoop()
+    while running do
+        task.wait(0.25)
+        if not running or not State.foxyGuard then continue end
+        if not inGuardMode() or not alive() then continue end
+        if not attrBool("gameStarted") or attrBool("nightFinished") then continue end
+        if attrBool("powerBlackout") then continue end
+
+        local foxy = getFoxyStatus()
+        if foxy.state == nil then continue end
+
+        local leftClosed = attrBool("leftDoorClosed")
+        if foxy.out then
+            foxyWasOut = true
+            if State.foxyHoldDoor and not leftClosed and not foxyPulsing then
+                if operateDoor("left", true, true) then
+                    foxyClosedDoor = true
+                    if State.foxyNotify then
+                        notify("Foxy Guard", "Foxy left Pirate Cove - left door held.", 3)
+                    end
+                end
+            end
+        else
+            if foxyWasOut then
+                foxyWasOut = false
+                foxyLastPulse = 0
+                if State.foxyNotify then
+                    notify("Foxy Guard", "Foxy is back in Pirate Cove.", 3)
+                end
+            end
+
+            -- Only reopen what this loop closed, and only when the hall is
+            -- clear. Auto-Door Defense handles its own door separately.
+            if foxyClosedDoor then
+                if not leftClosed then
+                    foxyClosedDoor = false
+                elseif State.autoReopen and not State.autoDoor then
+                    local leftThreats = getDoorThreats(leftClosed, attrBool("rightDoorClosed"))
+                    if #leftThreats == 0 then
+                        if operateDoor("left", false, true) then
+                            foxyClosedDoor = false
+                        end
+                    end
+                end
+            end
+
+            if os.clock() - foxyLastPulse >= State.foxyInterval then
+                foxyLastPulse = os.clock()
+                foxyPulse()
+            end
+        end
+    end
+end
+
+local function defenseLoop()
+    while running do
+        task.wait(0.25)
+        if not running or not State.autoDoor then continue end
+        if not inGuardMode() or not alive() then continue end
+        if attrBool("powerBlackout") then continue end
+
+        local leftClosed = attrBool("leftDoorClosed")
+        local rightClosed = attrBool("rightDoorClosed")
+        local leftThreats, rightThreats = getDoorThreats(leftClosed, rightClosed)
+
+        if #leftThreats > 0 then
+            if not leftClosed and operateDoor("left", true, true) then
+                if State.autoNotify and os.clock() - lastAutoNote.left > 6 then
+                    lastAutoNote.left = os.clock()
+                    notify("Auto-Door", "LEFT closed  ·  " .. threatLabel(leftThreats), 3)
+                end
+            end
+        elseif leftClosed and State.autoReopen then
+            if operateDoor("left", false, true) then
+                if State.autoNotify and os.clock() - lastAutoNote.left > 6 then
+                    lastAutoNote.left = os.clock()
+                    notify("Auto-Door", "LEFT reopened - hall is clear.", 2)
+                end
+            end
+        end
+
+        if #rightThreats > 0 then
+            if not rightClosed and operateDoor("right", true, true) then
+                if State.autoNotify and os.clock() - lastAutoNote.right > 6 then
+                    lastAutoNote.right = os.clock()
+                    notify("Auto-Door", "RIGHT closed  ·  " .. threatLabel(rightThreats), 3)
+                end
+            end
+        elseif rightClosed and State.autoReopen then
+            if operateDoor("right", false, true) then
+                if State.autoNotify and os.clock() - lastAutoNote.right > 6 then
+                    lastAutoNote.right = os.clock()
+                    notify("Auto-Door", "RIGHT reopened - hall is clear.", 2)
+                end
+            end
+        end
+    end
+end
+
+local function statusLoop()
+    local lastNight = nil
+    while running do
+        task.wait(0.35)
+        refreshAnims(true)
+
+        local night = RS:GetAttribute("Night")
+        if night ~= lastNight then
+            lastNight = night
+            warned.power = false
+            warned.blackout = false
+            warned.golden = false
+        end
+
+        local power = attrNumber("powerPercentage", 100)
+        if State.lowPowerWarn and power <= 20 and power > 0 and not warned.power then
+            warned.power = true
+            notify("Power", string.format("Power is at %d%%. Doors drain it fast.", power), 6)
+        end
+        if power > 25 then warned.power = false end
+
+        local blackout = attrBool("powerBlackout")
+        if blackout and not warned.blackout then
+            warned.blackout = true
+            notify("BLACKOUT", "Power is out. Doors and lights are offline.", 6)
+        elseif not blackout then
+            warned.blackout = false
+        end
+
+        local golden = attrBool("goldenFreddyInOffice")
+        if golden and not warned.golden then
+            warned.golden = true
+            notify("GOLDEN FREDDY", "He is in the office. Open the camera tablet!", 8)
+            if State.goldenAutoCam then openCameras() end
+        elseif not golden then
+            warned.golden = false
+        end
+    end
+end
+
+Connections[#Connections + 1] = LocalPlayer.CharacterAdded:Connect(function()
+    table.clear(noclipOriginal)
+    originalWalkSpeed = nil
+    originalJumpPower, originalUseJumpPower = nil, nil
+    task.spawn(function()
+        task.wait(1.0)
+        if not running then return end
+        if State.speed.enabled then applySpeed() end
+        if State.jump.enabled then applyJump() end
+        if State.noclip then noclipCharacter() end
+        if State.fly.enabled then setFly(true) end
+    end)
+end)
+
+Connections[#Connections + 1] = UserInputService.JumpRequest:Connect(function()
+    if running and State.infiniteJump and alive() then
+        local hum = getHum()
+        if hum then hum:ChangeState(Enum.HumanoidStateType.Jumping) end
+    end
+end)
+
+Connections[#Connections + 1] = RunService.RenderStepped:Connect(function()
+    if not running then return end
+    updateEsp()
+    updateOverlay()
+    flyTick()
+end)
+
+Connections[#Connections + 1] = RunService.Heartbeat:Connect(function()
+    if not running then return end
+    if State.fullbright ~= lastFullbrightState then
+        lastFullbrightState = State.fullbright
+        if State.fullbright then
+            applyFullbright()
+        else
+            restoreLighting()
+        end
+    elseif State.fullbright and os.clock() - lastFullbright > 1 then
+        lastFullbright = os.clock()
+        applyFullbright()
+    end
+    if State.speed.enabled then applySpeed() end
+    if State.jump.enabled then applyJump() end
+    if State.noclip then noclipCharacter() end
+end)
+
+local function cleanup()
+    running = false
+    State.running = false
+    for _, conn in ipairs(Connections) do
+        pcall(function() conn:Disconnect() end)
+    end
+    table.clear(Connections)
+
+    -- Put the character and lighting back the way we found them.
+    State.noclip = false
+    noclipCharacter()
+    State.speed.enabled = false
+    applySpeed()
+    State.jump.enabled = false
+    applyJump()
+    State.fly.enabled = false
+    if flyVelocity then
+        pcall(function() flyVelocity:Destroy() end)
+        flyVelocity = nil
+    end
+    State.fullbright = false
+    restoreLighting()
+    clearFakeCameraState()
+
+    clearEsp()
+    clearOverlay()
+    pcall(function() if Window then Window:Destroy() end end)
+    pcall(function() if uiFolder then uiFolder:Destroy() end end)
+    pcall(function()
+        local genv = getgenv()
+        if genv then genv.__FNAFToolkit = nil end
+    end)
+end
+
+--// ---------------------------------------------------------------- WindUI ---
+local function loadWindUI()
+    local ok, result = pcall(function()
+        return loadstring(game:HttpGet("https://github.com/Footagesus/WindUI/releases/latest/download/main.lua"))()
+    end)
+    if ok and result then return result end
+    log("WindUI load failed:", result)
+    return nil
+end
+
+local uiParent = game:GetService("CoreGui")
+pcall(function()
+    if gethui then uiParent = gethui() or uiParent end
+end)
+
+for _, child in ipairs(uiParent:GetChildren()) do
+    local name = tostring(child.Name)
+    if name == "FNAFToolkitUI" or name == "WindUI" or name:sub(1, 7) == "WindUI/" then
+        pcall(function() child:Destroy() end)
+    end
+end
+
+uiFolder = Instance.new("Folder")
+uiFolder.Name = "FNAFToolkitUI"
+uiFolder.Parent = uiParent
+
+windUI = loadWindUI()
+if not windUI then
+    error("[FNAFToolkit] WindUI failed to load. Check HTTP requests / executor.")
+end
+pcall(function() windUI:SetParent(uiFolder) end)
+log("stage 1: WindUI loaded")
+
+Window = windUI:CreateWindow({
+    Title = CFG.Title,
+    Author = "night shift  ·  " .. LocalPlayer.Name,
+    Icon = "moon",
+    Folder = "FNAFToolkit",
+    Size = UDim2.fromOffset(660, 510),
+    Theme = CFG.Theme,
+    ToggleKey = CFG.ToggleKey,
+    Resizable = true,
+    HideSearchBar = true,
+    User = { Enabled = false },
+})
+log("stage 2: window created")
+
+--// ------------------------------------------------------------------- Home --
+local home = Window:Tab({ Title = "Home", Icon = "house" })
+
+home:Button({
+    Title = "Enter Office & Start Night",
+    Desc = "Teleport to the chair and sit down, unlocking door controls",
+    Icon = "door-open",
+    Callback = function()
+        task.spawn(enterOffice)
+    end,
+})
+
+home:Button({
+    Title = "Refresh Status",
+    Desc = "Night, hour, power, doors, lights and animatronic rooms",
+    Icon = "refresh-cw",
+    Callback = function()
+        refreshAnims(true)
+        local leftClosed = attrBool("leftDoorClosed")
+        local rightClosed = attrBool("rightDoorClosed")
+        local leftThreats, rightThreats = getDoorThreats(leftClosed, rightClosed)
+        local bits = {}
+        for _, entry in ipairs(animCache.list) do
+            local room = entry.room ~= "" and entry.room or "?"
+            bits[#bits + 1] = entry.name .. ": " .. room
+        end
+        local camGui = getCameraGui()
+        notify("FNAF Status", string.format(
+            "Night %s  ·  %s  ·  Power %d%%\n%s\n%s\n%s\nPos %s  ·  Guard %s  ·  Cams %s",
+            tostring(RS:GetAttribute("Night") or "?"),
+            hourLabel(),
+            attrNumber("powerPercentage", 0),
+            doorStateText("left"),
+            doorStateText("right"),
+            #bits > 0 and table.concat(bits, "  ·  ") or "No animatronics found.",
+            posString(myPosition()),
+            inGuardMode() and "yes" or "no",
+            camGui and camGui.Enabled and "open" or "closed"
+        ) .. ((#leftThreats + #rightThreats) > 0
+            and ("\nTHREAT: L " .. threatLabel(leftThreats) .. " / R " .. threatLabel(rightThreats))
+            or ""), 8)
+    end,
+})
+
+home:Toggle({
+    Title = "Status Overlay",
+    Desc = "Night, power, doors, lights and AI rooms drawn at the top-left",
+    Value = State.overlay,
+    Callback = function(value)
+        State.overlay = value
+    end,
+})
+
+home:Toggle({
+    Title = "Fullbright",
+    Desc = "Brighten the building (client-side; restores when turned off)",
+    Icon = "sun",
+    Value = State.fullbright,
+    Callback = function(value)
+        State.fullbright = value
+        if value then
+            applyFullbright()
+        else
+            restoreLighting()
+        end
+    end,
+})
+
+home:Button({
+    Title = "Leave to Lobby",
+    Desc = "Exit Night Guard mode and teleport to the spawn",
+    Icon = "log-out",
+    Callback = function()
+        task.spawn(leaveToLobby)
+    end,
+})
+
+log("stage 3: home tab")
+
+--// --------------------------------------------------------------- Movement --
+local movement = Window:Tab({ Title = "Movement", Icon = "move" })
+
+movement:Toggle({
+    Title = "Speed",
+    Desc = "Override WalkSpeed (client-side)",
+    Icon = "gauge",
+    Value = false,
+    Callback = function(value)
+        State.speed.enabled = value
+        applySpeed()
+    end,
+})
+
+movement:Slider({
+    Title = "WalkSpeed",
+    Value = { Min = 16, Max = 120, Default = 32 },
+    Step = 1,
+    Callback = function(value)
+        State.speed.value = value
+        if State.speed.enabled then applySpeed() end
+    end,
+})
+
+movement:Toggle({
+    Title = "Jump Power",
+    Desc = "Set a higher jump power",
+    Icon = "arrow-up",
+    Value = false,
+    Callback = function(value)
+        State.jump.enabled = value
+        applyJump()
+    end,
+})
+
+movement:Slider({
+    Title = "JumpPower",
+    Value = { Min = 50, Max = 200, Default = 60 },
+    Step = 5,
+    Callback = function(value)
+        State.jump.value = value
+        if State.jump.enabled then applyJump() end
+    end,
+})
+
+movement:Toggle({
+    Title = "Noclip",
+    Desc = "Walk through walls",
+    Icon = "shield-off",
+    Value = false,
+    Callback = function(value)
+        State.noclip = value
+        noclipCharacter()
+    end,
+})
+
+movement:Toggle({
+    Title = "Fly",
+    Desc = "WASD to move, Space / LeftCtrl for up and down",
+    Icon = "plane",
+    Value = false,
+    Callback = function(value)
+        setFly(value)
+    end,
+})
+
+movement:Slider({
+    Title = "Fly Speed",
+    Value = { Min = 10, Max = 150, Default = 45 },
+    Step = 5,
+    Callback = function(value)
+        State.fly.speed = value
+    end,
+})
+
+movement:Toggle({
+    Title = "Infinite Jump",
+    Desc = "Jump again in mid-air",
+    Icon = "arrow-up",
+    Value = false,
+    Callback = function(value)
+        State.infiniteJump = value
+    end,
+})
+
+movement:Button({
+    Title = "Stand Up / Exit Guard Mode",
+    Desc = "Leave the chair and return control of the camera",
+    Icon = "door-closed",
+    Callback = function()
+        exitGuardMode()
+        notify("Night Guard", "Stood up and left Night Guard mode.", 3)
+    end,
+})
+
+movement:Button({
+    Title = "Reset Character",
+    Desc = "Standard Roblox reset",
+    Icon = "skull",
+    Callback = function()
+        local hum = getHum()
+        if hum then hum.Health = 0 end
+    end,
+})
+
+log("stage 4: movement tab")
+
+--// -------------------------------------------------------------- Teleports --
+local teleports = Window:Tab({ Title = "Teleports", Icon = "map-pin" })
+
+teleports:Dropdown({
+    Title = "Waypoint",
+    Values = WAYPOINT_ORDER,
+    Value = State.selectedWaypoint,
+    Callback = function(selected)
+        State.selectedWaypoint = selected
+    end,
+})
+
+teleports:Button({
+    Title = "Teleport to Waypoint",
+    Desc = "Leaves Night Guard mode first so the camera follows you",
+    Icon = "navigation",
+    Callback = function()
+        task.spawn(function()
+            tpWaypoint(State.selectedWaypoint)
+        end)
+    end,
+})
+
+teleports:Button({
+    Title = "Lobby / Spawn",
+    Desc = "Outside the office",
+    Icon = "home",
+    Callback = function() task.spawn(function() tpWaypoint("Lobby / Spawn") end) end,
+})
+
+teleports:Button({
+    Title = "Office Chair (Sit)",
+    Desc = "Enter the office and start the shift",
+    Icon = "armchair",
+    Callback = function() task.spawn(enterOffice) end,
+})
+
+teleports:Button({
+    Title = "Show Stage (CAM1A)",
+    Desc = "Bonnie, Chica and Freddy's starting room",
+    Icon = "map-pin",
+    Callback = function() task.spawn(function() tpWaypoint("Show Stage (CAM1A)") end) end,
+})
+
+teleports:Button({
+    Title = "W. Hall Corner (CAM2B)",
+    Desc = "Left door approach",
+    Icon = "map-pin",
+    Callback = function() task.spawn(function() tpWaypoint("W. Hall Corner (CAM2B)") end) end,
+})
+
+teleports:Button({
+    Title = "E. Hall Corner (CAM4B)",
+    Desc = "Right door approach",
+    Icon = "map-pin",
+    Callback = function() task.spawn(function() tpWaypoint("E. Hall Corner (CAM4B)") end) end,
+})
+
+teleports:Dropdown({
+    Title = "Animatronic",
+    Values = ANIMATRONIC_NAMES,
+    Value = State.selectedAnim,
+    Callback = function(selected)
+        State.selectedAnim = selected
+    end,
+})
+
+teleports:Button({
+    Title = "Teleport near Animatronic",
+    Desc = "8 studs behind them - may trigger a jumpscare",
+    Icon = "skull",
+    Callback = function()
+        task.spawn(function()
+            tpAnimatronic(State.selectedAnim)
+        end)
+    end,
+})
+
+log("stage 5: teleports tab")
+
+--// ------------------------------------------------------------------- ESP ---
+local espTab = Window:Tab({ Title = "ESP", Icon = "eye" })
+
+local function espToggle(title, desc, key)
+    espTab:Toggle({
+        Title = title,
+        Desc = desc,
+        Value = State.esp[key],
+        Callback = function(value)
+            State.esp[key] = value
+        end,
+    })
+end
+
+espToggle("Animatronics", "Boxes, names, rooms and AI levels", "animatronics")
+espToggle("Players", "Other players and their roles", "players")
+espToggle("Camera Markers", "Label every camera trigger in the map", "cameras")
+espToggle("Office Doors", "Label the left and right door states", "officeDoors")
+espToggle("Names + Distance", "Text above each target", "names")
+espToggle("Boxes", "2D bounding boxes", "boxes")
+espToggle("Tracers", "Line from the bottom of the screen", "tracers")
+
+espTab:Slider({
+    Title = "Max Distance",
+    Value = { Min = 50, Max = 1500, Default = 600 },
+    Step = 25,
+    Callback = function(value)
+        State.esp.maxDist = value
+    end,
+})
+
+log("stage 6: ESP tab")
+
+--// ----------------------------------------------------------- Night Guard ---
+local nightGuard = Window:Tab({ Title = "Night Guard", Icon = "moon" })
+
+nightGuard:Button({
+    Title = "Left Door (Toggle)",
+    Desc = "Requires Night Guard mode and the camera tablet closed",
+    Icon = "door-closed",
+    Callback = function() task.spawn(function() toggleDoor("left") end) end,
+})
+
+nightGuard:Button({
+    Title = "Right Door (Toggle)",
+    Icon = "door-closed",
+    Callback = function() task.spawn(function() toggleDoor("right") end) end,
+})
+
+nightGuard:Button({
+    Title = "Left Light (Toggle)",
+    Icon = "lightbulb",
+    Callback = function() task.spawn(function() toggleLight("left") end) end,
+})
+
+nightGuard:Button({
+    Title = "Right Light (Toggle)",
+    Icon = "lightbulb",
+    Callback = function() task.spawn(function() toggleLight("right") end) end,
+})
+
+nightGuard:Button({
+    Title = "Close Both Doors",
+    Desc = "Closes the camera tablet first if needed",
+    Icon = "shield",
+    Callback = function() task.spawn(function() setBothDoors(true) end) end,
+})
+
+nightGuard:Button({
+    Title = "Open Both Doors",
+    Icon = "unlock",
+    Callback = function() task.spawn(function() setBothDoors(false) end) end,
+})
+
+nightGuard:Toggle({
+    Title = "Auto-Door Defense",
+    Desc = "Closes a door when an animatronic reaches it",
+    Icon = "shield",
+    Value = false,
+    Callback = function(value)
+        State.autoDoor = value
+        notify("Night Guard", value and "Auto-Door Defense enabled." or "Auto-Door Defense disabled.", 3)
+    end,
+})
+
+nightGuard:Toggle({
+    Title = "Foxy: Camera Pulse",
+    Desc = "Holds Foxy in Pirate Cove without opening the tablet or draining camera power",
+    Icon = "camera",
+    Value = State.foxyGuard,
+    Callback = function(value)
+        State.foxyGuard = value
+        foxyLastPulse = 0
+        if value then
+            task.spawn(function() task.wait(0.3); foxyPulse() end)
+        end
+        notify("Foxy Guard", value
+            and "Enabled. Pirate Cove is being pinged in the background."
+            or "Disabled. Foxy can leave Pirate Cove again.", 3)
+    end,
+})
+
+nightGuard:Slider({
+    Title = "Foxy Pulse Interval",
+    Desc = "Seconds between Pirate Cove pings - keep it under 4",
+    Value = { Min = 1, Max = 8, Default = State.foxyInterval },
+    Step = 1,
+    Callback = function(value)
+        State.foxyInterval = value
+    end,
+})
+
+nightGuard:Toggle({
+    Title = "Foxy: Hold Left Door",
+    Desc = "Closes and holds the left door whenever Foxy leaves Pirate Cove",
+    Icon = "door-closed",
+    Value = State.foxyHoldDoor,
+    Callback = function(value)
+        State.foxyHoldDoor = value
+    end,
+})
+
+nightGuard:Button({
+    Title = "Pulse Pirate Cove Now",
+    Desc = "Sends one CAM1C ping immediately",
+    Icon = "camera",
+    Callback = function()
+        task.spawn(function()
+            local ok = foxyPulse()
+            notify("Foxy Guard", ok and "Pirate Cove ping sent." or "Pulse skipped (camera open or busy).", 2)
+        end)
+    end,
+})
+
+nightGuard:Slider({
+    Title = "Threat Radius",
+    Desc = "How close an animatronic must be to trigger the door",
+    Value = { Min = 6, Max = 30, Default = 15 },
+    Step = 1,
+    Callback = function(value)
+        State.autoRadius = value
+    end,
+})
+
+nightGuard:Toggle({
+    Title = "Reopen When Clear",
+    Desc = "Opens the door again once the animatronic moves away",
+    Value = true,
+    Callback = function(value)
+        State.autoReopen = value
+    end,
+})
+
+nightGuard:Toggle({
+    Title = "Close Cameras To Operate Doors",
+    Desc = "Door remotes are ignored while the tablet is open",
+    Value = true,
+    Callback = function(value)
+        State.autoCloseCams = value
+    end,
+})
+
+nightGuard:Toggle({
+    Title = "Defense Notifications",
+    Desc = "Notify when auto-defense closes or opens a door",
+    Value = false,
+    Callback = function(value)
+        State.autoNotify = value
+    end,
+})
+
+nightGuard:Toggle({
+    Title = "Low Power Warning",
+    Desc = "Warn at 20% power",
+    Icon = "battery-warning",
+    Value = true,
+    Callback = function(value)
+        State.lowPowerWarn = value
+    end,
+})
+
+nightGuard:Toggle({
+    Title = "Golden Freddy: Auto-Open Cameras",
+    Desc = "Opens the tablet when Golden Freddy appears in the office",
+    Value = false,
+    Callback = function(value)
+        State.goldenAutoCam = value
+    end,
+})
+
+nightGuard:Dropdown({
+    Title = "Camera",
+    Values = CAM_CODES,
+    Value = State.selectedCamera,
+    Callback = function(selected)
+        State.selectedCamera = selected
+    end,
+})
+
+nightGuard:Button({
+    Title = "Switch Camera",
+    Desc = "Opens the tablet if needed and selects the camera",
+    Icon = "video",
+    Callback = function()
+        task.spawn(function()
+            local ok = switchCamera(State.selectedCamera)
+            notify("Cameras", ok and ("Switched to " .. State.selectedCamera) or "Camera switch failed.", 3)
+        end)
+    end,
+})
+
+nightGuard:Button({
+    Title = "Open Cameras",
+    Icon = "video",
+    Callback = function()
+        task.spawn(function()
+            local ok = openCameras()
+            notify("Cameras", ok and "Camera tablet opened." or "Could not open the tablet.", 3)
+        end)
+    end,
+})
+
+nightGuard:Button({
+    Title = "Close Cameras",
+    Icon = "video-off",
+    Callback = function()
+        task.spawn(function()
+            local ok = closeCameras()
+            notify("Cameras", ok and "Camera tablet closed." or "Could not close the tablet.", 3)
+        end)
+    end,
+})
+
+nightGuard:Button({
+    Title = "Enter Office & Sit",
+    Desc = "Teleports to the chair and starts the shift",
+    Icon = "armchair",
+    Callback = function() task.spawn(enterOffice) end,
+})
+
+nightGuard:Button({
+    Title = "Stand Up / Exit Guard Mode",
+    Icon = "door-open",
+    Callback = function()
+        exitGuardMode()
+        notify("Night Guard", "Stood up and left Night Guard mode.", 3)
+    end,
+})
+
+log("stage 7: night guard tab")
+
+--// ------------------------------------------------------------------ Misc ---
+local misc = Window:Tab({ Title = "Misc", Icon = "settings" })
+
+misc:Button({
+    Title = "Copy Job ID",
+    Desc = "Useful for rejoin scripts",
+    Icon = "copy",
+    Callback = function()
+        local ok = pcall(function() setclipboard(game.JobId) end)
+        notify("Job ID", ok and game.JobId or "Clipboard unavailable.", 4)
+    end,
+})
+
+misc:Button({
+    Title = "Rejoin Server",
+    Desc = "Teleport back to this same server",
+    Icon = "rotate-cw",
+    Callback = function()
+        local ok, err = pcall(function()
+            TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer)
+        end)
+        notify("Rejoin", ok and "Teleporting…" or tostring(err), 3)
+    end,
+})
+
+misc:Button({
+    Title = "Print Debug Info",
+    Desc = "Character, doors, cameras, AI rooms and ESP count",
+    Icon = "terminal",
+    Callback = function()
+        refreshAnims(true)
+        log("pos", posString(myPosition()))
+        log("night", tostring(RS:GetAttribute("Night")), "hour", hourLabel(),
+            "power", tostring(RS:GetAttribute("powerPercentage")))
+        log("doors", tostring(RS:GetAttribute("leftDoorClosed")),
+            tostring(RS:GetAttribute("rightDoorClosed")), "lights",
+            tostring(RS:GetAttribute("leftLightOn")), tostring(RS:GetAttribute("rightLightOn")))
+        log("guard", tostring(inGuardMode()), "sitting", tostring(getHum() and getHum().Sit),
+            "cams", tostring(cameraOpen()))
+        for _, entry in ipairs(animCache.list) do
+            log(entry.name, entry.room ~= "" and entry.room or "?", "AI",
+                tostring(entry.ai), "pos", entry.root and posString(entry.root.Position) or "?")
+        end
+        local count = 0
+        for _ in pairs(espObjects) do count = count + 1 end
+        log("esp objects", count)
+        notify("Debug", "Details printed to the executor console.", 3)
+    end,
+})
+
+misc:Button({
+    Title = "Unload Toolkit",
+    Desc = "Stops loops, removes ESP, overlay and the menu",
+    Icon = "trash-2",
+    Callback = function()
+        print("[FNAFToolkit] Unloaded.")
+        cleanup()
+    end,
+})
+
+log("stage 8: misc tab")
+
+-- Small read-only handle used for live verification from the console.
+pcall(function()
+    getgenv().__FNAFToolkit = {
+        State = State,
+        setDoor = function(side, closed) return operateDoor(side, closed, false) end,
+        setLight = function(side, on) return operateLight(side, on, false) end,
+        toggleDoor = toggleDoor,
+        toggleLight = toggleLight,
+        applySpeed = applySpeed,
+        applyJump = applyJump,
+        applyNoclip = noclipCharacter,
+        setFly = setFly,
+        applyFullbright = applyFullbright,
+        restoreLighting = restoreLighting,
+        closeCameras = closeCameras,
+        openCameras = openCameras,
+        switchCamera = switchCamera,
+        enterOffice = enterOffice,
+        exitGuardMode = exitGuardMode,
+        leaveToLobby = leaveToLobby,
+        tpWaypoint = tpWaypoint,
+        teleport = teleportTo,
+        animEntries = getAnimEntries,
+        refreshAnims = function() return refreshAnims(true) end,
+        threats = function()
+            local left, right = getDoorThreats(attrBool("leftDoorClosed"), attrBool("rightDoorClosed"))
+            return left, right
+        end,
+        foxyStatus = function()
+            local foxy = getFoxyStatus()
+            return {
+                state = foxy.state,
+                out = foxy.out,
+                force = foxy.force,
+                locked = foxy.locked,
+                ai = foxy.ai,
+            }
+        end,
+        foxyPulse = foxyPulse,
+        overlayText = function()
+            return overlayObjects[2] and overlayObjects[2].Text or nil,
+                overlayObjects[3] and overlayObjects[3].Text or nil
+        end,
+        espCount = function()
+            local count = 0
+            for _ in pairs(espObjects) do count = count + 1 end
+            return count
+        end,
+    }
+end)
+
+-- Prime the cache and start background work.
+refreshAnims(true)
+task.spawn(defenseLoop)
+task.spawn(foxyLoop)
+task.spawn(statusLoop)
+
+notify("FNAF Toolkit", "Loaded. RightShift opens the menu. Home -> Enter Office starts the shift.", 7)
+log("stage 9: loaded")
+
+-- Allow a later execution to stop this one cleanly (live-reload friendly).
+pcall(function()
+    getgenv().__FNAFToolkitCleanup = cleanup
+end)
+
+pcall(function()
+    if STATE and STATE.onCleanup then
+        STATE.onCleanup(cleanup)
+    end
+end)
 end
 
 --// dispatch -------------------------------------------------------------------
