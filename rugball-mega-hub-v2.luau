@@ -30,7 +30,15 @@
 		92640845955320   HITBLOX MULTIPLAYER     hitblox
 		92551591080135   The Ditch Hotel (match)  ditch_hotel
 		83379330867218   The Ditch Hotel (lobby)  ditch_hotel
+		12497341251      FNAF: Co-op - Lobby     fnaf_coop
 		12497348201      FNAF: Co-op - FNAF 1    fnaf_coop
+		12497354347      FNAF: Co-op - FNAF 2    fnaf_coop
+		12497360072      FNAF: Co-op - FNAF 3    fnaf_coop
+		12497365956      FNAF: Co-op - FNAF 4    fnaf_coop
+		15305648732      FNAF: Co-op - Sister Location  fnaf_coop
+		126090388496360  FNAF: Co-op - FNAF 6    fnaf_coop
+		12497453410      FNAF: Co-op - Basement Hunt  fnaf_coop
+		12497456055      FNAF: Co-op - Puppet's Revenge  fnaf_coop
 
 	the taf bypass suite is standalone now. Drive Duels and Throw A Football 7s both
 	run qb_aimbot, which carries the same MoveGuard/AnimGuard layers, so loading
@@ -74,7 +82,15 @@ Hub.ORDER = {
 	{ place = 92640845955320,  label = "HITBLOX", suites = { "hitblox" } },
 	{ place = 92551591080135,  label = "THE DITCH HOTEL", suites = { "ditch_hotel" } },
 	{ place = 83379330867218,  label = "THE DITCH HOTEL", suites = { "ditch_hotel" } },
+	{ place = 12497341251,     label = "FNAF CO-OP - LOBBY", suites = { "fnaf_coop" } },
 	{ place = 12497348201,     label = "FNAF CO-OP - FNAF 1", suites = { "fnaf_coop" } },
+	{ place = 12497354347,     label = "FNAF CO-OP - FNAF 2", suites = { "fnaf_coop" } },
+	{ place = 12497360072,     label = "FNAF CO-OP - FNAF 3", suites = { "fnaf_coop" } },
+	{ place = 12497365956,     label = "FNAF CO-OP - FNAF 4", suites = { "fnaf_coop" } },
+	{ place = 15305648732,     label = "FNAF CO-OP - SISTER LOCATION", suites = { "fnaf_coop" } },
+	{ place = 126090388496360, label = "FNAF CO-OP - FNAF 6", suites = { "fnaf_coop" } },
+	{ place = 12497453410,     label = "FNAF CO-OP - BASEMENT HUNT", suites = { "fnaf_coop" } },
+	{ place = 12497456055,     label = "FNAF CO-OP - PUPPET'S REVENGE", suites = { "fnaf_coop" } },
 }
 
 Hub.GAMES = {}
@@ -117,7 +133,7 @@ Hub.SUITE_NAMES = {
 	criminal   = "criminal simulator |  loot esp / prompt sniper / grab / movement",
 	hitblox    = "hitblox panel     |  contract / payout / combat / esp / stealth",
 	ditch_hotel = "ditch hotel       |  auto knock / escape / esp",
-	fnaf_coop  = "fnaf coop         |  esp / night guard doors / movement / teleports",
+	fnaf_coop  = "fnaf coop         |  all 8 games / esp / inf power / pacify / objectives / movement",
 }
 
 Hub.SUITE = {}
@@ -38782,6 +38798,3097 @@ end
 
 --// embedded suite: fnaf_coop  (from fnaf_coop.luau) =========================
 Hub.SUITE.fnaf_coop = function()
+getgenv().__FNAFCoopReload = function() pcall(function() Hub.SUITE.fnaf_coop() end) end
+--// --------------------------------------------------- multi-game branch ---
+-- Every FNAF: Co-op place except FNAF 1 uses the multi-game suite below.
+-- FNAF 1 falls through to the original toolkit further down this file, so
+-- its Foxy Guard, camera pulse and __FNAFToolkit API stay exactly as they were.
+if game.PlaceId ~= 12497348201 then
+--[[
+    FNAF CO-OP MULTI-GAME TOOLKIT
+    One client-side suite for every FNAF: Co-op place except FNAF 1
+    (FNAF 1 keeps the original toolkit below this branch).
+
+    Covered places
+      12497341251       Lobby (game / night selection helper)
+      12497354347       FNAF 2
+      12497360072       FNAF 3
+      12497365956       FNAF 4
+      15305648732       Sister Location
+      126090388496360   FNAF 6 / Pizzeria Simulator
+      12497453410       Basement Hunt
+      12497456055       Puppet's Revenge
+
+    Menu: WindUI. Toggle: RightShift.
+]]
+
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Lighting = game:GetService("Lighting")
+local TeleportService = game:GetService("TeleportService")
+local LocalPlayer = Players.LocalPlayer
+local Workspace = workspace
+
+-- Replace a previous run cleanly (live-reload friendly).
+do
+    local ok, genv = pcall(function() return getgenv() end)
+    if ok and type(genv) == "table" then
+        if type(genv.__FNAFAllCleanup) == "function" then
+            pcall(genv.__FNAFAllCleanup)
+        end
+        genv.__FNAFAllCleanup = nil
+        -- Do not leave the FNAF 1 suite running in another place.
+        if type(genv.__FNAFToolkitCleanup) == "function" then
+            pcall(genv.__FNAFToolkitCleanup)
+        end
+        genv.__FNAFToolkitCleanup = nil
+    end
+end
+
+local CFG = {
+    Theme = "Dark",
+    ToggleKey = Enum.KeyCode.RightShift,
+}
+
+--// ------------------------------------------------------------- profiles ---
+local PROFILES = {
+    [12497341251] = {
+        key = "LOBBY", name = "FNAF Co-op - Lobby", short = "Lobby", kind = "lobby",
+    },
+    [12497348201] = {
+        key = "FNAF1", name = "FNAF 1", short = "FNAF 1", kind = "night",
+        powerAttrs = { "powerPercentage" }, clearAttrs = { "powerBlackout" },
+        doors = true, lights = true, camera = true, office = true, ai = true,
+    },
+    [12497354347] = {
+        key = "FNAF2", name = "FNAF 2", short = "FNAF 2", kind = "night",
+        powerAttrs = { "powerPercentage", "batteryLife" },
+        powerDefaults = { batteryLife = 100 },
+        clearAttrs = { "powerBlackout", "flashlightBatteryOut" },
+        camera = true, office = true, lights = true,
+        mask = true, musicBox = true, vents = true, ai = true,
+    },
+    [12497360072] = {
+        key = "FNAF3", name = "FNAF 3", short = "FNAF 3", kind = "night",
+        powerAttrs = { "powerPercentage" },
+        clearAttrs = {
+            "powerBlackout", "ventilationError", "ventilationErrorForce",
+            "ventilationPassOut", "blackoutScreenPitchBlack", "cameraError", "audioError",
+        },
+        camera = true, office = true, lights = true,
+        springtrap = true, ai = true,
+    },
+    [12497365956] = {
+        key = "FNAF4", name = "FNAF 4", short = "FNAF 4", kind = "night",
+        powerAttrs = { "powerPercentage" },
+        clearAttrs = { "powerBlackout" },
+        doors = true, lights = true, bedroom = true, ai = true,
+    },
+    [15305648732] = {
+        key = "SL", name = "Sister Location", short = "Sister Location", kind = "night",
+        powerAttrs = { "powerPercentage", "oxygenPercentage" },
+        powerDefaults = { oxygenPercentage = 100 },
+        clearAttrs = { "powerBlackout" },
+        doors = true, lights = true, ventDoor = true,
+        breakers = true, ai = true,
+    },
+    [126090388496360] = {
+        key = "FNAF6", name = "FNAF 6", short = "FNAF 6", kind = "tycoon",
+        powerAttrs = {}, clearAttrs = {},
+        animatronicFlags = true, tycoon = true, ai = true,
+    },
+    [12497453410] = {
+        key = "BASEMENT", name = "Basement Hunt", short = "Basement Hunt", kind = "survival",
+        objectives = true,
+    },
+    [12497456055] = {
+        key = "PUPPET", name = "Puppet's Revenge", short = "Puppet's Revenge", kind = "survival",
+        objectives = true,
+    },
+}
+
+local PROFILE_ORDER = {
+    { label = "Lobby", key = "LOBBY" },
+    { label = "FNAF 1", key = "FNAF1" },
+    { label = "FNAF 2", key = "FNAF2" },
+    { label = "FNAF 3", key = "FNAF3" },
+    { label = "FNAF 4", key = "FNAF4" },
+    { label = "Sister Location", key = "SL" },
+    { label = "FNAF 6", key = "FNAF6" },
+    { label = "Basement Hunt", key = "BASEMENT" },
+    { label = "Puppet's Revenge", key = "PUPPET" },
+}
+
+local function profileByKey(key)
+    if not key then return nil end
+    for _, profile in pairs(PROFILES) do
+        if profile.key == key then return profile end
+    end
+    return nil
+end
+
+local function readProfileOverride()
+    local ok, value = pcall(function() return getgenv().__FNAFProfileOverride end)
+    if not ok or type(value) ~= "string" or value == "" then return nil end
+    local okPlace, place = pcall(function() return getgenv().__FNAFProfileOverridePlace end)
+    if okPlace and type(place) == "number" and place ~= game.PlaceId then return nil end
+    return value
+end
+
+local function detectProfileAuto()
+    local exact = PROFILES[game.PlaceId]
+    if exact then return exact end
+
+    local function has(name) return RS:GetAttribute(name) ~= nil end
+    if has("animatronicLeftyEnabled") or has("tycoonCash") then
+        return PROFILES[126090388496360]
+    end
+    if has("BalloraAI") or has("CircusControlBreakerRoomPercentage") then
+        return PROFILES[15305648732]
+    end
+    if has("SpringtrapAI") then
+        return PROFILES[12497360072]
+    end
+    if has("PlushtrapAI") then
+        return PROFILES[12497365956]
+    end
+    if has("ToyFreddyAI") or has("musicBoxOff") then
+        return PROFILES[12497354347]
+    end
+    if has("powerPercentage") and has("leftDoorClosed") then
+        return {
+            key = "FNAF1", name = "FNAF 1", short = "FNAF 1", kind = "night",
+            powerAttrs = { "powerPercentage" }, clearAttrs = { "powerBlackout" },
+            doors = true, lights = true, camera = true, office = true, ai = true,
+        }
+    end
+    if has("generators") then
+        return PROFILES[12497456055]
+    end
+
+    local triggers = Workspace:FindFirstChild("GameTriggers")
+    if triggers and triggers:FindFirstChild("Levers") then
+        return PROFILES[12497453410]
+    end
+
+    return {
+        key = "UNKNOWN", name = "FNAF Co-op", short = "FNAF Co-op", kind = "unknown",
+        powerAttrs = { "powerPercentage", "batteryLife", "oxygenPercentage" },
+        powerDefaults = { batteryLife = 100, oxygenPercentage = 100 },
+        clearAttrs = { "powerBlackout", "flashlightBatteryOut" },
+        camera = true, office = true, lights = true, doors = true, ai = true,
+    }
+end
+
+local function detectProfile()
+    local override = readProfileOverride()
+    if override then
+        local chosen = profileByKey(override)
+        if chosen then return chosen end
+    end
+    return detectProfileAuto()
+end
+
+local GAME = detectProfile()
+local DETECTED = detectProfileAuto()
+local autoProfileLabel = "Auto (" .. DETECTED.short .. ")"
+
+local function profileLabel(key)
+    for _, entry in ipairs(PROFILE_ORDER) do
+        if entry.key == key then return entry.label end
+    end
+    return key
+end
+
+local function selectedProfileLabel()
+    local override = readProfileOverride()
+    if override and profileByKey(override) then
+        return profileLabel(override)
+    end
+    return autoProfileLabel
+end
+
+local function setProfileOverride(key)
+    pcall(function()
+        local genv = getgenv()
+        genv.__FNAFProfileOverride = key
+        genv.__FNAFProfileOverridePlace = key and game.PlaceId or nil
+    end)
+end
+
+local function requestProfileReload()
+    local reload
+    pcall(function() reload = getgenv().__FNAFCoopReload end)
+    if type(reload) == "function" then
+        task.defer(reload)
+        return true
+    end
+    return false
+end
+
+--// ---------------------------------------------------------------- state ---
+local State = {
+    running = true,
+    overlay = true,
+    esp = {
+        animatronics = true,
+        players = false,
+        cameras = false,
+        objectives = true,
+        names = true,
+        boxes = true,
+        tracers = false,
+        maxDist = 800,
+    },
+    speed = { enabled = false, value = 32 },
+    jump = { enabled = false, value = 60 },
+    noclip = false,
+    fly = { enabled = false, speed = 45 },
+    infiniteJump = false,
+    fullbright = false,
+    unlockMouse = false,
+
+    infPower = true,
+    powerCeilings = {},
+    serverPower = {},
+
+    pacifyAI = false,
+    savedAI = nil,
+
+    autoMask = false,
+    autoMusicBox = false,
+    musicBoxWinding = false,
+    autoVent = false,
+
+    fixBreakers = false,
+    savedBreakers = nil,
+
+    disableAnimatronics = false,
+    savedAnimatronicFlags = nil,
+
+    autoDoor = false,
+    autoObjectives = false,
+
+    selectedWaypoint = "Spawn",
+    selectedCamera = "",
+    selectedAnim = "",
+    selectedRemote = "",
+    selectedOfficeControl = "",
+    selectedAIName = "",
+    selectedLobbyGame = "FNAF 1",
+    selectedLobbyNight = 1,
+}
+
+local ESP_COLORS = {
+    player = Color3.fromRGB(255, 255, 255),
+    camera = Color3.fromRGB(80, 210, 255),
+    objective = Color3.fromRGB(120, 255, 120),
+    default = Color3.fromRGB(255, 170, 40),
+}
+
+local ANIM_COLORS = {
+    Freddy = Color3.fromRGB(205, 145, 90),
+    Bonnie = Color3.fromRGB(165, 120, 255),
+    Chica = Color3.fromRGB(255, 225, 90),
+    Foxy = Color3.fromRGB(255, 90, 70),
+    GoldenFreddy = Color3.fromRGB(255, 215, 80),
+    Springtrap = Color3.fromRGB(140, 200, 90),
+    Puppet = Color3.fromRGB(200, 200, 255),
+    Mangle = Color3.fromRGB(255, 255, 255),
+    BalloonBoy = Color3.fromRGB(120, 180, 255),
+    ToyFreddy = Color3.fromRGB(190, 140, 90),
+    ToyBonnie = Color3.fromRGB(120, 140, 255),
+    ToyChica = Color3.fromRGB(255, 210, 100),
+    Fredbear = Color3.fromRGB(220, 190, 120),
+    Nightmare = Color3.fromRGB(80, 80, 90),
+    Plushtrap = Color3.fromRGB(120, 180, 100),
+    Ballora = Color3.fromRGB(230, 180, 210),
+    Bidybab = Color3.fromRGB(220, 220, 220),
+    Bonnet = Color3.fromRGB(255, 160, 180),
+    Lolbit = Color3.fromRGB(255, 120, 255),
+    Minireena = Color3.fromRGB(230, 210, 240),
+    Yenndo = Color3.fromRGB(220, 200, 120),
+    Electrobab = Color3.fromRGB(160, 220, 255),
+    Lefty = Color3.fromRGB(60, 60, 60),
+    MoltenFreddy = Color3.fromRGB(180, 80, 50),
+    ScrapBaby = Color3.fromRGB(220, 120, 150),
+    ScrapTrap = Color3.fromRGB(100, 160, 90),
+}
+
+local Connections = {}
+local espObjects = {}
+local hashCache = {}
+local animCache = { t = 0, list = {} }
+local noclipOriginal = {}
+local overlayObjects = {}
+local running = true
+local windUI, Window, uiFolder
+local flyVelocity
+local originalWalkSpeed
+local originalJumpPower, originalUseJumpPower
+local lastFullbright = 0
+local lastFullbrightState = false
+local warned = {}
+local lastObjectiveAt = 0
+
+--// -------------------------------------------------------------- helpers ---
+local function log(...)
+    print("[FNAFMulti]", ...)
+end
+
+local function notify(title, content, duration)
+    if windUI then
+        pcall(function()
+            windUI:Notify({
+                Title = tostring(title),
+                Content = tostring(content),
+                Duration = duration or 4,
+                Icon = "info",
+            })
+        end)
+    else
+        print("[FNAFMulti]", title, content)
+    end
+end
+
+local function attr(name)
+    return RS:GetAttribute(name)
+end
+
+local function attrBool(name)
+    local value = RS:GetAttribute(name)
+    return value == true or value == "true"
+end
+
+local function attrNum(name, fallback)
+    return tonumber(RS:GetAttribute(name)) or fallback or 0
+end
+
+local function setAttr(name, value)
+    pcall(function() RS:SetAttribute(name, value) end)
+end
+
+local function getChar()
+    return LocalPlayer.Character
+end
+
+local function getHum()
+    local char = getChar()
+    return char and char:FindFirstChildOfClass("Humanoid")
+end
+
+local function getHRP()
+    local char = getChar()
+    return char and char:FindFirstChild("HumanoidRootPart")
+end
+
+local function alive()
+    local hum = getHum()
+    local hrp = getHRP()
+    return hum ~= nil and hrp ~= nil and hum.Health > 0
+end
+
+local function posString(p)
+    return string.format("%.0f, %.0f, %.0f", p.X, p.Y, p.Z)
+end
+
+local function myPosition()
+    local hrp = getHRP()
+    return hrp and hrp.Position or Vector3.zero
+end
+
+local function getRemote(name)
+    local re = RS:FindFirstChild("RemoteEvents")
+    return re and re:FindFirstChild(name) or nil
+end
+
+local function fireRemote(name, ...)
+    local ev = getRemote(name)
+    if not ev then return false, "missing " .. tostring(name) end
+    local args = table.pack(...)
+    local ok, err = pcall(function()
+        ev:FireServer(table.unpack(args, 1, args.n))
+    end)
+    return ok, err
+end
+
+local function getRemoteFolder(folderName)
+    local re = RS:FindFirstChild("RemoteEvents")
+    return re and re:FindFirstChild(folderName) or nil
+end
+
+local function fireNestedRemote(folderName, remoteName, ...)
+    local folder = getRemoteFolder(folderName)
+    local ev = folder and folder:FindFirstChild(remoteName)
+    if not ev then return false, "missing " .. tostring(folderName) .. "/" .. tostring(remoteName) end
+    local args = table.pack(...)
+    local ok, err = pcall(function()
+        ev:FireServer(table.unpack(args, 1, args.n))
+    end)
+    return ok, err
+end
+
+local function getOfficeControls()
+    local re = RS:FindFirstChild("RemoteEvents")
+    return re and re:FindFirstChild("OfficeControls") or nil
+end
+
+local function fireOfficeControl(name, ...)
+    local controls = getOfficeControls()
+    local ev = controls and controls:FindFirstChild(name)
+    if not ev then return false, "missing control " .. tostring(name) end
+    local args = table.pack(...)
+    local ok, err = pcall(function()
+        ev:FireServer(table.unpack(args, 1, args.n))
+    end)
+    return ok, err
+end
+
+-- FNAF 2/3/4/SL office remotes take an explicit boolean, unlike FNAF 1's
+-- no-argument toggles.
+local function toggleOfficeControl(controlName, attrName)
+    local current = attrBool(attrName)
+    local target = not current
+    local ok, err = fireOfficeControl(controlName, target)
+    task.wait(0.3)
+    return ok, attrBool(attrName), target, err
+end
+
+local function getCameraGui()
+    local pg = LocalPlayer:FindFirstChild("PlayerGui")
+    return pg and pg:FindFirstChild("CameraGui") or nil
+end
+
+local function cameraOpen()
+    local gui = getCameraGui()
+    return gui ~= nil and gui.Enabled == true
+end
+
+local function inGuardMode()
+    if LocalPlayer:GetAttribute("inNightGuardMode") == true then return true end
+    local pg = LocalPlayer:FindFirstChild("PlayerGui")
+    local gui = pg and pg:FindFirstChild("NightGuardModeGui")
+    return gui ~= nil and gui:GetAttribute("inMode") == true
+end
+
+local function gameActive()
+    if not LocalPlayer or not LocalPlayer.Parent then return false end
+    if attrBool("nightFinished") or attrBool("allPlayersDead") or attrBool("AllPlayersDead") then
+        return false
+    end
+    if attrBool("gameStarted") or attrBool("startOffice")
+        or attrBool("startTycoon") or attrBool("startSalvage") then
+        return true
+    end
+    if GAME.kind == "survival" then return true end
+    if GAME.kind == "tycoon" then return true end
+    return false
+end
+
+local HOUR_LABELS = { "12 AM", "1 AM", "2 AM", "3 AM", "4 AM", "5 AM", "6 AM" }
+
+local function hourLabel()
+    local h = math.clamp(math.floor(attrNum("nightTimeProgression", 0)), 0, 6)
+    return HOUR_LABELS[h + 1] or (tostring(h) .. " AM")
+end
+
+--// ---------------------------------------------------------- animatronics ---
+local function getAnimEntries()
+    local list = {}
+    local folder = Workspace:FindFirstChild("Animatronics")
+    if not folder then return list end
+
+    for _, child in ipairs(folder:GetChildren()) do
+        local npc = child:FindFirstChild(child.Name .. "NPC")
+        if not npc then
+            for _, candidate in ipairs(child:GetChildren()) do
+                if candidate:IsA("Model")
+                    and (candidate.Name:sub(-3) == "NPC"
+                        or candidate:FindFirstChildOfClass("Humanoid") ~= nil) then
+                    npc = candidate
+                    break
+                end
+            end
+        end
+
+        local root = (npc and npc:FindFirstChild("HumanoidRootPart"))
+            or child:FindFirstChild("HumanoidRootPart", true)
+        local humanoid = (npc and npc:FindFirstChildOfClass("Humanoid"))
+            or child:FindFirstChildOfClass("Humanoid")
+
+        local scriptName = child.Name:lower() .. "Script"
+        local scriptObj = child:FindFirstChild(scriptName)
+            or (npc and npc:FindFirstChild(scriptName))
+            or child:FindFirstChild(scriptName, true)
+        if not scriptObj then
+            for _, descendant in ipairs(child:GetDescendants()) do
+                if descendant:IsA("Script") or descendant:IsA("LocalScript") then
+                    scriptObj = descendant
+                    break
+                end
+            end
+        end
+
+        local ai = tonumber(RS:GetAttribute(child.Name .. "AI"))
+        local room = ""
+        if scriptObj then
+            if ai == nil then ai = tonumber(scriptObj:GetAttribute("AI")) end
+            local currentRoom = scriptObj:GetAttribute("currentRoom")
+            if currentRoom ~= nil then
+                room = tostring(currentRoom)
+            else
+                local currentState = scriptObj:GetAttribute("currentState")
+                if currentState ~= nil then room = "state " .. tostring(currentState) end
+            end
+        end
+
+        local active = RS:GetAttribute(child.Name .. "Active")
+        local enabled = RS:GetAttribute("animatronic" .. child.Name .. "Enabled")
+        list[#list + 1] = {
+            name = child.Name,
+            model = child,
+            npc = npc,
+            root = root,
+            humanoid = humanoid,
+            scriptObj = scriptObj,
+            ai = ai,
+            room = room,
+            active = active == true,
+            enabled = enabled == true,
+            stunned = npc ~= nil and npc:GetAttribute("stunned") == true,
+            jammed = npc ~= nil and npc:GetAttribute("jammerJammed") == true,
+        }
+    end
+
+    return list
+end
+
+local function refreshAnims(force)
+    local now = os.clock()
+    if not force and now - animCache.t < 0.3 then
+        return animCache.list
+    end
+    animCache.t = now
+    animCache.list = getAnimEntries()
+    return animCache.list
+end
+
+local function findAnimEntry(name)
+    for _, entry in ipairs(animCache.list) do
+        if entry.name == name then return entry end
+    end
+    return nil
+end
+
+local function getAINames()
+    local names, seen = {}, {}
+    for key, value in pairs(RS:GetAttributes()) do
+        if type(key) == "string" and #key > 2 and key:sub(-2) == "AI"
+            and type(value) == "number" then
+            local base = key:sub(1, #key - 2)
+            if base ~= "" and not seen[base] then
+                seen[base] = true
+                names[#names + 1] = base
+            end
+        end
+    end
+    for _, entry in ipairs(refreshAnims()) do
+        if not seen[entry.name]
+            and (RS:GetAttribute(entry.name .. "AI") ~= nil
+                or RS:GetAttribute("animatronic" .. entry.name .. "Enabled") ~= nil) then
+            seen[entry.name] = true
+            names[#names + 1] = entry.name
+        end
+    end
+    table.sort(names)
+    return names
+end
+
+local function setAI(name, value)
+    local ev = getRemote("playerChangeAI")
+    if ev then
+        pcall(function() ev:FireServer(name .. "AI", value) end)
+    end
+    -- Keep the client-side view in sync even when the server ignores the
+    -- remote (non-host or a game that does not use playerChangeAI).
+    setAttr(name .. "AI", value)
+end
+
+local function pacifyAnimatronics()
+    local names = getAINames()
+    if not State.savedAI then
+        State.savedAI = {}
+        for _, name in ipairs(names) do
+            State.savedAI[name] = tonumber(RS:GetAttribute(name .. "AI")) or 0
+        end
+        for _, name in ipairs({ "Lefty", "MoltenFreddy", "ScrapBaby", "ScrapTrap" }) do
+            local flag = "animatronic" .. name .. "Enabled"
+            if RS:GetAttribute(flag) ~= nil then
+                State.savedAI[flag] = RS:GetAttribute(flag)
+            end
+        end
+    end
+    for _, name in ipairs(names) do
+        setAI(name, 0)
+    end
+    for _, name in ipairs({ "Lefty", "MoltenFreddy", "ScrapBaby", "ScrapTrap" }) do
+        local flag = "animatronic" .. name .. "Enabled"
+        if RS:GetAttribute(flag) ~= nil then setAttr(flag, false) end
+    end
+end
+
+local function restoreAnimatronics()
+    if not State.savedAI then return end
+    for key, value in pairs(State.savedAI) do
+        if type(key) == "string" and key:sub(-9) == "Enabled" then
+            setAttr(key, value)
+        else
+            setAI(key, value)
+        end
+    end
+    State.savedAI = nil
+end
+
+--// ---------------------------------------------------------------- power ---
+local function getPowerAttrs()
+    if GAME.powerAttrs and #GAME.powerAttrs > 0 then
+        return GAME.powerAttrs
+    end
+    local list = {}
+    for _, name in ipairs({
+        "powerPercentage", "batteryLife", "oxygenPercentage",
+        "flashlightBattery", "power",
+    }) do
+        if tonumber(RS:GetAttribute(name)) ~= nil then
+            list[#list + 1] = name
+        end
+    end
+    return list
+end
+
+-- The server owns the real countdown. This pins the client-side meter at the
+-- highest value seen (or a sensible default for a battery/oxygen bar) and
+-- clears the failure flags the HUD checks. It runs from the lobby onward so
+-- oxygen does not drain during Sister Location's elevator phase.
+local function powerAllowed()
+    if not LocalPlayer or not LocalPlayer.Parent then return false end
+    if attrBool("nightFinished") or attrBool("allPlayersDead") or attrBool("AllPlayersDead") then
+        return false
+    end
+    return true
+end
+
+local function pinPower()
+    if not State.infPower or not powerAllowed() then return end
+
+    for _, name in ipairs(getPowerAttrs()) do
+        local raw = tonumber(RS:GetAttribute(name))
+        if raw ~= nil then
+            local default = (GAME.powerDefaults and GAME.powerDefaults[name]) or 100
+            local ceiling = State.powerCeilings[name]
+            if ceiling == nil then
+                ceiling = math.max(default, raw)
+                State.powerCeilings[name] = ceiling
+            elseif raw > ceiling then
+                ceiling = raw
+                State.powerCeilings[name] = ceiling
+            end
+
+            if raw < ceiling then
+                State.serverPower[name] = raw
+                setAttr(name, ceiling)
+            end
+        end
+    end
+
+    for _, name in ipairs(GAME.clearAttrs or {}) do
+        if attrBool(name) then setAttr(name, false) end
+    end
+end
+
+local function powerSummary()
+    local bits = {}
+    for _, name in ipairs(getPowerAttrs()) do
+        local value = math.floor(attrNum(name, 0))
+        if name == "powerPercentage" then
+            bits[#bits + 1] = "Power " .. value .. "%"
+        elseif name == "batteryLife" then
+            bits[#bits + 1] = "Battery " .. value .. "%"
+        elseif name == "oxygenPercentage" then
+            bits[#bits + 1] = "O2 " .. value .. "%"
+        else
+            bits[#bits + 1] = name .. " " .. value
+        end
+    end
+    return #bits > 0 and table.concat(bits, "  |  ") or "No power meter"
+end
+
+--// ------------------------------------------------------- game mechanics ---
+local function stopMusicBox()
+    fireRemote("playerWindBoxEvent", false)
+    fireRemote("playerSwitchCamsEvent", "")
+    State.musicBoxWinding = false
+end
+
+-- FNAF 2 only accepts winding while the camera is on CAM11. Pulse it without
+-- enabling the tablet GUI, then clear the camera state again.
+local function musicBoxPulse(duration)
+    if cameraOpen() or not inGuardMode() then return false end
+    local ok = fireRemote("playerSwitchCamsEvent", "CAM11")
+    if not ok then return false end
+    task.wait(0.25)
+    fireRemote("playerWindBoxEvent", true)
+    State.musicBoxWinding = true
+    task.wait(duration or 1.5)
+    fireRemote("playerWindBoxEvent", false)
+    fireRemote("playerSwitchCamsEvent", "")
+    State.musicBoxWinding = false
+    return true
+end
+
+local function setMusicBox(on)
+    if on then
+        return musicBoxPulse(1.5)
+    end
+    stopMusicBox()
+    return true
+end
+
+local function maskState()
+    return LocalPlayer:GetAttribute("behindMask") == true
+end
+
+local function setMaskRemote(on)
+    fireRemote("playerBehindMaskEvent", on)
+    pcall(function() LocalPlayer:SetAttribute("behindMask", on) end)
+end
+
+-- Manual mask toggle. Try the game's own Space key first so the local mask
+-- overlay updates too; fall back to the remote when native input is blocked.
+local function toggleMask()
+    local before = maskState()
+    local target = not before
+
+    local pg = LocalPlayer:FindFirstChild("PlayerGui")
+    local gui = pg and pg:FindFirstChild("FazbearMaskGui")
+    if gui then
+        pcall(function()
+            if type(keypress) == "function" and type(keyrelease) == "function" then
+                keypress(32)
+                task.wait(0.05)
+                keyrelease(32)
+            else
+                local vim = game:GetService("VirtualInputManager")
+                vim:SendKeyEvent(true, Enum.KeyCode.Space, false, game)
+                task.wait(0.05)
+                vim:SendKeyEvent(false, Enum.KeyCode.Space, false, game)
+            end
+        end)
+        task.wait(0.35)
+    end
+
+    if maskState() == before then
+        setMaskRemote(target)
+        task.wait(0.25)
+    end
+    return maskState()
+end
+
+local function useBedroomDoor(on)
+    return fireRemote("updatePlayerDoorStateEvent", on)
+end
+
+local function useBedroomLight(on)
+    return fireRemote("updatePlayerLightStateEvent", on)
+end
+
+local BEDROOM_SIDES = {
+    Left = { prox = "LeftDoorProxPart", look = "LeftDoorLookPart" },
+    Right = { prox = "RightDoorProxPart", look = "RightDoorLookPart" },
+}
+
+local function bedroomSidePart(side, kind)
+    local triggers = Workspace:FindFirstChild("GameTriggers")
+    local doors = triggers and triggers:FindFirstChild("BedroomDoors")
+    local config = BEDROOM_SIDES[side]
+    if not doors or not config then return nil end
+    return doors:FindFirstChild(config[kind])
+end
+
+-- The server checks the character's facing direction against the door look
+-- part, so put the character at the door and turn it towards the hallway.
+local function faceBedroomSide(side)
+    local prox = bedroomSidePart(side, "prox")
+    local look = bedroomSidePart(side, "look")
+    local hrp = getHRP()
+    if not prox or not look or not hrp then return false end
+    hrp.CFrame = CFrame.new(prox.Position + Vector3.new(0, 2, 0), look.Position)
+    task.wait(0.35)
+    return true
+end
+
+local function useBedroomDoorSide(side, on)
+    if not faceBedroomSide(side) then
+        return false, "No " .. tostring(side) .. " bedroom door was found."
+    end
+    local ok, err = useBedroomDoor(on)
+    task.wait(0.3)
+    return ok, err
+end
+
+local function flashBedroomLight(side)
+    if not faceBedroomSide(side) then
+        return false, "No " .. tostring(side) .. " bedroom door was found."
+    end
+    useBedroomLight(true)
+    task.wait(1.2)
+    useBedroomLight(false)
+    return true
+end
+
+local function breakerAttrs()
+    local list = {}
+    for key, value in pairs(RS:GetAttributes()) do
+        if type(key) == "string" and #key >= 21
+            and key:sub(-21) == "BreakerRoomPercentage" then
+            list[#list + 1] = key
+        end
+    end
+    table.sort(list)
+    return list
+end
+
+local function setBreakers(fixed)
+    local attrs = breakerAttrs()
+    if fixed and not State.savedBreakers then
+        State.savedBreakers = {}
+        for _, name in ipairs(attrs) do
+            State.savedBreakers[name] = tonumber(RS:GetAttribute(name)) or 0
+            local beingFixed = name:gsub("Percentage$", "BeingFixed")
+            State.savedBreakers[beingFixed] = RS:GetAttribute(beingFixed)
+        end
+    end
+
+    if fixed then
+        for _, name in ipairs(attrs) do
+            setAttr(name, 0)
+            setAttr(name:gsub("Percentage$", "BeingFixed"), false)
+        end
+    elseif State.savedBreakers then
+        for name, value in pairs(State.savedBreakers) do
+            setAttr(name, value)
+        end
+        State.savedBreakers = nil
+    end
+end
+
+local FNAF6_NAMES = { "Lefty", "MoltenFreddy", "ScrapBaby", "ScrapTrap" }
+
+local function setAnimatronicFlags(enabled)
+    if not enabled and not State.savedAnimatronicFlags then
+        State.savedAnimatronicFlags = {}
+        for _, name in ipairs(FNAF6_NAMES) do
+            local flag = "animatronic" .. name .. "Enabled"
+            State.savedAnimatronicFlags[flag] = RS:GetAttribute(flag)
+        end
+    end
+
+    for _, name in ipairs(FNAF6_NAMES) do
+        local flag = "animatronic" .. name .. "Enabled"
+        if RS:GetAttribute(flag) ~= nil then
+            setAttr(flag, enabled)
+            if not enabled then
+                fireRemote("playerChangeAI", name .. "AI", 0)
+            end
+        end
+    end
+
+    if enabled and State.savedAnimatronicFlags then
+        for flag, value in pairs(State.savedAnimatronicFlags) do
+            setAttr(flag, value)
+        end
+        State.savedAnimatronicFlags = nil
+    end
+end
+
+local VENT_ATTRS = {
+    "ventilationError", "ventilationErrorForce", "ventilationPassOut",
+    "blackoutScreenPitchBlack", "cameraError", "audioError",
+}
+
+local function suppressVentilation()
+    for _, name in ipairs(VENT_ATTRS) do
+        if attrBool(name) then setAttr(name, false) end
+    end
+end
+
+--// --------------------------------------------------------------- camera ---
+local function getCameraMarkers()
+    local markers = {}
+    local triggers = Workspace:FindFirstChild("GameTriggers")
+    local folder = triggers and triggers:FindFirstChild("Cameras")
+    if folder then
+        for _, value in ipairs(folder:GetChildren()) do
+            local part = value:IsA("BasePart") and value
+                or value:FindFirstChildWhichIsA("BasePart", true)
+            if part then
+                markers[#markers + 1] = { code = value.Name, part = part }
+            end
+        end
+    end
+    return markers
+end
+
+local function getCameraCodes()
+    local codes = {}
+    for _, marker in ipairs(getCameraMarkers()) do
+        codes[#codes + 1] = marker.code
+    end
+    if #codes == 0 then
+        for _, code in ipairs(GAME.cameraCodes or {}) do
+            codes[#codes + 1] = code
+        end
+    end
+    if #codes == 0 then
+        for i = 1, 12 do
+            codes[#codes + 1] = string.format("CAM%02d", i)
+        end
+    end
+    table.sort(codes)
+    return codes
+end
+
+local function openCameras()
+    local gui = getCameraGui()
+    if gui and not gui.Enabled then
+        pcall(function() gui.Enabled = true end)
+    end
+    fireRemote("openCamerasEvent", true)
+    task.wait(0.25)
+    return cameraOpen()
+end
+
+local function switchCamera(code)
+    if not code or code == "" then return false end
+    if not cameraOpen() then openCameras() end
+    local ok = fireRemote("playerSwitchCamsEvent", code)
+    return ok
+end
+
+local function closeCameras()
+    fireRemote("playerSwitchCamsEvent", "")
+    local gui = getCameraGui()
+    if gui and gui.Enabled then
+        pcall(function() gui.Enabled = false end)
+    end
+    return not cameraOpen()
+end
+
+--// ------------------------------------------------------------- FNAF 3 ---
+local VENT_CAMS = { "CAM11", "CAM12", "CAM13", "CAM14", "CAM15" }
+
+local function isVentCam(code)
+    for _, value in ipairs(VENT_CAMS) do
+        if value == code then return true end
+    end
+    return false
+end
+
+-- The audio lure needs a normal camera selected and canDistract at 7.
+local function playAudioLure()
+    if attrNum("canDistract", 0) ~= 7 then
+        return false, "The lure is still charging (" .. tostring(attr("canDistract") or 0) .. "/7)."
+    end
+    local code = State.selectedCamera
+    if code == "" or isVentCam(code) then
+        code = "CAM01"
+        if switchCamera(code) then task.wait(0.35) end
+    end
+    local ok, err = fireNestedRemote("FNAF3", "playDistractionEvent")
+    return ok, ok and code or err
+end
+
+-- Sealing only works while a vent camera (CAM11-CAM15) is selected.
+local function sealVent(code)
+    code = code or State.selectedCamera
+    if not isVentCam(code) then
+        return false, "Pick a vent camera (CAM11-CAM15) first."
+    end
+    if attr("sealedVent") == code then
+        return false, code .. " is already sealed."
+    end
+    switchCamera(code)
+    task.wait(0.35)
+    local ok, err = fireNestedRemote("FNAF3", "startSealingEvent")
+    return ok, ok and code or err
+end
+
+--// ------------------------------------------------------------ objectives ---
+local function firstBasePart(inst)
+    if inst:IsA("BasePart") then return inst end
+    return inst:FindFirstChildWhichIsA("BasePart", true)
+end
+
+local function getPromptFor(object)
+    if not object then return nil end
+    if object:IsA("ProximityPrompt") then return object end
+    return object:FindFirstChildWhichIsA("ProximityPrompt", true)
+end
+
+local function leverPulled(lever)
+    local up = lever:FindFirstChild("LeverUp")
+    local handle = up and up:FindFirstChildWhichIsA("BasePart", true)
+    return handle ~= nil and handle.Transparency >= 1
+end
+
+local function generatorFixed(gen)
+    local prompt = getPromptFor(gen)
+    return prompt ~= nil and not prompt.Enabled
+end
+
+local function getObjectiveEntries()
+    local list = {}
+    local triggers = Workspace:FindFirstChild("GameTriggers")
+    if not triggers then return list end
+
+    for _, folderName in ipairs({ "Generators", "Levers", "ExitDoors" }) do
+        local folder = triggers:FindFirstChild(folderName)
+        if folder then
+            for _, child in ipairs(folder:GetChildren()) do
+                local part = firstBasePart(child)
+                if part then
+                    list[#list + 1] = {
+                        name = folderName .. " / " .. child.Name,
+                        folder = folderName,
+                        part = part,
+                        object = child,
+                        done = (folderName == "Levers" and leverPulled(child))
+                            or (folderName == "Generators" and generatorFixed(child))
+                            or false,
+                    }
+                end
+            end
+        end
+    end
+
+    -- The exit model is mostly decorative beams. Use one marker, not 40.
+    local exitDoor = triggers:FindFirstChild("ExitDoor")
+    if exitDoor then
+        local marker = exitDoor:FindFirstChild("ExitMarkPart")
+            or exitDoor:FindFirstChild("MetalSheetDoor")
+            or firstBasePart(exitDoor)
+        if marker then
+            list[#list + 1] = {
+                name = "Exit Door",
+                folder = "ExitDoor",
+                part = marker,
+                object = exitDoor,
+            }
+        end
+    end
+
+    for _, name in ipairs({ "ExitPart", "ExitMarkPart" }) do
+        local part = triggers:FindFirstChild(name)
+        if part and part:IsA("BasePart") then
+            list[#list + 1] = {
+                name = name,
+                folder = "Exit",
+                part = part,
+                object = part,
+            }
+        end
+    end
+
+    return list
+end
+
+local function firePrompt(prompt)
+    if not prompt then return false end
+    local ok = pcall(function() fireproximityprompt(prompt) end)
+    if not ok then
+        ok = pcall(function()
+            prompt:InputHoldBegin()
+            task.wait(0.12)
+            prompt:InputHoldEnd()
+        end)
+    end
+    return ok
+end
+
+local function nearestObjective(includeDone)
+    local best, bestDist = nil, math.huge
+    local pos = myPosition()
+    for _, entry in ipairs(getObjectiveEntries()) do
+        if includeDone or not entry.done then
+            local dist = (entry.part.Position - pos).Magnitude
+            if dist < bestDist then
+                best, bestDist = entry, dist
+            end
+        end
+    end
+    return best, bestDist
+end
+
+--// ------------------------------------------------------------- movement ---
+local function applySpeed()
+    local hum = getHum()
+    if not hum then return end
+    if State.speed.enabled then
+        if originalWalkSpeed == nil then originalWalkSpeed = hum.WalkSpeed end
+        hum.WalkSpeed = State.speed.value
+    else
+        hum.WalkSpeed = originalWalkSpeed or hum.WalkSpeed
+        originalWalkSpeed = nil
+    end
+end
+
+local function applyJump()
+    local hum = getHum()
+    if not hum then return end
+    if State.jump.enabled then
+        if originalJumpPower == nil then
+            originalJumpPower = hum.JumpPower
+            originalUseJumpPower = hum.UseJumpPower
+        end
+        hum.UseJumpPower = true
+        hum.JumpPower = State.jump.value
+    else
+        if originalUseJumpPower ~= nil then
+            hum.UseJumpPower = originalUseJumpPower
+        end
+        hum.JumpPower = originalJumpPower or hum.JumpPower
+        originalJumpPower, originalUseJumpPower = nil, nil
+    end
+end
+
+local function makeFly(hrp)
+    if flyVelocity then pcall(function() flyVelocity:Destroy() end) end
+    flyVelocity = Instance.new("BodyVelocity")
+    flyVelocity.Name = "FNAFMultiFly"
+    flyVelocity.MaxForce = Vector3.new(1e6, 1e6, 1e6)
+    flyVelocity.P = 1e4
+    flyVelocity.Velocity = Vector3.zero
+    flyVelocity.Parent = hrp
+end
+
+local function setFly(enabled)
+    State.fly.enabled = enabled
+    if enabled then
+        local hrp = getHRP()
+        if hrp then makeFly(hrp) end
+    elseif flyVelocity then
+        flyVelocity:Destroy()
+        flyVelocity = nil
+    end
+end
+
+local function noclipCharacter()
+    local char = getChar()
+    if not char then return end
+    if State.noclip then
+        for _, part in ipairs(char:GetDescendants()) do
+            if part:IsA("BasePart") then
+                if noclipOriginal[part] == nil then
+                    noclipOriginal[part] = part.CanCollide
+                end
+                part.CanCollide = false
+            end
+        end
+    else
+        for part, original in pairs(noclipOriginal) do
+            if part and part.Parent then
+                pcall(function() part.CanCollide = original end)
+            end
+        end
+        table.clear(noclipOriginal)
+    end
+end
+
+local function flyTick()
+    if not State.fly.enabled then
+        if flyVelocity then
+            pcall(function() flyVelocity:Destroy() end)
+            flyVelocity = nil
+        end
+        return
+    end
+    if not alive() then return end
+    local hrp = getHRP()
+    if not hrp then return end
+
+    if not flyVelocity or not flyVelocity.Parent then
+        makeFly(hrp)
+    elseif flyVelocity.Parent ~= hrp then
+        flyVelocity.Parent = hrp
+    end
+
+    local hum = getHum()
+    local direction = hum and hum.MoveDirection or Vector3.zero
+    local vertical = 0
+    if UserInputService:IsKeyDown(Enum.KeyCode.Space) then vertical = 1 end
+    if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then vertical = -1 end
+    flyVelocity.Velocity = direction * State.fly.speed
+        + Vector3.new(0, vertical * State.fly.speed, 0)
+end
+
+--// ------------------------------------------------------------- teleports ---
+local function teleportRaw(pos)
+    local hrp = getHRP()
+    if not hrp then return false end
+
+    local hum = getHum()
+    if hum and hum.Sit then
+        hum.Sit = false
+        hum.Jump = true
+        task.wait(0.25)
+    end
+
+    hrp = getHRP()
+    if not hrp then return false end
+    hrp.CFrame = CFrame.new(pos + Vector3.new(0, 1, 0))
+    task.wait(0.15)
+    hrp = getHRP()
+    if hrp then hrp.CFrame = CFrame.new(pos + Vector3.new(0, 1, 0)) end
+    return true
+end
+
+local function teleportTo(pos, keepGuardMode)
+    if not keepGuardMode and inGuardMode() then
+        fireRemote("triggerNightGuardModeEvent", false)
+        task.wait(0.25)
+    end
+    return teleportRaw(pos)
+end
+
+local function getSpawnPos()
+    local triggers = Workspace:FindFirstChild("GameTriggers")
+    local spawns = triggers and triggers:FindFirstChild("Spawns")
+    if spawns then
+        for _, child in ipairs(spawns:GetChildren()) do
+            local part = child:IsA("BasePart") and child
+                or child:FindFirstChildWhichIsA("BasePart", true)
+            if part then return part.Position end
+        end
+    end
+    return Vector3.new(0, 10, 0)
+end
+
+local function getChairPart()
+    local triggers = Workspace:FindFirstChild("GameTriggers")
+    local chair = triggers and triggers:FindFirstChild("OfficeChair")
+    if not chair then return nil end
+    local prox = chair:FindFirstChild("ProxPart")
+    if prox then
+        local part = prox:IsA("BasePart") and prox
+            or prox:FindFirstChildWhichIsA("BasePart", true)
+        if part then return part end
+    end
+    return chair:FindFirstChildWhichIsA("BasePart", true)
+end
+
+local function enterOffice()
+    local chair = getChairPart()
+    if not chair then
+        notify("Office", "No office chair was found in this place.", 4)
+        return false
+    end
+
+    if not teleportTo(chair.Position, true) then
+        notify("Office", "No living character to move.", 3)
+        return false
+    end
+    task.wait(0.4)
+
+    local triggers = Workspace:FindFirstChild("GameTriggers")
+    local chairFolder = triggers and triggers:FindFirstChild("OfficeChair")
+    local prompt = getPromptFor(chairFolder)
+    if prompt then
+        firePrompt(prompt)
+        task.wait(1.0)
+    end
+
+    local hum = getHum()
+    local ok = inGuardMode() or (hum ~= nil and hum.Sit == true)
+    notify("Office", ok and "Seated. Office controls are live."
+        or "Moved to the chair, but the prompt did not start the shift.", 4)
+    return ok
+end
+
+local function leaveToLobby()
+    if inGuardMode() then
+        fireRemote("triggerNightGuardModeEvent", false)
+        task.wait(0.25)
+    end
+    local ok = teleportRaw(getSpawnPos())
+    if ok then notify("Teleport", "Left the office / returned to spawn.", 3) end
+    return ok
+end
+
+local function buildWaypoints()
+    State.waypoints = {}
+    State.waypointOrder = {}
+
+    State.waypoints["Spawn"] = getSpawnPos()
+    State.waypointOrder[#State.waypointOrder + 1] = "Spawn"
+
+    local chair = getChairPart()
+    if chair then
+        State.waypoints["Office Chair"] = chair.Position
+        State.waypointOrder[#State.waypointOrder + 1] = "Office Chair"
+    end
+
+    for _, marker in ipairs(getCameraMarkers()) do
+        local name = "CAM " .. marker.code
+        State.waypoints[name] = marker.part.Position
+        State.waypointOrder[#State.waypointOrder + 1] = name
+    end
+
+    for _, entry in ipairs(getObjectiveEntries()) do
+        State.waypoints[entry.name] = entry.part.Position
+        State.waypointOrder[#State.waypointOrder + 1] = entry.name
+    end
+
+    if #State.waypointOrder == 0 then
+        State.waypointOrder[1] = "Spawn"
+    end
+    State.selectedWaypoint = State.waypointOrder[1] or "Spawn"
+    return State.waypointOrder
+end
+
+local function tpWaypoint(name)
+    if name == "Spawn" then return leaveToLobby() end
+    if name == "Office Chair" then return enterOffice() end
+
+    local pos = State.waypoints and State.waypoints[name]
+    if not pos then
+        notify("Teleport", "Unknown waypoint: " .. tostring(name), 3)
+        return false
+    end
+    local ok = teleportTo(pos)
+    if ok then notify("Teleport", name .. "  ·  " .. posString(pos), 2) end
+    return ok
+end
+
+local function tpAnimatronic(name)
+    refreshAnims(true)
+    local entry = findAnimEntry(name)
+    if not entry or not entry.root then
+        notify("Teleport", tostring(name) .. " was not found.", 3)
+        return false
+    end
+    local target = entry.root.Position
+        - entry.root.CFrame.LookVector * 8
+        + Vector3.new(0, 1.5, 0)
+    local ok = teleportTo(target)
+    if ok then
+        notify("Teleport", string.format("Near %s  ·  %s", name, posString(target)), 3)
+    end
+    return ok
+end
+
+local function tpObjective(entry)
+    if not entry then
+        entry = nearestObjective()
+    end
+    if not entry then
+        notify("Teleport", "No objectives were found.", 3)
+        return false
+    end
+    local target = entry.part.Position + Vector3.new(0, 2, 0)
+    local ok = teleportTo(target)
+    if ok then notify("Teleport", entry.name, 3) end
+    return ok
+end
+
+local function pullAllLevers()
+    local triggers = Workspace:FindFirstChild("GameTriggers")
+    local folder = triggers and triggers:FindFirstChild("Levers")
+    if not folder then return false, "No levers in this place." end
+
+    local pulled, skipped, total = 0, 0, 0
+    for _, lever in ipairs(folder:GetChildren()) do
+        total = total + 1
+        if leverPulled(lever) then
+            skipped = skipped + 1
+        else
+            local part = firstBasePart(lever)
+            local prompt = getPromptFor(lever)
+            if part and prompt then
+                teleportTo(part.Position + Vector3.new(0, 2, 0))
+                task.wait(0.6)
+                if firePrompt(prompt) then pulled = pulled + 1 end
+                task.wait(1.0)
+            end
+        end
+    end
+    return true, string.format("Pulled %d of %d lever(s), %d already down.", pulled, total, skipped)
+end
+
+local function fixAllGenerators()
+    local triggers = Workspace:FindFirstChild("GameTriggers")
+    local folder = triggers and triggers:FindFirstChild("Generators")
+    if not folder then return false, "No generators in this place." end
+
+    local fixed, skipped, total = 0, 0, 0
+    for _, gen in ipairs(folder:GetChildren()) do
+        total = total + 1
+        local prompt = getPromptFor(gen)
+        if not prompt or not prompt.Enabled then
+            skipped = skipped + 1
+        else
+            local part = prompt.Parent
+            if part and part:IsA("BasePart") then
+                teleportTo(part.Position + Vector3.new(0, 2.5, 0))
+                task.wait(0.8)
+                if firePrompt(prompt) then fixed = fixed + 1 end
+                task.wait(1.0)
+            end
+        end
+    end
+    return true, string.format("Fixed %d of %d generator(s), %d already on.", fixed, total, skipped)
+end
+
+--// ------------------------------------------------------------------- ESP ---
+local function getDrawing()
+    local ok, drawing = pcall(function() return Drawing end)
+    if ok and drawing then return drawing end
+    return nil
+end
+
+local function worldBox(model)
+    if not model then return nil end
+    if not model:IsA("Model") then
+        local part = model:FindFirstChildWhichIsA("BasePart", true)
+        if not part then return nil end
+        return part.CFrame, part.Size
+    end
+
+    local now = os.clock()
+    local cached = hashCache[model]
+    if cached and now - cached.t < 1.2 then
+        return cached.cf, cached.size
+    end
+    local ok, cf, size = pcall(model.GetBoundingBox, model)
+    if not ok or not cf then return nil end
+    hashCache[model] = { t = now, cf = cf, size = size }
+    return cf, size
+end
+
+local function projectBox(cf, size)
+    local cam = Workspace.CurrentCamera
+    if not cam then return nil end
+    local minX, minY = math.huge, math.huge
+    local maxX, maxY = -math.huge, -math.huge
+    local any = false
+
+    for sx = -1, 1, 2 do
+        for sy = -1, 1, 2 do
+            for sz = -1, 1, 2 do
+                local world = cf:PointToWorldSpace(Vector3.new(
+                    sx * size.X / 2,
+                    sy * size.Y / 2,
+                    sz * size.Z / 2
+                ))
+                local screen, visible = cam:WorldToViewportPoint(world)
+                if visible and screen.Z > 0 then
+                    any = true
+                    if screen.X < minX then minX = screen.X end
+                    if screen.Y < minY then minY = screen.Y end
+                    if screen.X > maxX then maxX = screen.X end
+                    if screen.Y > maxY then maxY = screen.Y end
+                end
+            end
+        end
+    end
+
+    if not any then return nil end
+    return Vector2.new(minX, minY), Vector2.new(maxX - minX, maxY - minY)
+end
+
+local function getEsp(key)
+    local obj = espObjects[key]
+    if obj then return obj end
+    local D = getDrawing()
+    if not D then return nil end
+
+    obj = {
+        box = D.new("Square"),
+        name = D.new("Text"),
+        tracer = D.new("Line"),
+    }
+    obj.box.Thickness = 1
+    obj.box.Filled = false
+    obj.box.Transparency = 0.15
+    obj.name.Size = 14
+    obj.name.Center = true
+    obj.name.Outline = true
+    obj.name.OutlineColor = Color3.fromRGB(0, 0, 0)
+    obj.tracer.Thickness = 1
+    obj.tracer.Transparency = 0.35
+    espObjects[key] = obj
+    return obj
+end
+
+local function hideEsp(key)
+    local obj = espObjects[key]
+    if not obj then return end
+    if obj.box then obj.box.Visible = false end
+    if obj.name then obj.name.Visible = false end
+    if obj.tracer then obj.tracer.Visible = false end
+    obj.lastSeen = 0
+end
+
+local function drawTarget(model, root, color, label)
+    if not model or not model.Parent or not root or not root.Parent then
+        if model then hideEsp(model) end
+        return
+    end
+
+    local dist = (root.Position - myPosition()).Magnitude
+    if dist > State.esp.maxDist then hideEsp(model) return end
+
+    local cf, size = worldBox(model)
+    if not cf then hideEsp(model) return end
+
+    local screenPos, screenSize = projectBox(cf, size)
+    if not screenPos then hideEsp(model) return end
+
+    local obj = getEsp(model)
+    if not obj then return end
+    obj.lastSeen = os.clock()
+
+    if State.esp.boxes then
+        obj.box.Visible = true
+        obj.box.Size = screenSize
+        obj.box.Position = screenPos
+        obj.box.Color = color
+    else
+        obj.box.Visible = false
+    end
+
+    if State.esp.names then
+        obj.name.Visible = true
+        obj.name.Text = string.format("%s  %.0fm", label or model.Name, dist)
+        obj.name.Position = Vector2.new(screenPos.X + screenSize.X / 2, screenPos.Y - 17)
+        obj.name.Color = color
+    else
+        obj.name.Visible = false
+    end
+
+    if State.esp.tracers then
+        local cam = Workspace.CurrentCamera
+        local viewport = cam and cam.ViewportSize or Vector2.new(1280, 720)
+        obj.tracer.Visible = true
+        obj.tracer.From = Vector2.new(viewport.X / 2, viewport.Y)
+        obj.tracer.To = Vector2.new(screenPos.X + screenSize.X / 2, screenPos.Y + screenSize.Y)
+        obj.tracer.Color = color
+    else
+        obj.tracer.Visible = false
+    end
+end
+
+local function drawWorldLabel(part, text, color)
+    if not part or not part.Parent then return end
+    local cam = Workspace.CurrentCamera
+    if not cam then return end
+    local screen, visible = cam:WorldToViewportPoint(part.Position + Vector3.new(0, 1.5, 0))
+    if not visible or screen.Z <= 0 then return end
+
+    local obj = espObjects[part]
+    local D = getDrawing()
+    if not D then return end
+    if not obj then
+        obj = { name = D.new("Text") }
+        obj.name.Size = 14
+        obj.name.Center = true
+        obj.name.Outline = true
+        obj.name.OutlineColor = Color3.fromRGB(0, 0, 0)
+        espObjects[part] = obj
+    end
+
+    obj.name.Visible = true
+    obj.name.Text = text
+    obj.name.Position = Vector2.new(screen.X, screen.Y)
+    obj.name.Color = color
+    obj.lastSeen = os.clock()
+end
+
+local function clearEsp()
+    for _, obj in pairs(espObjects) do
+        for _, drawing in pairs(obj) do
+            if type(drawing) == "table" and drawing.Remove then
+                pcall(function() drawing:Remove() end)
+            elseif type(drawing) == "userdata" and drawing.Remove then
+                pcall(function() drawing:Remove() end)
+            end
+        end
+    end
+    table.clear(espObjects)
+    table.clear(hashCache)
+end
+
+local function updateEsp()
+    if not getDrawing() then return end
+
+    if State.esp.animatronics then
+        for _, entry in ipairs(animCache.list) do
+            local boxModel = entry.npc or entry.model
+            local color = ANIM_COLORS[entry.name] or ESP_COLORS.default
+            local bits = { entry.name }
+            if entry.room and entry.room ~= "" then bits[#bits + 1] = "[" .. entry.room .. "]" end
+            if entry.ai ~= nil then bits[#bits + 1] = "AI" .. tostring(entry.ai) end
+            if entry.enabled then bits[#bits + 1] = "ACTIVE" end
+            if entry.stunned then bits[#bits + 1] = "STUN" end
+            if entry.jammed then bits[#bits + 1] = "JAM" end
+            local label = table.concat(bits, " ")
+
+            if entry.root and entry.root.Parent and boxModel:IsA("Model") then
+                drawTarget(boxModel, entry.root, color, label)
+            elseif entry.root then
+                drawWorldLabel(entry.root, label, color)
+            end
+        end
+    end
+
+    if State.esp.players then
+        for _, player in ipairs(Players:GetPlayers()) do
+            if player ~= LocalPlayer then
+                local char = player.Character
+                local hum = char and char:FindFirstChildOfClass("Humanoid")
+                local root = char and char:FindFirstChild("HumanoidRootPart")
+                if char and hum and hum.Health > 0 and root then
+                    local role = tostring(player:GetAttribute("Role") or "PLAYER")
+                    drawTarget(char, root, ESP_COLORS.player, player.Name .. " [" .. role .. "]")
+                end
+            end
+        end
+    end
+
+    if State.esp.cameras then
+        for _, marker in ipairs(getCameraMarkers()) do
+            local dist = (marker.part.Position - myPosition()).Magnitude
+            if dist <= State.esp.maxDist then
+                drawWorldLabel(marker.part, marker.code, ESP_COLORS.camera)
+            end
+        end
+    end
+
+    if State.esp.objectives then
+        for _, entry in ipairs(getObjectiveEntries()) do
+            local dist = (entry.part.Position - myPosition()).Magnitude
+            if dist <= State.esp.maxDist then
+                drawWorldLabel(entry.part, entry.name, ESP_COLORS.objective)
+            end
+        end
+    end
+
+    local now = os.clock()
+    for key, obj in pairs(espObjects) do
+        if obj.lastSeen and now - obj.lastSeen > 1.5 then
+            if obj.box then obj.box.Visible = false end
+            if obj.name then obj.name.Visible = false end
+            if obj.tracer then obj.tracer.Visible = false end
+            if not key.Parent then
+                for _, drawing in pairs(obj) do
+                    local kind = type(drawing)
+                    if (kind == "table" or kind == "userdata") and drawing.Remove then
+                        pcall(function() drawing:Remove() end)
+                    end
+                end
+                espObjects[key] = nil
+            end
+        end
+    end
+end
+
+--// --------------------------------------------------------------- overlay ---
+local function ensureOverlay()
+    if #overlayObjects > 0 then return true end
+    local D = getDrawing()
+    if not D then return false end
+
+    local bg = D.new("Square")
+    bg.Color = Color3.fromRGB(15, 15, 20)
+    bg.Filled = true
+    bg.Transparency = 0.35
+    bg.Size = Vector2.new(1100, 48)
+    bg.Position = Vector2.new(12, 60)
+
+    local line1 = D.new("Text")
+    line1.Size = 15
+    line1.Outline = true
+    line1.OutlineColor = Color3.fromRGB(0, 0, 0)
+    line1.Position = Vector2.new(18, 65)
+
+    local line2 = D.new("Text")
+    line2.Size = 14
+    line2.Outline = true
+    line2.OutlineColor = Color3.fromRGB(0, 0, 0)
+    line2.Position = Vector2.new(18, 84)
+
+    overlayObjects[1] = bg
+    overlayObjects[2] = line1
+    overlayObjects[3] = line2
+    return true
+end
+
+local function clearOverlay()
+    for _, drawing in ipairs(overlayObjects) do
+        pcall(function() drawing:Remove() end)
+    end
+    table.clear(overlayObjects)
+end
+
+local function gameStatusText()
+    local bits = {}
+
+    if GAME.key == "FNAF2" then
+        bits[#bits + 1] = "Mask " .. (maskState() and "ON" or "OFF")
+        bits[#bits + 1] = "MusicBox " .. (attrBool("musicBoxOff") and "OFF" or "OK")
+        bits[#bits + 1] = "Vents L" .. (attrBool("leftVentClogged") and "X" or "OK")
+            .. " R" .. (attrBool("rightVentClogged") and "X" or "OK")
+    elseif GAME.key == "FNAF3" then
+        bits[#bits + 1] = "Vent " .. (attrBool("ventilationError") and "ERROR" or "OK")
+        bits[#bits + 1] = "Springtrap " .. attrNum("SpringtrapAI", 0)
+        bits[#bits + 1] = "Sealed " .. tostring(attr("sealedVent") or "-")
+    elseif GAME.key == "FNAF4" then
+        bits[#bits + 1] = "L " .. (attrBool("leftDoorClosed") and "CLOSED" or "OPEN")
+            .. "  R " .. (attrBool("rightDoorClosed") and "CLOSED" or "OPEN")
+        bits[#bits + 1] = "Closet " .. (attrBool("closetDoorClosed") and "CLOSED" or "OPEN")
+        bits[#bits + 1] = "Bed " .. (attrBool("bedLightState") and "LIT" or "DARK")
+    elseif GAME.key == "SL" then
+        local total, broken = 0, 0
+        for _, name in ipairs(breakerAttrs()) do
+            total = total + 1
+            if attrNum(name, 0) > 0 then broken = broken + 1 end
+        end
+        bits[#bits + 1] = "Breakers " .. broken .. "/" .. total
+    elseif GAME.key == "FNAF6" then
+        local active = {}
+        for _, name in ipairs(FNAF6_NAMES) do
+            if attrBool("animatronic" .. name .. "Enabled") then
+                active[#active + 1] = name
+            end
+        end
+        bits[#bits + 1] = #active > 0 and ("Active: " .. table.concat(active, ", ")) or "Animatronics off"
+        bits[#bits + 1] = "Cash $" .. math.floor(attrNum("tycoonCash", 0))
+    elseif GAME.key == "BASEMENT" then
+        local total, pulled = 0, 0
+        local triggers = Workspace:FindFirstChild("GameTriggers")
+        local levers = triggers and triggers:FindFirstChild("Levers")
+        if levers then
+            for _, lever in ipairs(levers:GetChildren()) do
+                total = total + 1
+                if leverPulled(lever) then pulled = pulled + 1 end
+            end
+        end
+        bits[#bits + 1] = "Levers " .. pulled .. "/" .. total
+        local door = triggers and triggers:FindFirstChild("ExitDoor")
+        local sheet = door and door:FindFirstChild("MetalSheetDoor")
+        bits[#bits + 1] = "Exit " .. (sheet and sheet.Transparency >= 1 and "OPEN" or "CLOSED")
+        bits[#bits + 1] = "Dead " .. attrNum("DeadPlayers", 0)
+    elseif GAME.key == "PUPPET" then
+        bits[#bits + 1] = "Generators " .. attrNum("generatorsDone", 0) .. "/" .. attrNum("generators", 0)
+        bits[#bits + 1] = "Exit " .. (attrBool("ExitOpened") and "OPEN" or "CLOSED")
+        bits[#bits + 1] = "Dead " .. attrNum("DeadPlayers", 0)
+    elseif GAME.key == "LOBBY" then
+        bits[#bits + 1] = "Selected " .. tostring(attr("gameSelected") or "NONE")
+        bits[#bits + 1] = "Night " .. tostring(attr("nightSelected") or "?")
+        bits[#bits + 1] = "Players " .. #Players:GetPlayers()
+    end
+
+    local aiBits = {}
+    for _, entry in ipairs(animCache.list) do
+        if entry.ai ~= nil then
+            aiBits[#aiBits + 1] = entry.name .. " " .. tostring(entry.ai)
+        end
+    end
+    if #aiBits > 0 then bits[#bits + 1] = table.concat(aiBits, "  ") end
+
+    return #bits > 0 and table.concat(bits, "  |  ") or "No game status."
+end
+
+local function updateOverlay()
+    if not State.overlay then
+        for _, drawing in ipairs(overlayObjects) do drawing.Visible = false end
+        return
+    end
+    if not ensureOverlay() then return end
+
+    local bg, line1, line2 = overlayObjects[1], overlayObjects[2], overlayObjects[3]
+    local night = tostring(attr("Night") or "?")
+    local guard = inGuardMode() and "GUARD" or "FREE"
+    local cam = cameraOpen() and "CAMS" or "NO CAMS"
+
+    line1.Text = string.format(
+        "%s  |  Night %s  %s  |  %s  |  %s  %s%s",
+        GAME.short, night, hourLabel(), powerSummary(), guard, cam,
+        State.infPower and "  INF" or ""
+    )
+    line2.Text = gameStatusText()
+
+    local color = Color3.fromRGB(90, 255, 160)
+    if attrBool("allPlayersDead") or attrBool("AllPlayersDead") or attrBool("nightFinished") then
+        color = Color3.fromRGB(255, 90, 90)
+    elseif State.infPower == false and attrNum("powerPercentage", 100) <= 20 then
+        color = Color3.fromRGB(255, 200, 80)
+    end
+
+    local camObj = Workspace.CurrentCamera
+    local viewport = camObj and camObj.ViewportSize or Vector2.new(1280, 720)
+    bg.Size = Vector2.new(math.min(1100, viewport.X - 24), 48)
+    bg.Visible = true
+    line1.Visible = true
+    line2.Visible = true
+    line1.Color = color
+    line2.Color = color
+end
+
+--// ------------------------------------------------------------- fullbright ---
+local LIGHT_PROPS = {
+    "Brightness", "ClockTime", "Ambient", "OutdoorAmbient", "GlobalShadows",
+    "FogEnd", "FogStart", "ExposureCompensation",
+}
+
+local lightOriginal = {}
+for _, prop in ipairs(LIGHT_PROPS) do
+    local ok, value = pcall(function() return Lighting[prop] end)
+    if ok then lightOriginal[prop] = value end
+end
+
+local function applyFullbright()
+    pcall(function()
+        Lighting.Brightness = 3
+        Lighting.ClockTime = 14
+        Lighting.Ambient = Color3.fromRGB(150, 150, 150)
+        Lighting.OutdoorAmbient = Color3.fromRGB(150, 150, 150)
+        Lighting.GlobalShadows = false
+        Lighting.FogEnd = 100000
+        Lighting.FogStart = 0
+        Lighting.ExposureCompensation = 0.4
+    end)
+end
+
+local function restoreLighting()
+    for prop, value in pairs(lightOriginal) do
+        pcall(function() Lighting[prop] = value end)
+    end
+end
+
+--// ----------------------------------------------------------------- loops ---
+local function powerLoop()
+    while running do
+        task.wait(0.15)
+        pinPower()
+    end
+end
+
+local function pacifyLoop()
+    while running do
+        task.wait(1)
+        if not running or not State.pacifyAI or not gameActive() then continue end
+
+        local names = getAINames()
+        if not State.savedAI then pacifyAnimatronics() end
+        for _, name in ipairs(names) do
+            if tonumber(RS:GetAttribute(name .. "AI")) ~= 0 then
+                setAI(name, 0)
+            end
+        end
+        if GAME.animatronicFlags then
+            for _, name in ipairs(FNAF6_NAMES) do
+                local flag = "animatronic" .. name .. "Enabled"
+                if attrBool(flag) then setAttr(flag, false) end
+            end
+        end
+    end
+end
+
+local function musicBoxLoop()
+    while running do
+        task.wait(6)
+        if not State.autoMusicBox or not gameActive() then
+            if State.musicBoxWinding then stopMusicBox() end
+            continue
+        end
+        if not cameraOpen() then musicBoxPulse(1.5) end
+    end
+end
+
+local function maskLoop()
+    local last = 0
+    while running do
+        task.wait(0.5)
+        if not running or not State.autoMask or not gameActive() then continue end
+        if os.clock() - last < 1 then continue end
+
+        local threat = attrBool("animatronicInOffice")
+            or attrBool("animatronicNear")
+            or attrBool("puppetOut")
+        if threat and not maskState() then
+            setMaskRemote(true)
+            last = os.clock()
+        elseif not threat and maskState() then
+            setMaskRemote(false)
+            last = os.clock()
+        end
+    end
+end
+
+local function ventLoop()
+    while running do
+        task.wait(0.5)
+        if State.autoVent and gameActive() then suppressVentilation() end
+    end
+end
+
+local function breakerLoop()
+    while running do
+        task.wait(1)
+        if not State.fixBreakers or not gameActive() then continue end
+        for _, name in ipairs(breakerAttrs()) do
+            if attrNum(name, 0) ~= 0 then setAttr(name, 0) end
+            setAttr(name:gsub("Percentage$", "BeingFixed"), false)
+        end
+    end
+end
+
+local function animatronicFlagLoop()
+    while running do
+        task.wait(1)
+        if not State.disableAnimatronics or not GAME.animatronicFlags or not gameActive() then
+            continue
+        end
+        for _, name in ipairs(FNAF6_NAMES) do
+            local flag = "animatronic" .. name .. "Enabled"
+            if attrBool(flag) then setAttr(flag, false) end
+        end
+    end
+end
+
+local function defenseLoop()
+    local last = 0
+    local lastNear = false
+    while running do
+        task.wait(0.4)
+        if not State.autoDoor or not GAME.bedroom or not gameActive() then continue end
+        if os.clock() - last < 0.8 then continue end
+
+        local near = attrBool("animatronicNear") or attrBool("animatronicInOffice")
+        local side = nil
+        if LocalPlayer:GetAttribute("nearLeftDoor") == true then
+            side = "Left"
+        elseif LocalPlayer:GetAttribute("nearRightDoor") == true then
+            side = "Right"
+        end
+
+        if near and side then
+            faceBedroomSide(side)
+            useBedroomDoor(true)
+            lastNear = true
+        elseif not near and lastNear then
+            useBedroomDoor(false)
+            lastNear = false
+        end
+        last = os.clock()
+    end
+end
+
+local function objectiveLoop()
+    while running do
+        task.wait(2)
+        if not State.autoObjectives or not gameActive() then continue end
+        local entry = nearestObjective()
+        if entry then
+            teleportTo(entry.part.Position + Vector3.new(0, 2, 0))
+            task.wait(0.45)
+            local prompt = getPromptFor(entry.object)
+            if prompt then firePrompt(prompt) end
+            task.wait(0.8)
+        end
+    end
+end
+
+local function mouseLoop()
+    while running do
+        if State.unlockMouse then
+            pcall(function()
+                UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+                UserInputService.MouseIconEnabled = true
+            end)
+            RunService.RenderStepped:Wait()
+        else
+            task.wait(0.2)
+        end
+    end
+end
+
+local function statusLoop()
+    while running do
+        task.wait(0.5)
+        refreshAnims(true)
+
+        if not gameActive() then
+            State.powerCeilings = {}
+            State.serverPower = {}
+        end
+
+        local power = attrNum("powerPercentage", 100)
+        if not State.infPower and power <= 20 and power > 0 and not warned.power then
+            warned.power = true
+            notify("Power", string.format("Power is at %d%%.", math.floor(power)), 5)
+        elseif power > 25 then
+            warned.power = false
+        end
+    end
+end
+
+--// ------------------------------------------------------------ connections ---
+Connections[#Connections + 1] = LocalPlayer.CharacterAdded:Connect(function()
+    table.clear(noclipOriginal)
+    originalWalkSpeed = nil
+    originalJumpPower, originalUseJumpPower = nil, nil
+    task.spawn(function()
+        task.wait(1.0)
+        if not running then return end
+        if State.speed.enabled then applySpeed() end
+        if State.jump.enabled then applyJump() end
+        if State.noclip then noclipCharacter() end
+        if State.fly.enabled then setFly(true) end
+    end)
+end)
+
+Connections[#Connections + 1] = UserInputService.JumpRequest:Connect(function()
+    if running and State.infiniteJump and alive() then
+        local hum = getHum()
+        if hum then hum:ChangeState(Enum.HumanoidStateType.Jumping) end
+    end
+end)
+
+Connections[#Connections + 1] = RunService.RenderStepped:Connect(function()
+    if not running then return end
+    updateEsp()
+    updateOverlay()
+    flyTick()
+end)
+
+Connections[#Connections + 1] = RunService.Heartbeat:Connect(function()
+    if not running then return end
+
+    if State.fullbright ~= lastFullbrightState then
+        lastFullbrightState = State.fullbright
+        if State.fullbright then applyFullbright() else restoreLighting() end
+    elseif State.fullbright and os.clock() - lastFullbright > 1 then
+        lastFullbright = os.clock()
+        applyFullbright()
+    end
+
+    if State.speed.enabled then applySpeed() end
+    if State.jump.enabled then applyJump() end
+    if State.noclip then noclipCharacter() end
+end)
+
+for _, name in ipairs({
+    "powerPercentage", "batteryLife", "oxygenPercentage",
+    "powerBlackout", "flashlightBatteryOut",
+}) do
+    Connections[#Connections + 1] = RS:GetAttributeChangedSignal(name):Connect(pinPower)
+end
+
+--// ---------------------------------------------------------------- cleanup ---
+local function cleanup()
+    running = false
+    State.running = false
+
+    for _, conn in ipairs(Connections) do
+        pcall(function() conn:Disconnect() end)
+    end
+    table.clear(Connections)
+
+    State.noclip = false
+    noclipCharacter()
+    State.speed.enabled = false
+    applySpeed()
+    State.jump.enabled = false
+    applyJump()
+    State.fly.enabled = false
+    if flyVelocity then
+        pcall(function() flyVelocity:Destroy() end)
+        flyVelocity = nil
+    end
+    State.fullbright = false
+    restoreLighting()
+    if State.musicBoxWinding then setMusicBox(false) end
+
+    clearEsp()
+    clearOverlay()
+    pcall(function() if Window then Window:Destroy() end end)
+    pcall(function() if uiFolder then uiFolder:Destroy() end end)
+    pcall(function()
+        local genv = getgenv()
+        if genv then genv.__FNAFAll = nil end
+    end)
+end
+
+--// ---------------------------------------------------------------- WindUI ---
+local function loadWindUI()
+    local ok, result = pcall(function()
+        return loadstring(game:HttpGet("https://github.com/Footagesus/WindUI/releases/latest/download/main.lua"))()
+    end)
+    if ok and result then return result end
+    log("WindUI load failed:", result)
+    return nil
+end
+
+local uiParent = game:GetService("CoreGui")
+pcall(function()
+    if gethui then uiParent = gethui() or uiParent end
+end)
+
+for _, child in ipairs(uiParent:GetChildren()) do
+    local name = tostring(child.Name)
+    if name == "FNAFAllUI" then
+        pcall(function() child:Destroy() end)
+    end
+end
+
+uiFolder = Instance.new("Folder")
+uiFolder.Name = "FNAFAllUI"
+uiFolder.Parent = uiParent
+
+windUI = loadWindUI()
+if not windUI then
+    error("[FNAFMulti] WindUI failed to load. Check HTTP requests / executor.")
+end
+pcall(function() windUI:SetParent(uiFolder) end)
+log("WindUI loaded for", GAME.key)
+
+Window = windUI:CreateWindow({
+    Title = "FNAF Co-op Toolkit - " .. GAME.short,
+    Author = "night shift  ·  " .. LocalPlayer.Name,
+    Icon = "moon",
+    Folder = "FNAFAll",
+    Size = UDim2.fromOffset(680, 520),
+    Theme = CFG.Theme,
+    ToggleKey = CFG.ToggleKey,
+    Resizable = true,
+    HideSearchBar = true,
+    User = { Enabled = false },
+})
+
+local function addButton(tab, title, desc, icon, callback)
+    tab:Button({
+        Title = title,
+        Desc = desc,
+        Icon = icon,
+        Callback = callback,
+    })
+end
+
+local function addToggle(tab, title, desc, icon, value, callback)
+    tab:Toggle({
+        Title = title,
+        Desc = desc,
+        Icon = icon,
+        Value = value,
+        Callback = callback,
+    })
+end
+
+--// ------------------------------------------------------------------- Home ---
+local home = Window:Tab({ Title = "Home", Icon = "house" })
+
+local profileValues = { autoProfileLabel }
+local profileKeyByLabel = {}
+for _, entry in ipairs(PROFILE_ORDER) do
+    profileValues[#profileValues + 1] = entry.label
+    profileKeyByLabel[entry.label] = entry.key
+end
+
+home:Dropdown({
+    Title = "Game Version",
+    Values = profileValues,
+    Value = selectedProfileLabel(),
+    Callback = function(value)
+        local key = profileKeyByLabel[value]
+        local current = readProfileOverride()
+        if (key or nil) == (current or nil) then
+            return
+        end
+        setProfileOverride(key)
+        notify("Game Profile", "Selected " .. value .. ".", 3)
+        if not requestProfileReload() then
+            notify("Game Profile", "Re-inject the script to apply the new version.", 6)
+        end
+    end,
+})
+
+addButton(home, "Refresh Status", "Game, night, power, guard mode, camera and AI", "refresh-cw", function()
+    refreshAnims(true)
+    local aiBits = {}
+    for _, entry in ipairs(animCache.list) do
+        local piece = entry.name
+        if entry.room and entry.room ~= "" then piece = piece .. " [" .. entry.room .. "]" end
+        if entry.ai ~= nil then piece = piece .. " AI" .. tostring(entry.ai) end
+        if entry.enabled then piece = piece .. " ACTIVE" end
+        aiBits[#aiBits + 1] = piece
+    end
+    notify("FNAF Status", string.format(
+        "%s  ·  %s  ·  place %d\nNight %s  ·  %s\n%s\nGuard %s  ·  Cams %s  ·  Pos %s\n%s",
+        GAME.name,
+        selectedProfileLabel() .. (readProfileOverride() and " (manual)" or " (auto)"),
+        game.PlaceId,
+        tostring(attr("Night") or "?"),
+        hourLabel(),
+        powerSummary(),
+        inGuardMode() and "yes" or "no",
+        cameraOpen() and "open" or "closed",
+        posString(myPosition()),
+        #aiBits > 0 and table.concat(aiBits, "  ·  ") or "No animatronics found."
+    ), 9)
+end)
+
+addToggle(home, "Status Overlay", "Power, game state and AI at the top-left", "activity", State.overlay, function(value)
+    State.overlay = value
+end)
+
+addToggle(home, "Fullbright", "Brighten the map (client-side; restores when off)", "sun", State.fullbright, function(value)
+    State.fullbright = value
+    if value then applyFullbright() else restoreLighting() end
+end)
+
+if GAME.office then
+    addButton(home, "Enter Office / Start Shift", "Teleport to the office chair and use the prompt", "door-open", function()
+        task.spawn(enterOffice)
+    end)
+end
+
+addButton(home, "Leave to Spawn", "Exit guard mode and return to the spawn point", "log-out", function()
+    task.spawn(leaveToLobby)
+end)
+
+addButton(home, "Rejoin Server", "Teleport back to this same server", "rotate-cw", function()
+    local ok, err = pcall(function()
+        TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer)
+    end)
+    notify("Rejoin", ok and "Teleporting…" or tostring(err), 3)
+end)
+
+--// ------------------------------------------------------------------ Lobby ---
+if GAME.kind == "lobby" then
+    local lobbyTab = Window:Tab({ Title = "Lobby", Icon = "gamepad-2" })
+    local LOBBY_GAMES = {
+        { label = "FNAF 1", key = "FNAF 1" },
+        { label = "FNAF 2", key = "FNAF 2" },
+        { label = "FNAF 3", key = "FNAF 3" },
+        { label = "FNAF 4", key = "FNAF 4" },
+        { label = "Sister Location", key = "Sister Location" },
+        { label = "FNAF 6", key = "FNAF 6" },
+        { label = "Basement Hunt", key = "Basement Hunt" },
+        { label = "Puppet's Revenge", key = "Puppet's Revenge" },
+    }
+    local labels = {}
+    local keyByLabel = {}
+    for _, entry in ipairs(LOBBY_GAMES) do
+        labels[#labels + 1] = entry.label
+        keyByLabel[entry.label] = entry.key
+    end
+
+    lobbyTab:Dropdown({
+        Title = "Game",
+        Values = labels,
+        Value = State.selectedLobbyGame,
+        Callback = function(value) State.selectedLobbyGame = value end,
+    })
+
+    lobbyTab:Dropdown({
+        Title = "Night",
+        Values = { "1", "2", "3", "4", "5", "6" },
+        Value = tostring(State.selectedLobbyNight),
+        Callback = function(value) State.selectedLobbyNight = tonumber(value) or 1 end,
+    })
+
+    addButton(lobbyTab, "Select Game & Night", "Sends gameSelectionChangedEvent to the server", "check", function()
+        local key = keyByLabel[State.selectedLobbyGame] or State.selectedLobbyGame
+        fireRemote("gameSelectionChangedEvent", key, tonumber(State.selectedLobbyNight) or 1)
+        task.wait(0.5)
+        notify("Lobby", string.format("Selected %s  ·  Night %d", key, State.selectedLobbyNight), 4)
+    end)
+
+    addButton(lobbyTab, "Ready Up", "Fires playerReadyUpEvent", "check-circle", function()
+        fireRemote("playerReadyUpEvent")
+        notify("Lobby", "Ready-up sent.", 2)
+    end)
+
+    addButton(lobbyTab, "Play Solo", "Fires playerTeleportSoloEvent", "play", function()
+        fireRemote("playerTeleportSoloEvent")
+        notify("Lobby", "Solo teleport requested.", 2)
+    end)
+
+    addButton(lobbyTab, "Leave Lobby", "Fires playerLeaveLobbyEvent", "log-out", function()
+        local ok = fireRemote("playerLeaveLobbyEvent")
+        if not ok then ok = fireRemote("playerLeaveGameEvent") end
+        notify("Lobby", ok and "Leave-lobby requested." or "Leave remote missing.", 2)
+    end)
+
+    addButton(lobbyTab, "Lobby Status", "Owner, selected game and player count", "info", function()
+        notify("Lobby", string.format(
+            "Owner %s  ·  Game %s  ·  Night %s  ·  Players %d",
+            tostring(attr("playerOwnerId")),
+            tostring(attr("gameSelected")),
+            tostring(attr("nightSelected")),
+            #Players:GetPlayers()
+        ), 6)
+    end)
+end
+
+--// --------------------------------------------------------------- Movement ---
+local movement = Window:Tab({ Title = "Movement", Icon = "move" })
+
+addToggle(movement, "Speed", "Override WalkSpeed (client-side)", "gauge", false, function(value)
+    State.speed.enabled = value
+    applySpeed()
+end)
+movement:Slider({
+    Title = "WalkSpeed",
+    Value = { Min = 16, Max = 120, Default = 32 },
+    Step = 1,
+    Callback = function(value)
+        State.speed.value = value
+        if State.speed.enabled then applySpeed() end
+    end,
+})
+
+addToggle(movement, "Jump Power", "Set a higher jump power", "arrow-up", false, function(value)
+    State.jump.enabled = value
+    applyJump()
+end)
+movement:Slider({
+    Title = "JumpPower",
+    Value = { Min = 50, Max = 200, Default = 60 },
+    Step = 5,
+    Callback = function(value)
+        State.jump.value = value
+        if State.jump.enabled then applyJump() end
+    end,
+})
+
+addToggle(movement, "Noclip", "Walk through walls", "shield-off", false, function(value)
+    State.noclip = value
+    noclipCharacter()
+end)
+
+addToggle(movement, "Fly", "WASD to move, Space / LeftCtrl for up and down", "plane", false, function(value)
+    setFly(value)
+end)
+movement:Slider({
+    Title = "Fly Speed",
+    Value = { Min = 10, Max = 150, Default = 45 },
+    Step = 5,
+    Callback = function(value) State.fly.speed = value end,
+})
+
+addToggle(movement, "Infinite Jump", "Jump again in mid-air", "arrow-up", false, function(value)
+    State.infiniteJump = value
+end)
+
+addButton(movement, "Stand Up / Exit Guard Mode", "Leave the chair and return camera control", "door-closed", function()
+    fireRemote("triggerNightGuardModeEvent", false)
+    local hum = getHum()
+    if hum and hum.Sit then hum.Sit = false; hum.Jump = true end
+    notify("Night Guard", "Stood up and left guard mode.", 3)
+end)
+
+addButton(movement, "Reset Character", "Standard Roblox reset", "skull", function()
+    local hum = getHum()
+    if hum then hum.Health = 0 end
+end)
+
+--// -------------------------------------------------------------- Teleports ---
+buildWaypoints()
+local teleports = Window:Tab({ Title = "Teleports", Icon = "map-pin" })
+
+teleports:Dropdown({
+    Title = "Waypoint",
+    Values = State.waypointOrder,
+    Value = State.selectedWaypoint,
+    Callback = function(value) State.selectedWaypoint = value end,
+})
+
+addButton(teleports, "Teleport to Waypoint", "Leaves guard mode first so the camera follows", "navigation", function()
+    task.spawn(function() tpWaypoint(State.selectedWaypoint) end)
+end)
+
+addButton(teleports, "Spawn", "Return to the spawn point", "home", function()
+    task.spawn(leaveToLobby)
+end)
+
+if GAME.office then
+    addButton(teleports, "Office Chair (Sit)", "Teleport to the chair and use the prompt", "armchair", function()
+        task.spawn(enterOffice)
+    end)
+end
+
+local animNames = {}
+for _, entry in ipairs(refreshAnims(true)) do
+    if entry.root then animNames[#animNames + 1] = entry.name end
+end
+if #animNames == 0 then animNames = { "None" } end
+State.selectedAnim = animNames[1]
+
+teleports:Dropdown({
+    Title = "Animatronic",
+    Values = animNames,
+    Value = State.selectedAnim,
+    Callback = function(value) State.selectedAnim = value end,
+})
+
+addButton(teleports, "Teleport near Animatronic", "8 studs behind them - may trigger a jumpscare", "skull", function()
+    task.spawn(function() tpAnimatronic(State.selectedAnim) end)
+end)
+
+if GAME.objectives then
+    addButton(teleports, "Nearest Objective", "Generators, levers, exit doors and alarms", "target", function()
+        task.spawn(function() tpObjective(nearestObjective()) end)
+    end)
+
+    addButton(teleports, "Interact with Nearest Prompt", "Fires the closest ProximityPrompt", "hand", function()
+        task.spawn(function()
+            local best, bestDist = nil, math.huge
+            local pos = myPosition()
+            for _, obj in ipairs(Workspace:GetDescendants()) do
+                if obj:IsA("ProximityPrompt") and obj.Enabled then
+                    local part = obj.Parent
+                    if part and part:IsA("BasePart") then
+                        local dist = (part.Position - pos).Magnitude
+                        if dist < bestDist then best, bestDist = obj, dist end
+                    end
+                end
+            end
+            if best then
+                firePrompt(best)
+                notify("Interact", string.format("Prompt fired  ·  %.0fm", bestDist), 3)
+            else
+                notify("Interact", "No enabled ProximityPrompt nearby.", 3)
+            end
+        end)
+    end)
+end
+
+if GAME.camera then
+    local cameraCodes = getCameraCodes()
+    State.selectedCamera = cameraCodes[1] or "CAM01"
+    teleports:Dropdown({
+        Title = "Camera",
+        Values = cameraCodes,
+        Value = State.selectedCamera,
+        Callback = function(value) State.selectedCamera = value end,
+    })
+
+    addButton(teleports, "Switch Camera", "Fires playerSwitchCamsEvent", "video", function()
+        task.spawn(function()
+            local ok = switchCamera(State.selectedCamera)
+            notify("Cameras", ok and ("Switched to " .. State.selectedCamera) or "Camera switch failed.", 3)
+        end)
+    end)
+
+    addButton(teleports, "Open Cameras", "Fires openCamerasEvent", "video", function()
+        task.spawn(function()
+            local ok = openCameras()
+            notify("Cameras", ok and "Camera tablet opened." or "Could not open the tablet.", 3)
+        end)
+    end)
+
+    addButton(teleports, "Close Cameras", "Clears the camera state", "video-off", function()
+        task.spawn(function()
+            local ok = closeCameras()
+            notify("Cameras", ok and "Camera tablet closed." or "Could not close the tablet.", 3)
+        end)
+    end)
+end
+
+--// ------------------------------------------------------------------- ESP ---
+local espTab = Window:Tab({ Title = "ESP", Icon = "eye" })
+local function espToggle(title, desc, key)
+    espTab:Toggle({
+        Title = title,
+        Desc = desc,
+        Value = State.esp[key],
+        Callback = function(value) State.esp[key] = value end,
+    })
+end
+
+espToggle("Animatronics", "Boxes, names, rooms, AI levels and active flags", "animatronics")
+espToggle("Players", "Other players and their roles", "players")
+espToggle("Camera Markers", "Label every camera trigger in the map", "cameras")
+espToggle("Objectives", "Generators, levers, exits and alarms", "objectives")
+espToggle("Names + Distance", "Text above each target", "names")
+espToggle("Boxes", "2D bounding boxes", "boxes")
+espToggle("Tracers", "Line from the bottom of the screen", "tracers")
+
+espTab:Slider({
+    Title = "Max Distance",
+    Value = { Min = 50, Max = 2000, Default = 800 },
+    Step = 25,
+    Callback = function(value) State.esp.maxDist = value end,
+})
+
+--// --------------------------------------------------------- Game Controls ---
+local controls = Window:Tab({ Title = "Game Controls", Icon = "settings-2" })
+
+if #getPowerAttrs() > 0 then
+    addToggle(controls, "Infinite Usage", "Pins the power / battery / oxygen meter and clears failure flags", "battery-charging", State.infPower, function(value)
+        State.infPower = value
+        if value then
+            State.powerCeilings = {}
+            task.spawn(function() task.wait(0.2); pinPower() end)
+        end
+        notify("Power", value
+            and "Infinite Usage enabled - the client meter is pinned."
+            or "Infinite Usage disabled - the real meter is back.", 4)
+    end)
+end
+
+addToggle(controls, "Pacify Animatronics", "Host only: sets every AI to 0 and clears FNAF 6 active flags", "ghost", State.pacifyAI, function(value)
+    State.pacifyAI = value
+    if value then
+        local owner = tonumber(attr("playerOwnerId"))
+        if owner and owner ~= LocalPlayer.UserId then
+            notify("Pacify", "Only the server host can change animatronic AI.", 4)
+        end
+        pacifyAnimatronics()
+        notify("Pacify", "Animatronic AI set to 0 for this night.", 3)
+    else
+        restoreAnimatronics()
+        notify("Pacify", "Animatronic AI restored to the saved levels.", 3)
+    end
+end)
+
+if GAME.mask then
+    addToggle(controls, "Auto-Mask", "Puts the mask on when an animatronic is in the office", "shield", State.autoMask, function(value)
+        State.autoMask = value
+        notify("FNAF 2", value and "Auto-Mask enabled." or "Auto-Mask disabled.", 3)
+    end)
+    addButton(controls, "Toggle Mask", "Uses the game's own Space-key mask toggle", "smile", function()
+        task.spawn(function()
+            local state = toggleMask()
+            notify("FNAF 2", state and "Mask ON." or "Mask OFF.", 3)
+        end)
+    end)
+end
+
+if GAME.musicBox then
+    addToggle(controls, "Auto-Wind Music Box", "Fires playerWindBoxEvent while the night is running", "music", State.autoMusicBox, function(value)
+        State.autoMusicBox = value
+        if not value then setMusicBox(false) end
+        notify("FNAF 2", value and "Auto-Wind enabled." or "Auto-Wind disabled.", 3)
+    end)
+    addButton(controls, "Wind Music Box Now", "Starts the winding state", "music", function()
+        task.spawn(function()
+            local ok = setMusicBox(true)
+            notify("FNAF 2", ok and "Music box winding started." or "playerWindBoxEvent missing.", 3)
+        end)
+    end)
+    addButton(controls, "Stop Winding", "Stops the winding state", "music-off", function()
+        task.spawn(function()
+            setMusicBox(false)
+            notify("FNAF 2", "Music box winding stopped.", 2)
+        end)
+    end)
+end
+
+if GAME.lights then
+    addButton(controls, "Hallway Light", "Toggles hallwayLightEvent", "lightbulb", function()
+        task.spawn(function()
+            local _, state = toggleOfficeControl("hallwayLightEvent", "hallwayLightOn")
+            notify("Lights", "Hallway light " .. (state and "ON" or "OFF") .. ".", 2)
+        end)
+    end)
+    addButton(controls, "Left Light", "Toggles leftLightEvent", "lightbulb", function()
+        task.spawn(function()
+            local _, state = toggleOfficeControl("leftLightEvent", "leftLightOn")
+            notify("Lights", "Left light " .. (state and "ON" or "OFF") .. ".", 2)
+        end)
+    end)
+    addButton(controls, "Right Light", "Toggles rightLightEvent", "lightbulb", function()
+        task.spawn(function()
+            local _, state = toggleOfficeControl("rightLightEvent", "rightLightOn")
+            notify("Lights", "Right light " .. (state and "ON" or "OFF") .. ".", 2)
+        end)
+    end)
+end
+
+if GAME.vents then
+    addButton(controls, "Clear Vent Flags", "Clears leftVentClogged / rightVentClogged locally", "wind", function()
+        setAttr("leftVentClogged", false)
+        setAttr("rightVentClogged", false)
+        notify("FNAF 2", "Vent flags cleared locally.", 3)
+    end)
+end
+
+if GAME.springtrap then
+    addToggle(controls, "Auto-Clear Ventilation", "Clears ventilation / camera / audio error flags locally", "wind", State.autoVent, function(value)
+        State.autoVent = value
+        if value then suppressVentilation() end
+        notify("FNAF 3", value and "Ventilation suppression enabled." or "Ventilation suppression disabled.", 3)
+    end)
+    addButton(controls, "Clear Ventilation Now", "Clears every error flag once", "wind", function()
+        suppressVentilation()
+        notify("FNAF 3", "Ventilation and camera errors cleared locally.", 3)
+    end)
+    addButton(controls, "Play Audio Lure", "Sends Springtrap to the selected camera (needs a full lure)", "volume-2", function()
+        task.spawn(function()
+            local ok, detail = playAudioLure()
+            notify("FNAF 3", ok and ("Audio lure playing at " .. tostring(detail) .. ".")
+                or tostring(detail), 4)
+        end)
+    end)
+    State.selectedVent = State.selectedVent or "CAM11"
+    controls:Dropdown({
+        Title = "Vent Camera",
+        Values = VENT_CAMS,
+        Value = State.selectedVent,
+        Callback = function(value) State.selectedVent = value end,
+    })
+    addButton(controls, "Seal Selected Vent", "Seals the chosen vent camera (CAM11-CAM15)", "shield", function()
+        task.spawn(function()
+            local ok, detail = sealVent(State.selectedVent)
+            notify("FNAF 3", ok and ("Sealing " .. tostring(detail) .. "…")
+                or tostring(detail), 4)
+        end)
+    end)
+    addButton(controls, "Springtrap Status", "AI, room and stare flags", "info", function()
+        local entry = findAnimEntry("Springtrap")
+        notify("FNAF 3", string.format(
+            "AI %s  ·  room %s  ·  staring %s  ·  canDistract %s",
+            entry and tostring(entry.ai) or "?",
+            entry and (entry.room ~= "" and entry.room or "?") or "?",
+            tostring(attrBool("springtrapStaringPlayerDown")),
+            tostring(attr("canDistract"))
+        ), 6)
+    end)
+end
+
+if GAME.bedroom then
+    addToggle(controls, "Auto-Use Door", "Closes the door you are standing at while a threat is near", "shield", State.autoDoor, function(value)
+        State.autoDoor = value
+        notify("FNAF 4", value and "Auto-Use Door enabled." or "Auto-Use Door disabled.", 3)
+    end)
+    State.selectedSide = State.selectedSide or "Left"
+    controls:Dropdown({
+        Title = "Bedroom Side",
+        Values = { "Left", "Right" },
+        Value = State.selectedSide,
+        Callback = function(value) State.selectedSide = value end,
+    })
+    addButton(controls, "Close Selected Door", "Moves to the door, faces the hallway and closes it", "door-closed", function()
+        task.spawn(function()
+            local ok, err = useBedroomDoorSide(State.selectedSide, true)
+            notify("FNAF 4", ok and (State.selectedSide .. " door closed.") or tostring(err), 3)
+        end)
+    end)
+    addButton(controls, "Open Selected Door", "Moves to the door and opens it", "door-open", function()
+        task.spawn(function()
+            local ok, err = useBedroomDoorSide(State.selectedSide, false)
+            notify("FNAF 4", ok and (State.selectedSide .. " door opened.") or tostring(err), 3)
+        end)
+    end)
+    addButton(controls, "Flash Selected Light", "Moves to the door and holds the light for 1.2s", "lightbulb", function()
+        task.spawn(function()
+            local ok, err = flashBedroomLight(State.selectedSide)
+            notify("FNAF 4", ok and (State.selectedSide .. " light flashed.") or tostring(err), 3)
+        end)
+    end)
+    addButton(controls, "Hold Door", "Fires updatePlayerDoorStateEvent(true) in place", "door-closed", function()
+        useBedroomDoor(true)
+        notify("FNAF 4", "Door held.", 2)
+    end)
+    addButton(controls, "Release Door", "Fires updatePlayerDoorStateEvent(false)", "door-open", function()
+        useBedroomDoor(false)
+        notify("FNAF 4", "Door released.", 2)
+    end)
+end
+
+if GAME.doors and not GAME.bedroom then
+    addButton(controls, "Left Door (Toggle)", "Toggles leftDoorEvent", "door-closed", function()
+        task.spawn(function()
+            local _, state = toggleOfficeControl("leftDoorEvent", "leftDoorClosed")
+            notify("Doors", "Left door " .. (state and "CLOSED" or "OPEN") .. ".", 2)
+        end)
+    end)
+    addButton(controls, "Right Door (Toggle)", "Toggles rightDoorEvent", "door-closed", function()
+        task.spawn(function()
+            local _, state = toggleOfficeControl("rightDoorEvent", "rightDoorClosed")
+            notify("Doors", "Right door " .. (state and "CLOSED" or "OPEN") .. ".", 2)
+        end)
+    end)
+end
+
+if GAME.ventDoor then
+    addButton(controls, "Vent Door (Toggle)", "Toggles ventDoorEvent", "wind", function()
+        task.spawn(function()
+            local _, state = toggleOfficeControl("ventDoorEvent", "ventDoorClosed")
+            notify("Doors", "Vent door " .. (state and "CLOSED" or "OPEN") .. ".", 2)
+        end)
+    end)
+end
+
+if GAME.breakers then
+    addToggle(controls, "Fix Breakers (local)", "Sets every BreakerRoomPercentage to 0 and clears BeingFixed", "wrench", State.fixBreakers, function(value)
+        State.fixBreakers = value
+        setBreakers(value)
+        notify("Sister Location", value and "Breaker fixing enabled." or "Breaker values restored.", 3)
+    end)
+    addButton(controls, "Fix Breakers Now", "One pass over every breaker room", "wrench", function()
+        setBreakers(true)
+        notify("Sister Location", "Breaker percentages set to 0.", 3)
+    end)
+    addButton(controls, "Flash Beacon", "Fires playerFlashBeaconRequest", "flashlight", function()
+        local ok = fireRemote("playerFlashBeaconRequest")
+        if not ok then ok = fireRemote("playerFlashBeaconFlash") end
+        notify("Sister Location", ok and "Flash beacon requested." or "Flash beacon remote missing.", 3)
+    end)
+end
+
+if GAME.animatronicFlags then
+    addToggle(controls, "Disable Animatronics (local)", "Clears the FNAF 6 active flags and sends playerChangeAI 0", "ghost", State.disableAnimatronics, function(value)
+        State.disableAnimatronics = value
+        setAnimatronicFlags(not value)
+        notify("FNAF 6", value and "Animatronic flags disabled locally." or "Animatronic flags restored.", 3)
+    end)
+    addButton(controls, "Disable Now", "Clears Lefty, Molten Freddy, Scrap Baby and ScrapTrap", "ghost", function()
+        setAnimatronicFlags(false)
+        notify("FNAF 6", "Active flags cleared locally.", 3)
+    end)
+    addButton(controls, "Restore Animatronics", "Puts the saved active flags back", "rotate-ccw", function()
+        setAnimatronicFlags(true)
+        notify("FNAF 6", "Saved active flags restored.", 3)
+    end)
+end
+
+if GAME.objectives then
+    addToggle(controls, "Auto Objectives", "Teleports to the nearest generator / lever and fires its prompt", "target", State.autoObjectives, function(value)
+        State.autoObjectives = value
+        notify("Objectives", value and "Auto Objectives enabled." or "Auto Objectives disabled.", 3)
+    end)
+    addButton(controls, "Go to Nearest Objective", "Teleport to the closest generator / lever / exit", "navigation", function()
+        task.spawn(function() tpObjective(nearestObjective()) end)
+    end)
+    addButton(controls, "Interact with Nearest Objective", "Teleports there and fires its ProximityPrompt", "hand", function()
+        task.spawn(function()
+            local entry = nearestObjective()
+            if not entry then
+                notify("Objectives", "Nothing left to interact with.", 3)
+                return
+            end
+            teleportTo(entry.part.Position + Vector3.new(0, 2, 0))
+            task.wait(0.6)
+            local prompt = getPromptFor(entry.object)
+            if prompt and firePrompt(prompt) then
+                notify("Objectives", "Used " .. entry.name .. ".", 3)
+            else
+                notify("Objectives", "No prompt found on " .. entry.name .. ".", 3)
+            end
+        end)
+    end)
+    if Workspace:FindFirstChild("GameTriggers")
+        and Workspace.GameTriggers:FindFirstChild("Levers") then
+        addButton(controls, "Pull All Levers", "Visits every lever and pulls it (Basement Hunt)", "toggle-right", function()
+            task.spawn(function()
+                local ok, message = pullAllLevers()
+                notify("Basement Hunt", ok and message or tostring(message), 6)
+            end)
+        end)
+    end
+    if Workspace:FindFirstChild("GameTriggers")
+        and Workspace.GameTriggers:FindFirstChild("Generators") then
+        addButton(controls, "Fix All Generators", "Visits every generator and fires its prompt (Puppet's Revenge)", "zap", function()
+            task.spawn(function()
+                local ok, message = fixAllGenerators()
+                notify("Puppet's Revenge", ok and message or tostring(message), 6)
+            end)
+        end)
+    end
+end
+
+addButton(controls, "Stand Up / Exit Guard Mode", "Leaves the office chair", "door-open", function()
+    fireRemote("triggerNightGuardModeEvent", false)
+    local hum = getHum()
+    if hum and hum.Sit then hum.Sit = false; hum.Jump = true end
+    notify("Night Guard", "Stood up and left guard mode.", 3)
+end)
+
+--// ----------------------------------------------------------------- Remotes ---
+local remotesTab = Window:Tab({ Title = "Remotes", Icon = "terminal" })
+
+local NOISY = {
+    animationEvent = true, playSoundEvent = true, updateWaistNeckRotationEvent = true,
+    MouseTrackerEvents = true, announce = true, subtitlesEvent = true,
+    sendPlayerNotificationEvent = true, textChatEvent = true,
+}
+local remoteNames = {}
+do
+    local re = RS:FindFirstChild("RemoteEvents")
+    if re then
+        for _, child in ipairs(re:GetChildren()) do
+            if (child:IsA("RemoteEvent") or child:IsA("UnreliableRemoteEvent"))
+                and not NOISY[child.Name] then
+                remoteNames[#remoteNames + 1] = child.Name
+            end
+        end
+    end
+    table.sort(remoteNames)
+end
+State.selectedRemote = remoteNames[1] or ""
+
+remotesTab:Dropdown({
+    Title = "RemoteEvent",
+    Values = #remoteNames > 0 and remoteNames or { "None" },
+    Value = State.selectedRemote,
+    Callback = function(value) State.selectedRemote = value end,
+})
+
+addButton(remotesTab, "Fire Selected Remote (no args)", "Advanced: fires the remote with no arguments", "send", function()
+    local ok, err = fireRemote(State.selectedRemote)
+    notify("Remotes", ok and ("Fired " .. State.selectedRemote) or tostring(err), 3)
+end)
+
+addButton(remotesTab, "Fire Selected Remote with Camera", "Sends the selected camera code as the first argument", "video", function()
+    local code = State.selectedCamera ~= "" and State.selectedCamera or (getCameraCodes()[1] or "CAM01")
+    local ok, err = fireRemote(State.selectedRemote, code)
+    notify("Remotes", ok and ("Fired " .. State.selectedRemote .. "(" .. code .. ")") or tostring(err), 3)
+end)
+
+local controlNames = {}
+do
+    local controlsFolder = getOfficeControls()
+    if controlsFolder then
+        for _, child in ipairs(controlsFolder:GetChildren()) do
+            if child:IsA("RemoteEvent") then controlNames[#controlNames + 1] = child.Name end
+        end
+    end
+    table.sort(controlNames)
+end
+State.selectedOfficeControl = controlNames[1] or ""
+
+remotesTab:Dropdown({
+    Title = "Office Control",
+    Values = #controlNames > 0 and controlNames or { "None" },
+    Value = State.selectedOfficeControl,
+    Callback = function(value) State.selectedOfficeControl = value end,
+})
+
+addButton(remotesTab, "Fire Selected Office Control", "No-argument office remote", "send", function()
+    local ok, err = fireOfficeControl(State.selectedOfficeControl)
+    notify("Remotes", ok and ("Fired " .. State.selectedOfficeControl) or tostring(err), 3)
+end)
+
+local aiNames = getAINames()
+State.selectedAIName = aiNames[1] or ""
+remotesTab:Dropdown({
+    Title = "Animatronic AI",
+    Values = #aiNames > 0 and aiNames or { "None" },
+    Value = State.selectedAIName,
+    Callback = function(value) State.selectedAIName = value end,
+})
+
+remotesTab:Slider({
+    Title = "AI Value",
+    Value = { Min = 0, Max = 20, Default = 0 },
+    Step = 1,
+    Callback = function(value) State.aiValue = value end,
+})
+
+addButton(remotesTab, "Set AI Value", "Sends playerChangeAI for the selected animatronic", "ghost", function()
+    if State.selectedAIName == "" then
+        notify("AI", "No AI attribute was found.", 3)
+        return
+    end
+    setAI(State.selectedAIName, State.aiValue or 0)
+    notify("AI", string.format("%s AI -> %s", State.selectedAIName, tostring(State.aiValue or 0)), 3)
+end)
+
+addButton(remotesTab, "List Remotes", "Prints the available RemoteEvents to the console", "list", function()
+    log("remotes:", table.concat(remoteNames, ", "))
+    log("office controls:", table.concat(controlNames, ", "))
+    log("AI names:", table.concat(aiNames, ", "))
+    notify("Remotes", "Lists printed to the executor console.", 3)
+end)
+
+--// ------------------------------------------------------------------- Misc ---
+local misc = Window:Tab({ Title = "Misc", Icon = "settings" })
+
+addButton(misc, "Copy Job ID", "Useful for rejoin scripts", "copy", function()
+    local ok = pcall(function() setclipboard(game.JobId) end)
+    notify("Job ID", ok and game.JobId or "Clipboard unavailable.", 4)
+end)
+
+addButton(misc, "Print Debug Info", "Game profile, power, AI, objectives and ESP count", "terminal", function()
+    refreshAnims(true)
+    log("game", GAME.key, GAME.name, "place", game.PlaceId)
+    log("night", tostring(attr("Night")), "hour", hourLabel(), "power", powerSummary())
+    log("guard", tostring(inGuardMode()), "sitting", tostring(getHum() and getHum().Sit),
+        "cams", tostring(cameraOpen()))
+    for _, entry in ipairs(animCache.list) do
+        log(entry.name, entry.room ~= "" and entry.room or "?", "AI", tostring(entry.ai),
+            "active", tostring(entry.enabled), "pos", entry.root and posString(entry.root.Position) or "?")
+    end
+    for _, entry in ipairs(getObjectiveEntries()) do
+        log("objective", entry.name, posString(entry.part.Position))
+    end
+    local count = 0
+    for _ in pairs(espObjects) do count = count + 1 end
+    log("esp objects", count)
+    notify("Debug", "Details printed to the executor console.", 3)
+end)
+
+addButton(misc, "Unlock Mouse", "Frees the cursor from the game's mouse lock", "mouse-pointer", function()
+    local ok = pcall(function()
+        UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+        UserInputService.MouseIconEnabled = true
+    end)
+    notify("Mouse", ok and "Mouse unlocked." or "Could not unlock the mouse.", 3)
+end)
+
+addToggle(misc, "Keep Mouse Unlocked", "Holds the cursor free every frame (may fight first-person camera)", "mouse-pointer", State.unlockMouse, function(value)
+    State.unlockMouse = value
+    if value then
+        pcall(function()
+            UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+            UserInputService.MouseIconEnabled = true
+        end)
+    end
+end)
+
+addButton(misc, "Unload Toolkit", "Stops loops, removes ESP, overlay and the menu", "trash-2", function()
+    print("[FNAFMulti] Unloaded.")
+    cleanup()
+end)
+
+--// -------------------------------------------------------------------- API ---
+pcall(function()
+    getgenv().__FNAFAll = {
+        State = State,
+        GAME = GAME,
+        setInfPower = function(value)
+            State.infPower = value ~= false
+            if State.infPower then
+                State.powerCeilings = {}
+                pinPower()
+            end
+            return State.infPower
+        end,
+        powerStatus = function()
+            local out = { enabled = State.infPower }
+            for _, name in ipairs(getPowerAttrs()) do
+                out[name] = tonumber(RS:GetAttribute(name))
+                out[name .. "Ceiling"] = State.powerCeilings[name]
+                out[name .. "Server"] = State.serverPower[name]
+            end
+            return out
+        end,
+        setPacify = function(value)
+            State.pacifyAI = value ~= false
+            if State.pacifyAI then pacifyAnimatronics() else restoreAnimatronics() end
+            return State.pacifyAI
+        end,
+        aiStatus = function()
+            local out = {}
+            for _, name in ipairs(getAINames()) do
+                out[name] = tonumber(RS:GetAttribute(name .. "AI"))
+            end
+            out.saved = State.savedAI
+            out.pacify = State.pacifyAI
+            return out
+        end,
+        setMask = function(value)
+            setMaskRemote(value ~= false)
+            return maskState()
+        end,
+        toggleMask = toggleMask,
+        playAudioLure = playAudioLure,
+        sealVent = sealVent,
+        fireFnaf3 = function(name, ...)
+            return fireNestedRemote("FNAF3", name, ...)
+        end,
+        useBedroomDoorSide = useBedroomDoorSide,
+        flashBedroomLight = flashBedroomLight,
+        setMusicBox = setMusicBox,
+        switchCamera = switchCamera,
+        openCameras = openCameras,
+        closeCameras = closeCameras,
+        enterOffice = enterOffice,
+        leaveToLobby = leaveToLobby,
+        tpWaypoint = tpWaypoint,
+        tpAnimatronic = tpAnimatronic,
+        teleport = teleportTo,
+        animEntries = getAnimEntries,
+        refreshAnims = function() return refreshAnims(true) end,
+        objectives = getObjectiveEntries,
+        nearestObjective = nearestObjective,
+        pullAllLevers = pullAllLevers,
+        fixAllGenerators = fixAllGenerators,
+        profile = function()
+            return GAME.key, GAME.name, readProfileOverride()
+        end,
+        setProfile = function(key)
+            if key and not profileByKey(key) then key = nil end
+            setProfileOverride(key)
+            if not requestProfileReload() then
+                notify("Game Profile", "Saved. Re-inject the script to apply.", 5)
+            end
+            return true
+        end,
+        setUnlockMouse = function(value)
+            State.unlockMouse = value ~= false
+            if State.unlockMouse then
+                pcall(function()
+                    UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+                    UserInputService.MouseIconEnabled = true
+                end)
+            end
+            return State.unlockMouse
+        end,
+        overlayText = function()
+            return overlayObjects[2] and overlayObjects[2].Text or nil,
+                overlayObjects[3] and overlayObjects[3].Text or nil
+        end,
+        espCount = function()
+            local count = 0
+            for _ in pairs(espObjects) do count = count + 1 end
+            return count
+        end,
+    }
+end)
+
+-- Prime everything and start background work.
+refreshAnims(true)
+buildWaypoints()
+task.spawn(powerLoop)
+task.spawn(pacifyLoop)
+task.spawn(musicBoxLoop)
+task.spawn(maskLoop)
+task.spawn(ventLoop)
+task.spawn(breakerLoop)
+task.spawn(animatronicFlagLoop)
+task.spawn(defenseLoop)
+task.spawn(objectiveLoop)
+task.spawn(mouseLoop)
+task.spawn(statusLoop)
+
+notify("FNAF Toolkit", string.format(
+    "%s loaded. RightShift opens the menu.", GAME.short), 7)
+log("loaded", GAME.key, "place", game.PlaceId)
+
+pcall(function()
+    getgenv().__FNAFAllCleanup = cleanup
+end)
+
+return
+end
+
 --[[
     FNAF CO-OP TOOLKIT
     Standalone client-side helper for FNAF: Co-op - FNAF 1 (place 12497348201).
@@ -38794,7 +41901,8 @@ Hub.SUITE.fnaf_coop = function()
       - Teleports: lobby, office, every camera room, near animatronics
       - ESP: animatronics, players, camera markers, office doors
       - Night Guard: door/light toggles, camera switching, auto-door defense,
-        Foxy camera-pulse guard (holds him in Pirate Cove without the tablet)
+        Infinite Usage power pin, host-only AI pacify, Foxy camera-pulse guard
+        (holds him in Pirate Cove without the tablet)
       - Misc: fullbright, rejoin, debug info, unload
 
     Notes
@@ -38823,6 +41931,12 @@ do
             pcall(genv.__FNAFToolkitCleanup)
         end
         genv.__FNAFToolkitCleanup = nil
+        -- Stop the multi-game branch if the player arrived here from another
+        -- FNAF: Co-op place and its loops survived the teleport.
+        if type(genv.__FNAFAllCleanup) == "function" then
+            pcall(genv.__FNAFAllCleanup)
+        end
+        genv.__FNAFAllCleanup = nil
         -- The prison toolkit belongs to a different game; stop it if it is
         -- still running so its loops and menu do not overlap this one.
         if type(genv.__PrisonToolkitCleanup) == "function" then
@@ -38835,7 +41949,7 @@ end
 local CFG = {
     Theme = "Dark",
     ToggleKey = Enum.KeyCode.RightShift,
-    Title = "FNAF Co-op Toolkit",
+    Title = "FNAF Co-op Toolkit - FNAF 1",
 }
 
 -- Office door reference points (XZ only - the doors are ceiling-high).
@@ -38906,6 +42020,7 @@ local State = {
     fly = { enabled = false, speed = 45 },
     infiniteJump = false,
     fullbright = false,
+    unlockMouse = false,
     autoDoor = false,
     autoRadius = 15,
     autoReopen = true,
@@ -38913,6 +42028,16 @@ local State = {
     autoNotify = false,
     lowPowerWarn = true,
     goldenAutoCam = false,
+    -- Pins the power meter at the value the shift started with and clears the
+    -- blackout flag locally, so doors, lights and cameras keep working.
+    infPower = true,
+    powerCeiling = 100,
+    serverPower = 100,
+    -- Host-only: zero every animatronic's AI for the night. With no threats
+    -- the doors can stay open, which is what actually keeps the server's
+    -- power drain low enough to finish the shift.
+    pacifyAI = false,
+    savedAI = nil,
     -- Foxy's "camera usage" demand can be satisfied by pinging the game's own
     -- playerSwitchCamsEvent with CAM1C. That sets lockedState server-side
     -- without opening the tablet, so it costs no camera power.
@@ -39119,6 +42244,36 @@ local function findAnimEntry(name)
         if entry.name == name then return entry end
     end
     return nil
+end
+
+local AI_ANIMATRONICS = { "Bonnie", "Chica", "Freddy", "Foxy" }
+
+local function setAnimatronicAI(name, value)
+    local re = RS:FindFirstChild("RemoteEvents")
+    local event = re and re:FindFirstChild("playerChangeAI")
+    if not event then return false end
+    pcall(function() event:FireServer(name .. "AI", value) end)
+    return true
+end
+
+local function pacifyAnimatronics()
+    if not State.savedAI then
+        State.savedAI = {}
+        for _, name in ipairs(AI_ANIMATRONICS) do
+            State.savedAI[name] = tonumber(RS:GetAttribute(name .. "AI")) or 0
+        end
+    end
+    for _, name in ipairs(AI_ANIMATRONICS) do
+        setAnimatronicAI(name, 0)
+    end
+end
+
+local function restoreAnimatronics()
+    if not State.savedAI then return end
+    for name, value in pairs(State.savedAI) do
+        setAnimatronicAI(name, value)
+    end
+    State.savedAI = nil
 end
 
 -- Foxy's state: 0/1 = still around Pirate Cove, 2+ = out and heading for the
@@ -39996,6 +43151,8 @@ local function updateOverlay()
     local leftThreats, rightThreats = getDoorThreats(leftClosed, rightClosed)
     local golden = attrBool("goldenFreddyInOffice")
     local blackout = attrBool("powerBlackout")
+    local pinActive = State.infPower and inGuardMode() and alive()
+        and attrBool("gameStarted") and not attrBool("nightFinished")
 
     local threatText = ""
     if #leftThreats > 0 then threatText = threatText .. "  !L:" .. threatLabel(leftThreats) end
@@ -40003,9 +43160,10 @@ local function updateOverlay()
     if golden then threatText = threatText .. "  !GOLDEN IN OFFICE" end
 
     line1.Text = string.format(
-        "FNAF Co-op  |  Night %s  %s  |  Power %d%%  |  %s  |  %s%s",
-        tostring(night), hourLabel(), power, doorStateText("left"),
-        doorStateText("right"), blackout and "  |  BLACKOUT" or threatText
+        "FNAF Co-op  |  Night %s  %s  |  Power %d%%%s  |  %s  |  %s%s",
+        tostring(night), hourLabel(), power, pinActive and " INF" or "",
+        doorStateText("left"), doorStateText("right"),
+        blackout and "  |  BLACKOUT" or threatText
     )
 
     local bits = {}
@@ -40029,7 +43187,7 @@ local function updateOverlay()
         color = Color3.fromRGB(255, 80, 80)
     elseif #leftThreats > 0 or #rightThreats > 0 or golden then
         color = Color3.fromRGB(255, 90, 90)
-    elseif power <= 20 then
+    elseif power <= 20 and not State.infPower then
         color = Color3.fromRGB(255, 200, 80)
     end
 
@@ -40044,6 +43202,59 @@ local function updateOverlay()
 end
 
 --// ----------------------------------------------------------------- loops ---
+-- Keep the local power meter at the ceiling the shift started with. The server
+-- still runs its own countdown, but every client-side check (lights, camera
+-- display, HUD) reads this attribute, and re-pinning it also clears blackout
+-- locally so the office controls keep responding.
+local function enforceInfinitePower()
+    if not running or not State.infPower then return end
+    if not inGuardMode() or not alive() then return end
+    if not attrBool("gameStarted") or attrBool("nightFinished") then return end
+
+    local power = attrNumber("powerPercentage", 100)
+    if power > State.powerCeiling then
+        State.powerCeiling = power
+        State.serverPower = power
+    elseif power < State.powerCeiling then
+        -- The server still owns its own countdown; remember the real value
+        -- before putting the HUD back to full.
+        State.serverPower = power
+        RS:SetAttribute("powerPercentage", State.powerCeiling)
+    end
+
+    if attrBool("powerBlackout") then
+        RS:SetAttribute("powerBlackout", false)
+    end
+end
+
+local function powerLoop()
+    while running do
+        task.wait(0.15)
+        enforceInfinitePower()
+    end
+end
+
+local function pacifyLoop()
+    while running do
+        task.wait(1)
+        if not running or not State.pacifyAI then continue end
+        if not attrBool("gameStarted") or attrBool("nightFinished") then continue end
+
+        if not State.savedAI then
+            State.savedAI = {}
+            for _, name in ipairs(AI_ANIMATRONICS) do
+                State.savedAI[name] = tonumber(RS:GetAttribute(name .. "AI")) or 0
+            end
+        end
+
+        for _, name in ipairs(AI_ANIMATRONICS) do
+            if tonumber(RS:GetAttribute(name .. "AI")) ~= 0 then
+                setAnimatronicAI(name, 0)
+            end
+        end
+    end
+end
+
 local function foxyLoop()
     while running do
         task.wait(0.25)
@@ -40143,28 +43354,65 @@ local function defenseLoop()
     end
 end
 
+local function mouseLoop()
+    while running do
+        if State.unlockMouse then
+            pcall(function()
+                UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+                UserInputService.MouseIconEnabled = true
+            end)
+            RunService.RenderStepped:Wait()
+        else
+            task.wait(0.2)
+        end
+    end
+end
+
 local function statusLoop()
     local lastNight = nil
+    local lastGameStarted = nil
     while running do
         task.wait(0.35)
         refreshAnims(true)
 
         local night = RS:GetAttribute("Night")
-        if night ~= lastNight then
+        local gameStarted = attrBool("gameStarted")
+        if night ~= lastNight or gameStarted ~= lastGameStarted then
             lastNight = night
+            lastGameStarted = gameStarted
             warned.power = false
             warned.blackout = false
             warned.golden = false
+            warned.serverPower = false
+            State.powerCeiling = math.max(100, attrNumber("powerPercentage", 100))
+            State.serverPower = State.powerCeiling
+            if gameStarted and State.pacifyAI then
+                -- New night: capture the server's AI levels before zeroing them.
+                State.savedAI = nil
+            end
         end
 
         local power = attrNumber("powerPercentage", 100)
-        if State.lowPowerWarn and power <= 20 and power > 0 and not warned.power then
+        if State.infPower then
+            enforceInfinitePower()
+            if State.serverPower <= 20 and not warned.serverPower then
+                warned.serverPower = true
+                notify("Power", string.format(
+                    "The game's real power is at %d%%. Infinite Usage only pins the meter - a server blackout can still happen.",
+                    State.serverPower), 8)
+            end
+            if State.serverPower > 25 then warned.serverPower = false end
+        end
+        if not State.infPower or not inGuardMode() or not attrBool("gameStarted") or not alive() then
+            State.serverPower = attrNumber("powerPercentage", 100)
+        end
+        if State.lowPowerWarn and not State.infPower and power <= 20 and power > 0 and not warned.power then
             warned.power = true
             notify("Power", string.format("Power is at %d%%. Doors drain it fast.", power), 6)
         end
         if power > 25 then warned.power = false end
 
-        local blackout = attrBool("powerBlackout")
+        local blackout = attrBool("powerBlackout") and not State.infPower
         if blackout and not warned.blackout then
             warned.blackout = true
             notify("BLACKOUT", "Power is out. Doors and lights are offline.", 6)
@@ -40227,6 +43475,15 @@ Connections[#Connections + 1] = RunService.Heartbeat:Connect(function()
     if State.speed.enabled then applySpeed() end
     if State.jump.enabled then applyJump() end
     if State.noclip then noclipCharacter() end
+end)
+
+-- React the instant the server writes either power attribute, instead of
+-- waiting for the next loop tick.
+Connections[#Connections + 1] = RS:GetAttributeChangedSignal("powerPercentage"):Connect(function()
+    enforceInfinitePower()
+end)
+Connections[#Connections + 1] = RS:GetAttributeChangedSignal("powerBlackout"):Connect(function()
+    enforceInfinitePower()
 end)
 
 local function cleanup()
@@ -40662,6 +43919,44 @@ nightGuard:Toggle({
 })
 
 nightGuard:Toggle({
+    Title = "Infinite Usage",
+    Desc = "Pins the meter at full and keeps the HUD/lights powered; the server still counts down underneath",
+    Icon = "battery-charging",
+    Value = State.infPower,
+    Callback = function(value)
+        State.infPower = value
+        if value then
+            State.powerCeiling = math.max(State.powerCeiling, attrNumber("powerPercentage", 100))
+            task.spawn(function() task.wait(0.2); enforceInfinitePower() end)
+        end
+        notify("Night Guard", value
+            and "Infinite Usage enabled - the meter is pinned. The game's real countdown still runs."
+            or "Infinite Usage disabled - the real power meter is back.", 3)
+    end,
+})
+
+nightGuard:Toggle({
+    Title = "Pacify Animatronics",
+    Desc = "Host only: sets every AI to 0 so doors can stay open and the server's power drain stays low",
+    Icon = "ghost",
+    Value = State.pacifyAI,
+    Callback = function(value)
+        State.pacifyAI = value
+        if value then
+            local owner = tonumber(RS:GetAttribute("playerOwnerId"))
+            if owner and owner ~= LocalPlayer.UserId then
+                notify("Night Guard", "Only the server host can change animatronic AI.", 4)
+            end
+            pacifyAnimatronics()
+            notify("Night Guard", "Animatronic AI set to 0 for this night.", 3)
+        else
+            restoreAnimatronics()
+            notify("Night Guard", "Animatronic AI restored to their previous levels.", 3)
+        end
+    end,
+})
+
+nightGuard:Toggle({
     Title = "Foxy: Camera Pulse",
     Desc = "Holds Foxy in Pirate Cove without opening the tablet or draining camera power",
     Icon = "camera",
@@ -40878,6 +44173,35 @@ misc:Button({
 })
 
 misc:Button({
+    Title = "Unlock Mouse",
+    Desc = "Frees the cursor from the game's mouse lock",
+    Icon = "mouse-pointer",
+    Callback = function()
+        local ok = pcall(function()
+            UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+            UserInputService.MouseIconEnabled = true
+        end)
+        notify("Mouse", ok and "Mouse unlocked." or "Could not unlock the mouse.", 3)
+    end,
+})
+
+misc:Toggle({
+    Title = "Keep Mouse Unlocked",
+    Desc = "Holds the cursor free every frame (may fight first-person camera)",
+    Icon = "mouse-pointer",
+    Value = State.unlockMouse,
+    Callback = function(value)
+        State.unlockMouse = value
+        if value then
+            pcall(function()
+                UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+                UserInputService.MouseIconEnabled = true
+            end)
+        end
+    end,
+})
+
+misc:Button({
     Title = "Unload Toolkit",
     Desc = "Stops loops, removes ESP, overlay and the menu",
     Icon = "trash-2",
@@ -40928,6 +44252,54 @@ pcall(function()
             }
         end,
         foxyPulse = foxyPulse,
+        setInfPower = function(value)
+            State.infPower = value ~= false
+            if State.infPower then
+                State.powerCeiling = math.max(State.powerCeiling, attrNumber("powerPercentage", 100))
+                enforceInfinitePower()
+            end
+            return State.infPower
+        end,
+        powerStatus = function()
+            local raw = attrNumber("powerPercentage", 100)
+            local pinned = State.infPower and attrBool("gameStarted")
+                and not attrBool("nightFinished") and inGuardMode() and alive()
+            return {
+                enabled = State.infPower,
+                power = raw,
+                ceiling = State.powerCeiling,
+                serverPower = pinned and State.serverPower or raw,
+                blackout = attrBool("powerBlackout"),
+            }
+        end,
+        setPacify = function(value)
+            State.pacifyAI = value ~= false
+            if State.pacifyAI then
+                pacifyAnimatronics()
+            else
+                restoreAnimatronics()
+            end
+            return State.pacifyAI
+        end,
+        setUnlockMouse = function(value)
+            State.unlockMouse = value ~= false
+            if State.unlockMouse then
+                pcall(function()
+                    UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+                    UserInputService.MouseIconEnabled = true
+                end)
+            end
+            return State.unlockMouse
+        end,
+        aiStatus = function()
+            local out = {}
+            for _, name in ipairs(AI_ANIMATRONICS) do
+                out[name] = tonumber(RS:GetAttribute(name .. "AI"))
+            end
+            out.saved = State.savedAI
+            out.pacify = State.pacifyAI
+            return out
+        end,
         overlayText = function()
             return overlayObjects[2] and overlayObjects[2].Text or nil,
                 overlayObjects[3] and overlayObjects[3].Text or nil
@@ -40944,6 +44316,9 @@ end)
 refreshAnims(true)
 task.spawn(defenseLoop)
 task.spawn(foxyLoop)
+task.spawn(pacifyLoop)
+task.spawn(powerLoop)
+task.spawn(mouseLoop)
 task.spawn(statusLoop)
 
 notify("FNAF Toolkit", "Loaded. RightShift opens the menu. Home -> Enter Office starts the shift.", 7)
