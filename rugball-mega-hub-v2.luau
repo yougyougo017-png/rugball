@@ -38901,9 +38901,12 @@ local PROFILES = {
     [12497360072] = {
         key = "FNAF3", name = "FNAF 3", short = "FNAF 3", kind = "night",
         powerAttrs = { "powerPercentage" },
+        -- Do not pin the system errors away: ventilationError / cameraError /
+        -- audioError drive the restart menu, and clearing them locally only
+        -- hid the symptom. The pass-out/blackout flags are safe to keep clear
+        -- so Infinite Usage still protects the player during a reboot.
         clearAttrs = {
-            "powerBlackout", "ventilationError", "ventilationErrorForce",
-            "ventilationPassOut", "blackoutScreenPitchBlack", "cameraError", "audioError",
+            "powerBlackout", "ventilationPassOut", "blackoutScreenPitchBlack",
         },
         camera = true, office = true, lights = true,
         springtrap = true, ai = true,
@@ -39775,17 +39778,6 @@ local function setAnimatronicFlags(enabled)
     end
 end
 
-local VENT_ATTRS = {
-    "ventilationError", "ventilationErrorForce", "ventilationPassOut",
-    "blackoutScreenPitchBlack", "cameraError", "audioError",
-}
-
-local function suppressVentilation()
-    for _, name in ipairs(VENT_ATTRS) do
-        if attrBool(name) then setAttr(name, false) end
-    end
-end
-
 --// --------------------------------------------------------------- camera ---
 local function getCameraMarkers()
     local markers = {}
@@ -39977,6 +39969,423 @@ local function firePrompt(prompt)
         end)
     end
     return ok
+end
+
+--// ------------------------------------------------------- FNAF 3 systems ---
+-- The maintenance panel is a GUI menu ("system restart menu") with audio
+-- devices / camera system / ventilation / reboot all. The error attributes
+-- only mirror the panel; clearing them locally never rebooted anything
+-- server-side, so this clicks the panel's own controls instead.
+local FNAF3_SYSTEMS = {
+    { key = "audioError", label = "audio devices", short = "A" },
+    { key = "cameraError", label = "camera system", short = "C" },
+    { key = "ventilationError", label = "ventilation", short = "V" },
+}
+local fnaf3LastRestart = 0
+local fnaf3NextPanelScan = 0
+local fnaf3RestartBusy = false
+
+local function fnaf3NormalizeText(text)
+    return tostring(text or ""):lower():gsub(">", " "):gsub("%s+", " ")
+end
+
+-- FNAF 3 mirrors some state onto the LocalPlayer instead of ReplicatedStorage,
+-- so check both when deciding whether a system is actually down.
+local function fnaf3AttrBool(name)
+    if attrBool(name) then return true end
+    local ok, value = pcall(function() return LocalPlayer:GetAttribute(name) end)
+    return ok and (value == true or value == "true" or value == 1 or value == "1")
+end
+
+local function fnaf3ActiveSystems()
+    local list = {}
+    for _, system in ipairs(FNAF3_SYSTEMS) do
+        if fnaf3AttrBool(system.key) then
+            list[#list + 1] = system
+        end
+    end
+    if fnaf3AttrBool("ventilationErrorForce") and not fnaf3AttrBool("ventilationError") then
+        list[#list + 1] = { key = "ventilationErrorForce", label = "ventilation", short = "V" }
+    end
+    return list
+end
+
+local function fnaf3HasErrors()
+    return #fnaf3ActiveSystems() > 0
+end
+
+local function fnaf3ButtonText(object)
+    local parts = { tostring(object.Name or "") }
+    if object:IsA("TextButton") or object:IsA("TextLabel") then
+        parts[#parts + 1] = object.Text
+    end
+    for _, child in ipairs(object:GetDescendants()) do
+        if child:IsA("TextLabel") or child:IsA("TextButton") then
+            parts[#parts + 1] = child.Text
+        end
+    end
+    return fnaf3NormalizeText(table.concat(parts, " "))
+end
+
+local function fnaf3InterestingText(text)
+    return text:find("audio", 1, true)
+        or text:find("camera", 1, true)
+        or text:find("ventilat", 1, true)
+        or text:find("reboot", 1, true)
+        or text:find("restart", 1, true)
+        or text:find("maintenance", 1, true)
+        or text:find("system", 1, true)
+end
+
+local function fnaf3Visible(object)
+    local node = object
+    while node and node ~= game do
+        if node:IsA("GuiObject") and node.Visible == false then return false end
+        if node:IsA("LayerCollector") and node.Enabled == false then return false end
+        node = node.Parent
+    end
+    return true
+end
+
+-- Prefer controls that live inside a panel/restart container over unrelated
+-- office HUD labels that happen to contain the same word.
+local function fnaf3PanelScore(object)
+    local score = 0
+    local node = object
+    while node and node ~= game do
+        local name = fnaf3NormalizeText(node.Name)
+        if name:find("maintenance", 1, true)
+            or name:find("panel", 1, true)
+            or name:find("restart", 1, true) then
+            score = score + 10
+        end
+        node = node.Parent
+    end
+    if object:IsA("GuiButton") then score = score + 4 end
+    return score
+end
+
+local function fnaf3CollectButtons()
+    local list = {}
+    local seen = {}
+
+    local function add(button, text)
+        if not button or seen[button] then return end
+        if uiFolder and (button == uiFolder or button:IsDescendantOf(uiFolder)) then return end
+        seen[button] = true
+        list[#list + 1] = {
+            button = button,
+            text = text,
+            visible = fnaf3Visible(button),
+            score = fnaf3PanelScore(button),
+        }
+    end
+
+    local function scan(root)
+        for _, object in ipairs(root:GetDescendants()) do
+            if object:IsA("GuiButton") then
+                local text = fnaf3ButtonText(object)
+                if fnaf3InterestingText(text) then add(object, text) end
+            elseif object:IsA("TextLabel") then
+                local text = fnaf3NormalizeText(object.Text)
+                if fnaf3InterestingText(text) then
+                    local parentButton
+                    local node = object.Parent
+                    while node and node ~= root do
+                        if node:IsA("GuiButton") then
+                            parentButton = node
+                            break
+                        end
+                        node = node.Parent
+                    end
+                    add(parentButton or object, parentButton and fnaf3ButtonText(parentButton) or text)
+                end
+            elseif object:IsA("ImageLabel") then
+                -- Icon-only panels often put the click handler on the image.
+                local text = fnaf3NormalizeText(object.Name)
+                if fnaf3InterestingText(text) then add(object, text) end
+            elseif object:IsA("ClickDetector") then
+                -- Some versions build the maintenance panel as physical buttons.
+                local text = fnaf3NormalizeText((object.Parent and object.Parent.Name or "") .. " " .. object.Name)
+                if text:find("audio", 1, true)
+                    or text:find("camera", 1, true)
+                    or text:find("ventilat", 1, true)
+                    or text:find("reboot", 1, true)
+                    or text:find("maintenance", 1, true) then
+                    add(object, text)
+                end
+            elseif object:IsA("GuiObject") then
+                local text = fnaf3NormalizeText(object.Name)
+                if text:find("reboot", 1, true)
+                    or text:find("restart", 1, true)
+                    or text:find("maintenance", 1, true) then
+                    add(object, text)
+                end
+            end
+        end
+    end
+
+    local pg = LocalPlayer:FindFirstChild("PlayerGui")
+    if pg then scan(pg) end
+
+    -- If the panel is a normal ScreenGui, PlayerGui already has it and scanning
+    -- the whole of Workspace every tick is wasted work.
+    local hasPanel = false
+    for _, entry in ipairs(list) do
+        if entry.text:find("system restart menu", 1, true)
+            or entry.text:find("reboot all", 1, true) then
+            hasPanel = true
+            break
+        end
+    end
+    if not hasPanel then scan(Workspace) end
+    return list
+end
+
+local function fnaf3FindButton(target, buttons, visibleOnly)
+    local needle = fnaf3NormalizeText(target)
+    local best, bestScore
+    local hidden, hiddenScore
+    for _, entry in ipairs(buttons or fnaf3CollectButtons()) do
+        if entry.text:find(needle, 1, true) then
+            local score = entry.score or 0
+            if entry.visible then
+                if not best or score > bestScore then
+                    best, bestScore = entry, score
+                end
+            elseif not hidden or score > hiddenScore then
+                hidden, hiddenScore = entry, score
+            end
+        end
+    end
+    if best then return best.button, best end
+    if not visibleOnly and hidden then return hidden.button, hidden end
+    return nil
+end
+
+local function fnaf3InvokeSignal(signal, seen)
+    local ok, connections = pcall(getconnections, signal)
+    if not ok or not connections then return 0 end
+    local fired = 0
+    for _, connection in ipairs(connections) do
+        local fn = connection.Function
+        if connection.Enabled ~= false and type(fn) == "function" and not seen[fn] then
+            seen[fn] = true
+            if pcall(fn) then
+                fired = fired + 1
+            end
+        end
+    end
+    return fired
+end
+
+local function fnaf3ClickButton(button)
+    if not button then return false end
+    if button:IsA("ClickDetector") then
+        local ok = pcall(function() fireclickdetector(button) end)
+        if ok then return true end
+        return fnaf3InvokeSignal(button.MouseClick, {}) > 0
+    end
+    if not button:IsA("GuiObject") then return false end
+
+    local seen = {}
+    local fired = 0
+    if button:IsA("GuiButton") then
+        fired = fired + fnaf3InvokeSignal(button.Activated, seen)
+        fired = fired + fnaf3InvokeSignal(button.MouseButton1Click, seen)
+        fired = fired + fnaf3InvokeSignal(button.MouseButton1Down, seen)
+    else
+        fired = fired + fnaf3InvokeSignal(button.InputBegan, seen)
+        fired = fired + fnaf3InvokeSignal(button.InputEnded, seen)
+    end
+    if fired > 0 then return true end
+
+    -- No scripted connection was visible: click where the control actually is.
+    local sent = false
+    pcall(function()
+        pcall(function() button.Active = true end)
+        local vim = game:GetService("VirtualInputManager")
+        local pos = button.AbsolutePosition + button.AbsoluteSize * 0.5
+        if pos.X <= 0 or pos.Y <= 0 then return end
+        vim:SendMouseMoveEvent(pos.X, pos.Y, game)
+        task.wait(0.05)
+        vim:SendMouseButtonEvent(pos.X, pos.Y, 0, true, game, 1)
+        task.wait(0.05)
+        vim:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 1)
+        sent = true
+    end)
+    return sent
+end
+
+local function fnaf3ClickDetector(detector)
+    local ok = pcall(function() fireclickdetector(detector) end)
+    if ok then return true end
+    local fired = fnaf3InvokeSignal(detector.MouseClick, {})
+    return fired > 0
+end
+
+local function fnaf3PanelVisible(buttons)
+    for _, entry in ipairs(buttons or fnaf3CollectButtons()) do
+        if entry.visible and (entry.text:find("system restart menu", 1, true)
+            or entry.text:find("reboot all", 1, true)) then
+            return true
+        end
+    end
+    return false
+end
+
+-- If the panel exists but its ScreenGui/Frame is hidden, reveal it. This is a
+-- fallback only: the normal path raises the panel with the game's own control.
+local function fnaf3ForceShowPanel()
+    for _, root in ipairs({ LocalPlayer:FindFirstChild("PlayerGui"), Workspace }) do
+        if root then
+            for _, object in ipairs(root:GetDescendants()) do
+                local label = (object:IsA("TextLabel") or object:IsA("TextButton"))
+                    and fnaf3NormalizeText(object.Text) or ""
+                if (label:find("system restart menu", 1, true)
+                    or label:find("reboot all", 1, true)) then
+                    local node = object
+                    while node and node ~= root do
+                        if node:IsA("LayerCollector") then
+                            pcall(function() node.Enabled = true end)
+                        elseif node:IsA("GuiObject") then
+                            pcall(function() node.Visible = true end)
+                        end
+                        node = node.Parent
+                    end
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
+local function fnaf3TryOpenPanel(buttons)
+    buttons = buttons or fnaf3CollectButtons()
+    if fnaf3PanelVisible(buttons) then return true end
+
+    for _, name in ipairs({ "maintenance", "panel" }) do
+        local button = fnaf3FindButton(name, buttons, true)
+        if button then
+            fnaf3ClickButton(button)
+            task.wait(0.6)
+            return fnaf3PanelVisible()
+        end
+    end
+
+    -- Workspace scanning is expensive; don't repeat it every auto tick.
+    if os.clock() < fnaf3NextPanelScan then return false end
+    fnaf3NextPanelScan = os.clock() + 10
+
+    for _, object in ipairs(Workspace:GetDescendants()) do
+        if object:IsA("ProximityPrompt") then
+            local text = fnaf3NormalizeText((object.ActionText or "") .. " " .. (object.ObjectText or ""))
+            if text:find("maintenance", 1, true)
+                or text:find("panel", 1, true)
+                or text:find("reboot", 1, true) then
+                if firePrompt(object) then
+                    task.wait(0.5)
+                    return fnaf3PanelVisible()
+                end
+            end
+        elseif object:IsA("ClickDetector") then
+            local name = fnaf3NormalizeText((object.Parent and object.Parent.Name or "") .. " " .. object.Name)
+            if name:find("maintenance", 1, true)
+                or name:find("panel", 1, true)
+                or name:find("reboot", 1, true) then
+                if fnaf3ClickDetector(object) then
+                    task.wait(0.5)
+                    return fnaf3PanelVisible()
+                end
+            end
+        end
+    end
+    return false
+end
+
+local function fnaf3RestartSystemsUnlocked(force, individual)
+    local active = fnaf3ActiveSystems()
+    if #active == 0 and not force then
+        return true, "All systems are already OK."
+    end
+    if not force and os.clock() - fnaf3LastRestart < 4 then
+        return true, "A reboot is already in progress."
+    end
+
+    local clicked = {}
+    local buttons = fnaf3CollectButtons()
+    if not fnaf3PanelVisible(buttons) then
+        fnaf3TryOpenPanel(buttons)
+        task.wait(0.35)
+        buttons = fnaf3CollectButtons()
+        if not fnaf3PanelVisible(buttons) then
+            fnaf3ForceShowPanel()
+            task.wait(0.15)
+            buttons = fnaf3CollectButtons()
+        end
+    end
+
+    local function clickMatch(name, label, visibleOnly)
+        local button = fnaf3FindButton(name, buttons, visibleOnly)
+        if not button then return false end
+        if fnaf3ClickButton(button) then
+            clicked[#clicked + 1] = label or name
+            task.wait(0.5)
+            return true
+        end
+        return false
+    end
+
+    if force and #active == 0 then active = FNAF3_SYSTEMS end
+
+    -- Reboot All when several systems are down; otherwise just the failed one.
+    -- If the panel ignores Reboot All, fall back to the individual controls.
+    local useAll = force or #active > 1
+    if useAll and not individual then
+        if clickMatch("reboot all", "reboot all", true) then
+            fnaf3LastRestart = os.clock()
+            return true, "Reboot All pressed. Waiting for the panel to finish."
+        end
+    end
+
+    -- Individual reboots are sequential in FNAF 3, so start only one per pass.
+    local function clickFirstActive(visibleOnly)
+        for _, system in ipairs(active) do
+            if clickMatch(system.label, system.label, visibleOnly) then return true end
+        end
+        return false
+    end
+
+    clickFirstActive(true)
+
+    if #clicked == 0 then
+        if not individual and clickMatch("reboot all", "reboot all", false) then
+            fnaf3LastRestart = os.clock()
+            return true, "Reboot All pressed. Waiting for the panel to finish."
+        end
+        clickFirstActive(false)
+    end
+
+    if #clicked > 0 then
+        fnaf3LastRestart = os.clock()
+        return true, "Reboot requested: " .. table.concat(clicked, ", ")
+    end
+    return false, "Maintenance panel not found. Raise it manually, then press Restart Systems Now."
+end
+
+-- Only one restart may walk the panel at a time; the toggle callback and the
+-- auto loop can otherwise double-click it.
+local function fnaf3RestartSystems(force, individual)
+    if fnaf3RestartBusy then
+        return true, "A reboot is already in progress."
+    end
+    fnaf3RestartBusy = true
+    local ok, result, detail = pcall(fnaf3RestartSystemsUnlocked, force, individual)
+    fnaf3RestartBusy = false
+    if ok then return result, detail end
+    print("[FNAF3 Auto] restart error: " .. tostring(result))
+    return false, "Restart failed: " .. tostring(result)
 end
 
 local function nearestObjective(includeDone)
@@ -40975,7 +41384,11 @@ local function gameStatusText()
             bits[#bits + 1] = "Custom " .. tostring(attr("customNightSelectedChallenge") or "on")
         end
     elseif GAME.key == "FNAF3" then
-        bits[#bits + 1] = "Vent " .. (attrBool("ventilationError") and "ERROR" or "OK")
+        local failed = {}
+        for _, system in ipairs(fnaf3ActiveSystems()) do
+            failed[#failed + 1] = system.short or system.label
+        end
+        bits[#bits + 1] = #failed > 0 and ("Systems " .. table.concat(failed, "+")) or "Systems OK"
         bits[#bits + 1] = "Springtrap " .. attrNum("SpringtrapAI", 0)
         bits[#bits + 1] = "Sealed " .. tostring(attr("sealedVent") or "-")
     elseif GAME.key == "FNAF4" then
@@ -41204,9 +41617,69 @@ local function fnaf2GeneratorLoop()
 end
 
 local function ventLoop()
+    if GAME.key ~= "FNAF3" then return end
+    local nextTry = 0
+    local attempt = 0
+    local lastWarn = 0
+    local lastSignature
+    local sameCount = 0
+    local warnedStuck = false
     while running do
-        task.wait(0.5)
-        if State.autoVent and gameActive() then suppressVentilation() end
+        task.wait(1)
+        if not running or not State.autoVent then
+            attempt, nextTry = 0, 0
+            lastSignature, sameCount, warnedStuck = nil, 0, false
+            continue
+        end
+
+        -- Do not gate this on gameActive(): a failed system is itself proof the
+        -- night is running, and FNAF 3 does not always expose the usual flags.
+        local active = fnaf3ActiveSystems()
+        if #active == 0 then
+            attempt, nextTry = 0, 0
+            lastSignature, sameCount, warnedStuck = nil, 0, false
+            continue
+        end
+
+        local keys = {}
+        for _, system in ipairs(active) do keys[#keys + 1] = system.key end
+        table.sort(keys)
+        local signature = table.concat(keys, ",")
+        if signature ~= lastSignature then
+            lastSignature = signature
+            sameCount = 0
+            warnedStuck = false
+        end
+
+        if os.clock() < nextTry then continue end
+
+        -- Six attempts covers two full passes over all three systems. If the
+        -- panel still reports the same set, stop clicking and tell the player
+        -- instead of restarting systems forever.
+        if sameCount >= 6 then
+            if not warnedStuck then
+                warnedStuck = true
+                notify("FNAF 3", "Systems still report errors after several reboots. Press Restart Systems Now or scan the panel.", 8)
+            end
+            continue
+        end
+
+        sameCount = sameCount + 1
+        attempt = attempt + 1
+        -- Try the preferred control first, then force the individual systems if
+        -- Reboot All did not take.
+        local individual = (attempt % 3 == 2)
+        local ok, detail = fnaf3RestartSystems(false, individual)
+        if not ok and os.clock() - lastWarn > 30 then
+            lastWarn = os.clock()
+            print("[FNAF3 Auto] " .. tostring(detail))
+        end
+
+        local waitFor = 12
+        if ok and type(detail) == "string" and detail:find("Reboot All", 1, true) then
+            waitFor = 18
+        end
+        nextTry = os.clock() + waitFor
     end
 end
 
@@ -41983,14 +42456,33 @@ if GAME.vents then
 end
 
 if GAME.springtrap then
-    addToggle(controls, "Auto-Clear Ventilation", "Clears ventilation / camera / audio error flags locally", "wind", State.autoVent, function(value)
+    addToggle(controls, "Auto-Restart Systems", "Presses Reboot All (or the failed system) on the maintenance panel when audio, cameras or ventilation fail", "wind", State.autoVent, function(value)
         State.autoVent = value
-        if value then suppressVentilation() end
-        notify("FNAF 3", value and "Ventilation suppression enabled." or "Ventilation suppression disabled.", 3)
+        if value then
+            task.spawn(function()
+                local ok, detail = fnaf3RestartSystems(false)
+                notify("FNAF 3", ok and detail or tostring(detail), 5)
+            end)
+        end
+        notify("FNAF 3", value and "Auto-Restart Systems enabled." or "Auto-Restart Systems disabled.", 3)
     end)
-    addButton(controls, "Clear Ventilation Now", "Clears every error flag once", "wind", function()
-        suppressVentilation()
-        notify("FNAF 3", "Ventilation and camera errors cleared locally.", 3)
+    addButton(controls, "Restart Systems Now", "Reboots every failed system through the maintenance panel", "refresh-cw", function()
+        task.spawn(function()
+            local ok, detail = fnaf3RestartSystems(true)
+            notify("FNAF 3", ok and detail or tostring(detail), 5)
+        end)
+    end)
+    addButton(controls, "Scan Maintenance Panel", "Prints the matching panel controls to the executor console", "search", function()
+        local buttons = fnaf3CollectButtons()
+        print("[FNAF3 Panel] " .. #buttons .. " matching controls")
+        for _, entry in ipairs(buttons) do
+            print(string.format("  %-7s  %s  [%s]",
+                entry.visible and "visible" or "hidden",
+                entry.button:GetFullName(),
+                entry.text))
+        end
+        notify("FNAF 3", #buttons .. " maintenance controls found"
+            .. (#buttons > 0 and " - details in the console." or "."), 5)
     end)
     addButton(controls, "Play Audio Lure", "Sends Springtrap to the selected camera (needs a full lure)", "volume-2", function()
         task.spawn(function()
@@ -42556,6 +43048,31 @@ pcall(function()
         toggleMask = toggleMask,
         playAudioLure = playAudioLure,
         sealVent = sealVent,
+        restartSystems = function(force, individual)
+            return fnaf3RestartSystems(force == true, individual == true)
+        end,
+        systemStatus = function()
+            local failed = {}
+            for _, system in ipairs(fnaf3ActiveSystems()) do
+                failed[#failed + 1] = system.label
+            end
+            return failed, fnaf3PanelVisible()
+        end,
+        setAutoSystems = function(value)
+            State.autoVent = value ~= false
+            return State.autoVent
+        end,
+        maintenanceControls = function()
+            local out = {}
+            for _, entry in ipairs(fnaf3CollectButtons()) do
+                out[#out + 1] = {
+                    path = entry.button:GetFullName(),
+                    text = entry.text,
+                    visible = entry.visible,
+                }
+            end
+            return out
+        end,
         fireFnaf3 = function(name, ...)
             return fireNestedRemote("FNAF3", name, ...)
         end,
