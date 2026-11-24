@@ -31,6 +31,7 @@
 		92551591080135   The Ditch Hotel (match)  ditch_hotel
 		83379330867218   The Ditch Hotel (lobby)  ditch_hotel
 		12497341251      FNAF: Co-op - Lobby     fnaf_coop
+		12495498157      FNAF: Co-op - Main Menu  fnaf_coop
 		12497348201      FNAF: Co-op - FNAF 1    fnaf_coop
 		12497354347      FNAF: Co-op - FNAF 2    fnaf_coop
 		12497360072      FNAF: Co-op - FNAF 3    fnaf_coop
@@ -39,6 +40,7 @@
 		126090388496360  FNAF: Co-op - FNAF 6    fnaf_coop
 		12497453410      FNAF: Co-op - Basement Hunt  fnaf_coop
 		12497456055      FNAF: Co-op - Puppet's Revenge  fnaf_coop
+		83743340498788   The Hatch               fnaf_coop
 
 	the taf bypass suite is standalone now. Drive Duels and Throw A Football 7s both
 	run qb_aimbot, which carries the same MoveGuard/AnimGuard layers, so loading
@@ -83,6 +85,7 @@ Hub.ORDER = {
 	{ place = 92551591080135,  label = "THE DITCH HOTEL", suites = { "ditch_hotel" } },
 	{ place = 83379330867218,  label = "THE DITCH HOTEL", suites = { "ditch_hotel" } },
 	{ place = 12497341251,     label = "FNAF CO-OP - LOBBY", suites = { "fnaf_coop" } },
+	{ place = 12495498157,     label = "FNAF CO-OP - MAIN MENU", suites = { "fnaf_coop" } },
 	{ place = 12497348201,     label = "FNAF CO-OP - FNAF 1", suites = { "fnaf_coop" } },
 	{ place = 12497354347,     label = "FNAF CO-OP - FNAF 2", suites = { "fnaf_coop" } },
 	{ place = 12497360072,     label = "FNAF CO-OP - FNAF 3", suites = { "fnaf_coop" } },
@@ -91,6 +94,7 @@ Hub.ORDER = {
 	{ place = 126090388496360, label = "FNAF CO-OP - FNAF 6", suites = { "fnaf_coop" } },
 	{ place = 12497453410,     label = "FNAF CO-OP - BASEMENT HUNT", suites = { "fnaf_coop" } },
 	{ place = 12497456055,     label = "FNAF CO-OP - PUPPET'S REVENGE", suites = { "fnaf_coop" } },
+	{ place = 83743340498788,  label = "FNAF CO-OP - THE HATCH", suites = { "fnaf_coop" } },
 }
 
 Hub.GAMES = {}
@@ -38803,6 +38807,23 @@ getgenv().__FNAFCoopReload = function() pcall(function() Hub.SUITE.fnaf_coop() e
 -- Every FNAF: Co-op place except FNAF 1 uses the multi-game suite below.
 -- FNAF 1 falls through to the original toolkit further down this file, so
 -- its Foxy Guard, camera pulse and __FNAFToolkit API stay exactly as they were.
+
+-- Shared by both branches: direct joins, so a mode can be reached without
+-- depending on the game's default "Play Solo" destination.
+local FNAF_PLACES = {
+    { label = "Lobby", place = 12497341251 },
+    { label = "Main Menu", place = 12495498157 },
+    { label = "FNAF 1", place = 12497348201 },
+    { label = "FNAF 2", place = 12497354347 },
+    { label = "FNAF 3", place = 12497360072 },
+    { label = "FNAF 4", place = 12497365956 },
+    { label = "Sister Location", place = 15305648732 },
+    { label = "FNAF 6", place = 126090388496360 },
+    { label = "Basement Hunt", place = 12497453410 },
+    { label = "Puppet's Revenge", place = 12497456055 },
+    { label = "The Hatch", place = 83743340498788 },
+}
+
 if game.PlaceId ~= 12497348201 then
 --[[
     FNAF CO-OP MULTI-GAME TOOLKIT
@@ -38811,6 +38832,7 @@ if game.PlaceId ~= 12497348201 then
 
     Covered places
       12497341251       Lobby (game / night selection helper)
+      12495498157       Main Menu (game selection entry point)
       12497354347       FNAF 2
       12497360072       FNAF 3
       12497365956       FNAF 4
@@ -38818,6 +38840,7 @@ if game.PlaceId ~= 12497348201 then
       126090388496360   FNAF 6 / Pizzeria Simulator
       12497453410       Basement Hunt
       12497456055       Puppet's Revenge
+      83743340498788    The Hatch
 
     Menu: WindUI. Toggle: RightShift.
 ]]
@@ -38857,6 +38880,9 @@ local PROFILES = {
     [12497341251] = {
         key = "LOBBY", name = "FNAF Co-op - Lobby", short = "Lobby", kind = "lobby",
     },
+    [12495498157] = {
+        key = "MENU", name = "FNAF Co-op - Main Menu", short = "Main Menu", kind = "lobby", menu = true,
+    },
     [12497348201] = {
         key = "FNAF1", name = "FNAF 1", short = "FNAF 1", kind = "night",
         powerAttrs = { "powerPercentage" }, clearAttrs = { "powerBlackout" },
@@ -38864,8 +38890,10 @@ local PROFILES = {
     },
     [12497354347] = {
         key = "FNAF2", name = "FNAF 2", short = "FNAF 2", kind = "night",
-        powerAttrs = { "powerPercentage", "batteryLife" },
-        powerDefaults = { batteryLife = 100 },
+        -- The flashlight battery is not a ReplicatedStorage attribute; the
+        -- server sends it over sendFlashlightBatteryPercentage. Keep only the
+        -- real power meter here so the overlay does not show a fake 0% battery.
+        powerAttrs = { "powerPercentage" },
         clearAttrs = { "powerBlackout", "flashlightBatteryOut" },
         camera = true, office = true, lights = true,
         mask = true, musicBox = true, vents = true, ai = true,
@@ -38907,10 +38935,15 @@ local PROFILES = {
         key = "PUPPET", name = "Puppet's Revenge", short = "Puppet's Revenge", kind = "survival",
         objectives = true,
     },
+    [83743340498788] = {
+        key = "HATCH", name = "The Hatch", short = "The Hatch", kind = "survival",
+        objectives = true,
+    },
 }
 
 local PROFILE_ORDER = {
     { label = "Lobby", key = "LOBBY" },
+    { label = "Main Menu", key = "MENU" },
     { label = "FNAF 1", key = "FNAF1" },
     { label = "FNAF 2", key = "FNAF2" },
     { label = "FNAF 3", key = "FNAF3" },
@@ -38919,6 +38952,7 @@ local PROFILE_ORDER = {
     { label = "FNAF 6", key = "FNAF6" },
     { label = "Basement Hunt", key = "BASEMENT" },
     { label = "Puppet's Revenge", key = "PUPPET" },
+    { label = "The Hatch", key = "HATCH" },
 }
 
 local function profileByKey(key)
@@ -38933,7 +38967,12 @@ local function readProfileOverride()
     local ok, value = pcall(function() return getgenv().__FNAFProfileOverride end)
     if not ok or type(value) ~= "string" or value == "" then return nil end
     local okPlace, place = pcall(function() return getgenv().__FNAFProfileOverridePlace end)
-    if okPlace and type(place) == "number" and place ~= game.PlaceId then return nil end
+    -- Manual overrides are scoped to the place they were chosen in. A value
+    -- with no place id came from an older build and used to follow the player
+    -- into every FNAF game, making every mode report the same version.
+    if not okPlace or type(place) ~= "number" or place ~= game.PlaceId then
+        return nil
+    end
     return value
 end
 
@@ -38991,8 +39030,19 @@ local function detectProfile()
     return detectProfileAuto()
 end
 
+-- Drop a legacy manual profile that was stored without a place id. Leaving it
+-- in place would override exact place-id detection in every FNAF game.
+pcall(function()
+    local genv = getgenv()
+    if genv.__FNAFProfileOverride ~= nil
+        and type(genv.__FNAFProfileOverridePlace) ~= "number" then
+        genv.__FNAFProfileOverride = nil
+    end
+end)
+
 local GAME = detectProfile()
 local DETECTED = detectProfileAuto()
+local MANUAL_PROFILE = readProfileOverride() ~= nil
 local autoProfileLabel = "Auto (" .. DETECTED.short .. ")"
 
 local function profileLabel(key)
@@ -39061,6 +39111,18 @@ local State = {
     autoMusicBox = false,
     musicBoxWinding = false,
     autoVent = false,
+
+    infFlashlight = false,
+    flashBattery = 100,
+    flashSavedEnabled = nil,
+    flashSavedLevel = nil,
+    autoTasks = false,
+    autoGenerator = false,
+    fnaf2Tasks = {},
+    selectedFnaf2Anim = "Bonnie",
+    fnaf2AIValue = 0,
+    fnaf2AI = {},
+    selectedChallenge = "Custom",
 
     fixBreakers = false,
     savedBreakers = nil,
@@ -40250,6 +40312,356 @@ local function fixAllGenerators()
     return true, string.format("Fixed %d of %d generator(s), %d already on.", fixed, total, skipped)
 end
 
+--// -------------------------------------------------------------- FNAF 2 ---
+-- FNAF 2 has a second layer of gameplay on top of the office: roles
+-- (Night Guard / Janitor / Engineer / Policeman), janitor tasks, a flashlight
+-- with its own battery, and Night 7 "Custom Night" with per-animatronic AI
+-- levels and challenge presets. The helpers below read that state and use the
+-- game's own remotes/prompts instead of inventing server calls.
+local FNAF2_ANIMATRONICS = {
+    "Bonnie", "Chica", "Freddy", "Foxy",
+    "ToyBonnie", "ToyChica", "ToyFreddy", "Mangle",
+    "BalloonBoy", "GoldenFreddy",
+}
+
+local FNAF2_CHALLENGES = {
+    "Custom",
+    "20/20/20/20",
+    "New and Shiny",
+    "Double Trouble",
+    "Night of Misfits",
+    "Foxy Foxy",
+    "Ladies Night",
+    "Freddy's Circus",
+    "Cupcake Challenge",
+    "Fazbear Fever",
+    "Golden Freddy",
+}
+
+local function fnaf2Role()
+    return tostring(LocalPlayer:GetAttribute("Role") or "PLAYER")
+end
+
+local function fnaf2IsHost()
+    local owner = tonumber(attr("playerOwnerId"))
+    return owner == nil or owner == LocalPlayer.UserId
+end
+
+local FNAF2_TASK_NAMES = {
+    PartyRoom1Tables = "Party Room 1 table",
+    PartyRoom2Tables = "Party Room 2 table",
+    PartyRoom3Tables = "Party Room 3 table",
+    PartyRoom4Tables = "Party Room 4 table",
+    MainHallTables = "Main Hall table",
+    KidsCoveTables = "Kids Cove table",
+    WaterSplash = "Water spill",
+    ArcadeMachines = "Arcade machine",
+    Generator = "Generator",
+}
+
+local function fnaf2CanClean()
+    local role = fnaf2Role()
+    return role == "JANITOR" or role == "ENGINEER"
+end
+
+local function fnaf2CanFix()
+    return fnaf2Role() == "ENGINEER"
+end
+
+local function fnaf2RoleHasTasks()
+    return fnaf2CanClean() or fnaf2CanFix()
+end
+
+local function fnaf2TaskEntries()
+    local list = {}
+    if not fnaf2RoleHasTasks() then return list end
+
+    -- Prefer the server's own list: updateTasksEvent carries the Role table
+    -- for each task, while the GUI only shows frames after it has slid in.
+    if #State.fnaf2Tasks > 0 then
+        local role = fnaf2Role()
+        for _, item in ipairs(State.fnaf2Tasks) do
+            local allowed = false
+            if type(item.roles) == "table" then
+                for _, entryRole in ipairs(item.roles) do
+                    if tostring(entryRole) == role then
+                        allowed = true
+                        break
+                    end
+                end
+            elseif type(item.roles) == "string" then
+                allowed = tostring(item.roles) == role
+            end
+            if allowed then
+                list[#list + 1] = { text = item.text, done = item.done }
+            end
+        end
+        if #list > 0 then return list end
+    end
+
+    local pg = LocalPlayer:FindFirstChild("PlayerGui")
+    local gui = pg and pg:FindFirstChild("JanitorTasksGui")
+    local sidebar = gui and gui:FindFirstChild("Sidebar")
+    local container = sidebar and sidebar:FindFirstChild("Container")
+    if not container then return list end
+
+    for _, frame in ipairs(container:GetChildren()) do
+        if frame:IsA("Frame") and frame.Visible == true then
+            local text = frame:FindFirstChild("TaskText")
+            if text and text:IsA("TextLabel") then
+                local done = text:FindFirstChild("Done")
+                list[#list + 1] = {
+                    text = tostring(text.Text),
+                    done = done ~= nil and done.Visible == true,
+                }
+            end
+        end
+    end
+    return list
+end
+
+local function fnaf2TaskSummary()
+    local done, total = 0, 0
+    for _, entry in ipairs(fnaf2TaskEntries()) do
+        total = total + 1
+        if entry.done then done = done + 1 end
+    end
+    return done, total
+end
+
+local function fnaf2PromptPart(prompt)
+    local node = prompt and prompt.Parent
+    while node and node ~= Workspace do
+        if node:IsA("BasePart") then return node end
+        node = node.Parent
+    end
+    return prompt and firstBasePart(prompt.Parent) or nil
+end
+
+local function fnaf2TaskLabel(prompt)
+    local node = prompt and prompt.Parent
+    while node and node ~= Workspace do
+        local label = FNAF2_TASK_NAMES[node.Name]
+        if label then return label end
+        node = node.Parent
+    end
+    local object = tostring(prompt and prompt.ObjectText or "")
+    if object ~= "" then return object end
+    return prompt and prompt.Parent and prompt.Parent.Name or "Task"
+end
+
+local function fnaf2TaskModels()
+    local list = {}
+    if not fnaf2RoleHasTasks() then return list end
+    local triggers = Workspace:FindFirstChild("GameTriggers")
+    if not triggers then return list end
+
+    local role = fnaf2Role()
+    local canClean = role == "JANITOR" or role == "ENGINEER"
+    local canFix = role == "ENGINEER"
+    for _, prompt in ipairs(triggers:GetDescendants()) do
+        if prompt:IsA("ProximityPrompt") then
+            local action = prompt.ActionText
+            -- Clean covers the table/floor spills; Fix covers the arcade
+            -- machines and the generator. Office buttons use Interact/Open,
+            -- so they never end up in this list.
+            if (action == "Clean" and canClean) or (action == "Fix" and canFix) then
+                local part = fnaf2PromptPart(prompt)
+                if part then
+                    list[#list + 1] = {
+                        name = fnaf2TaskLabel(prompt),
+                        prompt = prompt,
+                        part = part,
+                        done = prompt.Enabled == false,
+                    }
+                end
+            end
+        end
+    end
+    return list
+end
+
+local function fnaf2NearestTask()
+    local best, bestDist = nil, math.huge
+    local pos = myPosition()
+    for _, entry in ipairs(fnaf2TaskModels()) do
+        if not entry.done then
+            local dist = (entry.part.Position - pos).Magnitude
+            if dist < bestDist then
+                best, bestDist = entry, dist
+            end
+        end
+    end
+    return best, bestDist
+end
+
+local function fnaf2UsePrompt(prompt, label)
+    if not prompt then return false, "No task prompt found." end
+    if not prompt.Enabled then return false, (label or "That task") .. " is already done." end
+    local part = fnaf2PromptPart(prompt)
+    if part then
+        teleportTo(part.Position + Vector3.new(0, 2.5, 0))
+        task.wait(0.6)
+    end
+    if not prompt.Enabled then
+        return true, (label or "That task") .. " was already done."
+    end
+    if not firePrompt(prompt) then
+        return false, "The task prompt did not fire."
+    end
+    task.wait(math.min(tonumber(prompt.HoldDuration) or 0.2, 1.5) + 0.3)
+    return true, label or "Task"
+end
+
+local function fnaf2DoNearestTask()
+    local role = fnaf2Role()
+    if not fnaf2RoleHasTasks() then
+        return false, "You need the JANITOR or ENGINEER role (current: " .. role .. ")."
+    end
+    if not gameActive() then return false, "The night has not started yet." end
+    local entry = fnaf2NearestTask()
+    if not entry then return false, "No active task found. Wait for the game to assign one." end
+    return fnaf2UsePrompt(entry.prompt, entry.name)
+end
+
+local function fnaf2Generator()
+    local triggers = Workspace:FindFirstChild("GameTriggers")
+    local gen = triggers and triggers:FindFirstChild("Generator")
+    if not gen then return nil, nil end
+    return gen, getPromptFor(gen)
+end
+
+local function fnaf2GeneratorInfo()
+    local gen, prompt = fnaf2Generator()
+    return {
+        present = gen ~= nil,
+        broken = prompt ~= nil and prompt.Enabled == true,
+        role = fnaf2Role(),
+    }
+end
+
+local function fnaf2FixGenerator()
+    if not fnaf2CanFix() then
+        return false, "You need the ENGINEER role (current: " .. fnaf2Role() .. ")."
+    end
+    local _, prompt = fnaf2Generator()
+    if not prompt then return false, "No generator in this place." end
+    if not prompt.Enabled then return false, "The generator is not broken right now." end
+    return fnaf2UsePrompt(prompt, "Generator")
+end
+
+local function fnaf2RepairArcade()
+    if not fnaf2CanFix() then
+        return false, "You need the ENGINEER role (current: " .. fnaf2Role() .. ")."
+    end
+    local triggers = Workspace:FindFirstChild("GameTriggers")
+    local arcade = triggers and triggers:FindFirstChild("ArcadeMachines")
+    local prompt = arcade and getPromptFor(arcade)
+    if not prompt then return false, "No arcade machine task here." end
+    return fnaf2UsePrompt(prompt, "Arcade machine")
+end
+
+local function fnaf2CaptureTasks()
+    local re = RS:FindFirstChild("RemoteEvents")
+    local ev = re and re:FindFirstChild("updateTasksEvent")
+    if not ev then return end
+    Connections[#Connections + 1] = ev.OnClientEvent:Connect(function(items)
+        if type(items) ~= "table" then return end
+        local list = {}
+        for _, item in ipairs(items) do
+            if type(item) == "table" then
+                list[#list + 1] = {
+                    text = tostring(item.Info or "Task"),
+                    done = item.Completed == true,
+                    roles = item.Role,
+                }
+            end
+        end
+        State.fnaf2Tasks = list
+    end)
+end
+
+local function fnaf2FlashBattery()
+    return math.clamp(tonumber(State.flashBattery) or 100, 0, 100)
+end
+
+local function fnaf2SetFlashlight(on, level)
+    -- Remember the state the game gave us before the toolkit changed anything
+    -- so cleanup can put it back exactly as it was.
+    if State.flashSavedEnabled == nil and State.flashSavedLevel == nil then
+        State.flashSavedEnabled = LocalPlayer:GetAttribute("HasFlashlightEnabled")
+        State.flashSavedLevel = LocalPlayer:GetAttribute("HasFlashlightLevel")
+    end
+    local target = on ~= false
+    pcall(function() LocalPlayer:SetAttribute("HasFlashlightEnabled", target) end)
+    if level ~= nil then
+        pcall(function()
+            LocalPlayer:SetAttribute("HasFlashlightLevel", math.clamp(tonumber(level) or 0, 0, 10))
+        end)
+    end
+    return target
+end
+
+local function fnaf2RestoreFlashlight()
+    if State.flashSavedEnabled ~= nil then
+        pcall(function() LocalPlayer:SetAttribute("HasFlashlightEnabled", State.flashSavedEnabled) end)
+    end
+    if State.flashSavedLevel ~= nil then
+        pcall(function() LocalPlayer:SetAttribute("HasFlashlightLevel", State.flashSavedLevel) end)
+    end
+    State.flashSavedEnabled = nil
+    State.flashSavedLevel = nil
+end
+
+local function fnaf2CaptureBattery()
+    local re = RS:FindFirstChild("RemoteEvents")
+    local ev = re and re:FindFirstChild("sendFlashlightBatteryPercentage")
+    if not ev then return end
+    Connections[#Connections + 1] = ev.OnClientEvent:Connect(function(value)
+        local n = tonumber(value)
+        if n then State.flashBattery = math.clamp(n, 0, 100) end
+    end)
+end
+
+local function fnaf2AIStatus()
+    local out = {
+        night = tonumber(attr("Night")),
+        challenge = attr("customNightSelectedChallenge"),
+    }
+    for _, name in ipairs(FNAF2_ANIMATRONICS) do
+        out[name] = tonumber(RS:GetAttribute(name .. "AI"))
+    end
+    return out
+end
+
+local function fnaf2SetAI(name, value)
+    if not name or name == "" then return false, "No animatronic selected." end
+    if not fnaf2IsHost() then
+        return false, "Only the server host can change animatronic AI."
+    end
+    local night = tonumber(attr("Night"))
+    if night ~= 7 then
+        return false, "Custom Night is Night 7 (current: " .. tostring(night or "?") .. ")."
+    end
+    setAI(name, math.clamp(tonumber(value) or 0, 0, 20))
+    return true
+end
+
+local function fnaf2ApplyChallenge(name)
+    if not name or name == "" then return false, "No challenge selected." end
+    if not fnaf2IsHost() then
+        return false, "Only the server host can change the Custom Night challenge."
+    end
+    local night = tonumber(attr("Night"))
+    if night ~= 7 then
+        return false, "Custom Night is Night 7 (current: " .. tostring(night or "?") .. ")."
+    end
+    local ev = getRemote("playerChangeAI")
+    if not ev then return false, "playerChangeAI is missing." end
+    local ok, err = pcall(function() ev:FireServer(nil, nil, name) end)
+    return ok, err
+end
+
 --// ------------------------------------------------------------------- ESP ---
 local function getDrawing()
     local ok, drawing = pcall(function() return Drawing end)
@@ -40270,7 +40682,7 @@ local function worldBox(model)
     if cached and now - cached.t < 1.2 then
         return cached.cf, cached.size
     end
-    local ok, cf, size = pcall(model.GetBoundingBox, model)
+    local ok, cf, size = pcall(function() return model:GetBoundingBox() end)
     if not ok or not cf then return nil end
     hashCache[model] = { t = now, cf = cf, size = size }
     return cf, size
@@ -40549,6 +40961,19 @@ local function gameStatusText()
         bits[#bits + 1] = "MusicBox " .. (attrBool("musicBoxOff") and "OFF" or "OK")
         bits[#bits + 1] = "Vents L" .. (attrBool("leftVentClogged") and "X" or "OK")
             .. " R" .. (attrBool("rightVentClogged") and "X" or "OK")
+        local role = fnaf2Role()
+        bits[#bits + 1] = "Role " .. role
+        bits[#bits + 1] = "Flash " .. string.format("%.0f%%", fnaf2FlashBattery())
+        local done, total = fnaf2TaskSummary()
+        if total > 0 then
+            bits[#bits + 1] = "Tasks " .. done .. "/" .. total
+        end
+        if role == "ENGINEER" and fnaf2GeneratorInfo().broken then
+            bits[#bits + 1] = "Gen FIX"
+        end
+        if tonumber(attr("Night")) == 7 then
+            bits[#bits + 1] = "Custom " .. tostring(attr("customNightSelectedChallenge") or "on")
+        end
     elseif GAME.key == "FNAF3" then
         bits[#bits + 1] = "Vent " .. (attrBool("ventilationError") and "ERROR" or "OK")
         bits[#bits + 1] = "Springtrap " .. attrNum("SpringtrapAI", 0)
@@ -40593,7 +41018,18 @@ local function gameStatusText()
         bits[#bits + 1] = "Generators " .. attrNum("generatorsDone", 0) .. "/" .. attrNum("generators", 0)
         bits[#bits + 1] = "Exit " .. (attrBool("ExitOpened") and "OPEN" or "CLOSED")
         bits[#bits + 1] = "Dead " .. attrNum("DeadPlayers", 0)
-    elseif GAME.key == "LOBBY" then
+    elseif GAME.key == "HATCH" then
+        local total, pulled = 0, 0
+        local triggers = Workspace:FindFirstChild("GameTriggers")
+        local levers = triggers and triggers:FindFirstChild("Levers")
+        if levers then
+            for _, lever in ipairs(levers:GetChildren()) do
+                total = total + 1
+                if leverPulled(lever) then pulled = pulled + 1 end
+            end
+        end
+        bits[#bits + 1] = "Levers " .. pulled .. "/" .. total
+    elseif GAME.kind == "lobby" then
         bits[#bits + 1] = "Selected " .. tostring(attr("gameSelected") or "NONE")
         bits[#bits + 1] = "Night " .. tostring(attr("nightSelected") or "?")
         bits[#bits + 1] = "Players " .. #Players:GetPlayers()
@@ -40623,8 +41059,8 @@ local function updateOverlay()
     local cam = cameraOpen() and "CAMS" or "NO CAMS"
 
     line1.Text = string.format(
-        "%s  |  Night %s  %s  |  %s  |  %s  %s%s",
-        GAME.short, night, hourLabel(), powerSummary(), guard, cam,
+        "%s%s  |  Night %s  %s  |  %s  |  %s  %s%s",
+        GAME.short, MANUAL_PROFILE and "  [MANUAL]" or "", night, hourLabel(), powerSummary(), guard, cam,
         State.infPower and "  INF" or ""
     )
     line2.Text = gameStatusText()
@@ -40734,6 +41170,36 @@ local function maskLoop()
             setMaskRemote(false)
             last = os.clock()
         end
+    end
+end
+
+local function flashlightLoop()
+    while running do
+        task.wait(2)
+        if not running or not State.infFlashlight or not gameActive() then continue end
+        fnaf2SetFlashlight(true, 10)
+    end
+end
+
+local function fnaf2TaskLoop()
+    local last = 0
+    while running do
+        task.wait(2)
+        if not running or not State.autoTasks or not gameActive() then continue end
+        if os.clock() - last < 5 then continue end
+        local ok = fnaf2DoNearestTask()
+        if ok then last = os.clock() end
+    end
+end
+
+local function fnaf2GeneratorLoop()
+    local last = 0
+    while running do
+        task.wait(2)
+        if not running or not State.autoGenerator or not gameActive() then continue end
+        if os.clock() - last < 5 then continue end
+        local ok = fnaf2FixGenerator()
+        if ok then last = os.clock() end
     end
 end
 
@@ -40921,6 +41387,8 @@ local function cleanup()
     State.fullbright = false
     restoreLighting()
     if State.musicBoxWinding then setMusicBox(false) end
+    State.infFlashlight = false
+    fnaf2RestoreFlashlight()
 
     clearEsp()
     clearOverlay()
@@ -41025,6 +41493,18 @@ home:Dropdown({
     end,
 })
 
+addButton(home, "Use Auto (" .. DETECTED.short .. ")", "Clear the manual version and follow this place's id", "wand", function()
+    if not readProfileOverride() then
+        notify("Game Profile", "Already following auto detection: " .. DETECTED.short .. ".", 3)
+        return
+    end
+    setProfileOverride(nil)
+    notify("Game Profile", "Manual version cleared. Auto detects " .. DETECTED.short .. ".", 4)
+    if not requestProfileReload() then
+        notify("Game Profile", "Re-inject the script to apply.", 5)
+    end
+end)
+
 addButton(home, "Refresh Status", "Game, night, power, guard mode, camera and AI", "refresh-cw", function()
     refreshAnims(true)
     local aiBits = {}
@@ -41036,9 +41516,10 @@ addButton(home, "Refresh Status", "Game, night, power, guard mode, camera and AI
         aiBits[#aiBits + 1] = piece
     end
     notify("FNAF Status", string.format(
-        "%s  ·  %s  ·  place %d\nNight %s  ·  %s\n%s\nGuard %s  ·  Cams %s  ·  Pos %s\n%s",
+        "%s  ·  %s  ·  auto %s  ·  place %d\nNight %s  ·  %s\n%s\nGuard %s  ·  Cams %s  ·  Pos %s\n%s",
         GAME.name,
-        selectedProfileLabel() .. (readProfileOverride() and " (manual)" or " (auto)"),
+        selectedProfileLabel() .. (MANUAL_PROFILE and " (manual)" or " (auto)"),
+        DETECTED.short,
         game.PlaceId,
         tostring(attr("Night") or "?"),
         hourLabel(),
@@ -41048,6 +41529,23 @@ addButton(home, "Refresh Status", "Game, night, power, guard mode, camera and AI
         posString(myPosition()),
         #aiBits > 0 and table.concat(aiBits, "  ·  ") or "No animatronics found."
     ), 9)
+
+    if GAME.key == "FNAF2" then
+        local done, total = fnaf2TaskSummary()
+        local generator = fnaf2GeneratorInfo()
+        local bits = {
+            "Role " .. fnaf2Role(),
+            string.format("Flashlight %.0f%%", fnaf2FlashBattery()),
+        }
+        if total > 0 then
+            bits[#bits + 1] = string.format("Tasks %d/%d", done, total)
+        end
+        if generator.present then
+            bits[#bits + 1] = "Generator " .. (generator.broken and "BROKEN" or "OK")
+        end
+        bits[#bits + 1] = "Custom " .. tostring(attr("customNightSelectedChallenge") or "off")
+        notify("FNAF 2 Role", table.concat(bits, "  ·  "), 8)
+    end
 end)
 
 addToggle(home, "Status Overlay", "Power, game state and AI at the top-left", "activity", State.overlay, function(value)
@@ -41076,9 +41574,43 @@ addButton(home, "Rejoin Server", "Teleport back to this same server", "rotate-cw
     notify("Rejoin", ok and "Teleporting…" or tostring(err), 3)
 end)
 
+--// -------------------------------------------------------------- Join Game ---
+local joinTab = Window:Tab({ Title = "Join Game", Icon = "arrow-right-left" })
+
+for _, entry in ipairs(FNAF_PLACES) do
+    local target = entry
+    addButton(joinTab, target.label, target.place == game.PlaceId
+        and "You are already in this place"
+        or ("Direct teleport to place " .. target.place), "external-link", function()
+        if target.place == game.PlaceId then
+            notify("Join Game", "Already in " .. target.label .. ".", 3)
+            return
+        end
+        local ok, err = pcall(function()
+            TeleportService:Teleport(target.place, LocalPlayer)
+        end)
+        notify("Join Game", ok and ("Joining " .. target.label .. "…") or tostring(err), 4)
+    end)
+end
+
 --// ------------------------------------------------------------------ Lobby ---
 if GAME.kind == "lobby" then
     local lobbyTab = Window:Tab({ Title = "Lobby", Icon = "gamepad-2" })
+    if GAME.menu then
+        addButton(lobbyTab, "Go to Game Lobby", "Open the lobby where the game and night are selected", "arrow-right", function()
+            local ok, err = pcall(function()
+                TeleportService:Teleport(12497341251, LocalPlayer)
+            end)
+            notify("Lobby", ok and "Joining the game lobby…" or tostring(err), 4)
+        end)
+        addButton(lobbyTab, "Lobby Status", "Owner and player count", "info", function()
+            notify("Lobby", string.format(
+                "Owner %s  ·  Players %d",
+                tostring(attr("playerOwnerId")),
+                #Players:GetPlayers()
+            ), 6)
+        end)
+    else
     local LOBBY_GAMES = {
         { label = "FNAF 1", key = "FNAF 1" },
         { label = "FNAF 2", key = "FNAF 2" },
@@ -41088,6 +41620,7 @@ if GAME.kind == "lobby" then
         { label = "FNAF 6", key = "FNAF 6" },
         { label = "Basement Hunt", key = "Basement Hunt" },
         { label = "Puppet's Revenge", key = "Puppet's Revenge" },
+        { label = "The Hatch", key = "The Hatch" },
     }
     local labels = {}
     local keyByLabel = {}
@@ -41105,16 +41638,36 @@ if GAME.kind == "lobby" then
 
     lobbyTab:Dropdown({
         Title = "Night",
-        Values = { "1", "2", "3", "4", "5", "6" },
-        Value = tostring(State.selectedLobbyNight),
-        Callback = function(value) State.selectedLobbyNight = tonumber(value) or 1 end,
+        Values = { "1", "2", "3", "4", "5", "6", "7 (Custom)" },
+        Value = State.selectedLobbyNight == 7 and "7 (Custom)" or tostring(State.selectedLobbyNight),
+        Callback = function(value)
+            State.selectedLobbyNight = tonumber(string.match(value, "%d+")) or 1
+        end,
     })
 
     addButton(lobbyTab, "Select Game & Night", "Sends gameSelectionChangedEvent to the server", "check", function()
         local key = keyByLabel[State.selectedLobbyGame] or State.selectedLobbyGame
-        fireRemote("gameSelectionChangedEvent", key, tonumber(State.selectedLobbyNight) or 1)
-        task.wait(0.5)
-        notify("Lobby", string.format("Selected %s  ·  Night %d", key, State.selectedLobbyNight), 4)
+        local night = tonumber(State.selectedLobbyNight) or 1
+        fireRemote("gameSelectionChangedEvent", key, night)
+        task.wait(0.6)
+        local actual = tonumber(attr("nightSelected"))
+        if actual == night then
+            notify("Lobby", string.format("Selected %s  ·  %s", key,
+                night == 7 and "Night 7 (Custom Night)" or ("Night " .. night)), 4)
+        else
+            notify("Lobby", string.format("Requested %s Night %d, but the server kept Night %s.",
+                key, night, tostring(actual or "?")), 5)
+        end
+    end)
+
+    addButton(lobbyTab, "Select FNAF 2 Custom Night", "Selects FNAF 2 and Night 7 (Custom Night) in one click", "wand", function()
+        fireRemote("gameSelectionChangedEvent", "FNAF 2", 7)
+        task.wait(0.6)
+        local actual = tonumber(attr("nightSelected"))
+        notify("Lobby", actual == 7
+            and "Selected FNAF 2  ·  Night 7 (Custom Night)."
+            or ("FNAF 2 selected, but the server kept Night " .. tostring(actual or "?")
+                .. " (Custom Night may be locked)."), 5)
     end)
 
     addButton(lobbyTab, "Ready Up", "Fires playerReadyUpEvent", "check-circle", function()
@@ -41142,6 +41695,7 @@ if GAME.kind == "lobby" then
             #Players:GetPlayers()
         ), 6)
     end)
+    end
 end
 
 --// --------------------------------------------------------------- Movement ---
@@ -41620,6 +42174,184 @@ addButton(controls, "Stand Up / Exit Guard Mode", "Leaves the office chair", "do
     notify("Night Guard", "Stood up and left guard mode.", 3)
 end)
 
+--// ------------------------------------------------------------- FNAF 2 tab ---
+if GAME.key == "FNAF2" then
+    local fnaf2Tab = Window:Tab({ Title = "FNAF 2", Icon = "smile" })
+
+    addButton(fnaf2Tab, "Show Role & Tasks", "Role, flashlight battery, generator and task list", "info", function()
+        local role = fnaf2Role()
+        local lines = {
+            "Role: " .. role,
+            string.format("Flashlight battery: %.0f%%", fnaf2FlashBattery()),
+        }
+        local generator = fnaf2GeneratorInfo()
+        if generator.present then
+            lines[#lines + 1] = "Generator: " .. (generator.broken and "BROKEN (ENGINEER can fix)" or "OK")
+        else
+            lines[#lines + 1] = "Generator: not in this place"
+        end
+        if fnaf2RoleHasTasks() then
+            local tasks = fnaf2TaskEntries()
+            if #tasks == 0 then
+                lines[#lines + 1] = "Tasks: none assigned yet"
+            else
+                for _, task in ipairs(tasks) do
+                    lines[#lines + 1] = (task.done and "[x] " or "[ ] ") .. task.text
+                end
+            end
+        else
+            lines[#lines + 1] = "Tasks: JANITOR / ENGINEER only (your role: " .. role .. ")"
+        end
+        notify("FNAF 2 Role", table.concat(lines, "\n"), 10)
+    end)
+
+    addButton(fnaf2Tab, "Player Attributes", "Lists role, flashlight, taser/trap and other player flags", "list", function()
+        local bits = {}
+        for name, value in pairs(LocalPlayer:GetAttributes()) do
+            if typeof(value) ~= "Instance" then
+                bits[#bits + 1] = name .. "=" .. tostring(value)
+            end
+        end
+        table.sort(bits)
+        notify("FNAF 2 Player", #bits > 0 and table.concat(bits, "  ·  ") or "No player attributes found.", 10)
+    end)
+
+    addButton(fnaf2Tab, "Do Nearest Task", "Teleports to the closest Clean/Fix task and fires its ProximityPrompt", "hand", function()
+        task.spawn(function()
+            local ok, detail = fnaf2DoNearestTask()
+            notify("FNAF 2", ok and ("Used task: " .. tostring(detail)) or tostring(detail), 4)
+        end)
+    end)
+
+    addButton(fnaf2Tab, "Fix Generator", "ENGINEER task: repairs the generator when its Fix prompt is active", "zap", function()
+        task.spawn(function()
+            local _, detail = fnaf2FixGenerator()
+            notify("FNAF 2", tostring(detail), 4)
+        end)
+    end)
+
+    addButton(fnaf2Tab, "Repair Arcade Machines", "ENGINEER task: fires the arcade machine Fix prompt", "wrench", function()
+        task.spawn(function()
+            local _, detail = fnaf2RepairArcade()
+            notify("FNAF 2", tostring(detail), 4)
+        end)
+    end)
+
+    addToggle(fnaf2Tab, "Auto Tasks", "Repeats the nearest Clean/Fix task while the night is running", "target", State.autoTasks, function(value)
+        State.autoTasks = value
+        notify("FNAF 2", value and "Auto tasks enabled." or "Auto tasks disabled.", 3)
+    end)
+
+    addToggle(fnaf2Tab, "Auto Fix Generator", "ENGINEER only: fixes the generator whenever it breaks", "zap", State.autoGenerator, function(value)
+        State.autoGenerator = value
+        notify("FNAF 2", value and "Auto generator repair enabled." or "Auto generator repair disabled.", 3)
+    end)
+
+    addToggle(fnaf2Tab, "Infinite Flashlight", "Keeps the flashlight on at max level (client-side)", "flashlight", State.infFlashlight, function(value)
+        State.infFlashlight = value
+        if value then
+            if State.flashSavedEnabled == nil then
+                State.flashSavedEnabled = LocalPlayer:GetAttribute("HasFlashlightEnabled")
+                State.flashSavedLevel = LocalPlayer:GetAttribute("HasFlashlightLevel")
+            end
+            fnaf2SetFlashlight(true, 10)
+        else
+            fnaf2RestoreFlashlight()
+        end
+        notify("FNAF 2", value and "Infinite flashlight enabled." or "Infinite flashlight disabled.", 3)
+    end)
+
+    addButton(fnaf2Tab, "Max Flashlight", "Sets HasFlashlightLevel to 10", "flashlight", function()
+        fnaf2SetFlashlight(true, 10)
+        notify("FNAF 2", "Flashlight set to max level.", 3)
+    end)
+
+    addButton(fnaf2Tab, "Toggle Flashlight", "Toggles HasFlashlightEnabled locally", "flashlight", function()
+        local on = LocalPlayer:GetAttribute("HasFlashlightEnabled") ~= true
+        fnaf2SetFlashlight(on)
+        notify("FNAF 2", on and "Flashlight ON." or "Flashlight OFF.", 2)
+    end)
+
+    addButton(fnaf2Tab, "Flashlight Battery", "Shows the last battery value sent by the server", "battery-charging", function()
+        notify("FNAF 2", string.format("Flashlight battery: %.0f%%", fnaf2FlashBattery()), 4)
+    end)
+
+    -- Night 7 is the game's Custom Night. Keep its controls in a separate tab
+    -- because it has one AI slider per animatronic plus challenge presets.
+    local customTab = Window:Tab({ Title = "Custom Night", Icon = "moon" })
+
+    local currentChallenge = tostring(attr("customNightSelectedChallenge") or "Custom")
+    if not table.find(FNAF2_CHALLENGES, currentChallenge) then
+        currentChallenge = "Custom"
+    end
+    State.selectedChallenge = currentChallenge
+    customTab:Dropdown({
+        Title = "Challenge Preset",
+        Values = FNAF2_CHALLENGES,
+        Value = currentChallenge,
+        Callback = function(value) State.selectedChallenge = value end,
+    })
+    addButton(customTab, "Apply Challenge Preset", "Host only: sends the selected challenge (Night 7)", "wand", function()
+        local ok, err = fnaf2ApplyChallenge(State.selectedChallenge)
+        notify("Custom Night", ok and ("Challenge set to " .. State.selectedChallenge .. ".") or tostring(err), 4)
+    end)
+
+    for _, name in ipairs(FNAF2_ANIMATRONICS) do
+        local animName = name
+        local initial = math.clamp(tonumber(RS:GetAttribute(animName .. "AI")) or 0, 0, 20)
+        State.fnaf2AI[animName] = initial
+        customTab:Slider({
+            Title = animName .. " AI",
+            Value = { Min = 0, Max = 20, Default = initial },
+            Step = 1,
+            Callback = function(value) State.fnaf2AI[animName] = value end,
+        })
+    end
+
+    local function customAIReady()
+        if not fnaf2IsHost() then
+            notify("Custom Night", "Only the server host can change animatronic AI.", 4)
+            return false
+        end
+        if tonumber(attr("Night")) ~= 7 then
+            notify("Custom Night", "AI levels can only be sent on Night 7 (Custom Night).", 4)
+            return false
+        end
+        return true
+    end
+
+    addButton(customTab, "Apply Custom AI", "Host only: sends every slider to playerChangeAI (Night 7)", "ghost", function()
+        if not customAIReady() then return end
+        for _, name in ipairs(FNAF2_ANIMATRONICS) do
+            fnaf2SetAI(name, State.fnaf2AI[name] or 0)
+        end
+        notify("Custom Night", "Custom AI sent for " .. #FNAF2_ANIMATRONICS .. " animatronics.", 4)
+    end)
+    addButton(customTab, "Set All AI to 20", "Host only: maximum difficulty (Night 7)", "zap", function()
+        if not customAIReady() then return end
+        for _, name in ipairs(FNAF2_ANIMATRONICS) do fnaf2SetAI(name, 20) end
+        notify("Custom Night", "All animatronic AI set to 20.", 3)
+    end)
+    addButton(customTab, "Set All AI to 0", "Host only: quiet night (Night 7)", "ghost", function()
+        if not customAIReady() then return end
+        for _, name in ipairs(FNAF2_ANIMATRONICS) do fnaf2SetAI(name, 0) end
+        notify("Custom Night", "All animatronic AI set to 0.", 3)
+    end)
+    addButton(customTab, "Read Current AI", "Night, selected challenge and current AI values", "info", function()
+        local status = fnaf2AIStatus()
+        local bits = {
+            "Night " .. tostring(status.night or "?"),
+            "Challenge " .. tostring(status.challenge or "none"),
+        }
+        for _, name in ipairs(FNAF2_ANIMATRONICS) do
+            if status[name] ~= nil then
+                bits[#bits + 1] = name .. " " .. tostring(status[name])
+            end
+        end
+        notify("Custom Night", table.concat(bits, "  ·  "), 8)
+    end)
+end
+
 --// ----------------------------------------------------------------- Remotes ---
 local remotesTab = Window:Tab({ Title = "Remotes", Icon = "terminal" })
 
@@ -41803,6 +42535,20 @@ pcall(function()
             out.pacify = State.pacifyAI
             return out
         end,
+        role = fnaf2Role,
+        tasks = fnaf2TaskEntries,
+        taskSummary = fnaf2TaskSummary,
+        doNearestTask = fnaf2DoNearestTask,
+        generator = fnaf2GeneratorInfo,
+        fixGenerator = fnaf2FixGenerator,
+        repairArcade = fnaf2RepairArcade,
+        flashlight = function()
+            return fnaf2FlashBattery(), State.infFlashlight
+        end,
+        setFlashlight = fnaf2SetFlashlight,
+        setAILevel = fnaf2SetAI,
+        selectChallenge = fnaf2ApplyChallenge,
+        customNightStatus = fnaf2AIStatus,
         setMask = function(value)
             setMaskRemote(value ~= false)
             return maskState()
@@ -41866,10 +42612,15 @@ end)
 -- Prime everything and start background work.
 refreshAnims(true)
 buildWaypoints()
+fnaf2CaptureBattery()
+fnaf2CaptureTasks()
 task.spawn(powerLoop)
 task.spawn(pacifyLoop)
 task.spawn(musicBoxLoop)
 task.spawn(maskLoop)
+task.spawn(flashlightLoop)
+task.spawn(fnaf2TaskLoop)
+task.spawn(fnaf2GeneratorLoop)
 task.spawn(ventLoop)
 task.spawn(breakerLoop)
 task.spawn(animatronicFlagLoop)
@@ -42835,7 +43586,7 @@ local function worldBox(model)
     if cached and now - cached.t < 1.2 then
         return cached.cf, cached.size
     end
-    local ok, cf, size = pcall(model.GetBoundingBox, model)
+    local ok, cf, size = pcall(function() return model:GetBoundingBox() end)
     if not ok or not cf then return nil end
     hashCache[model] = { t = now, cf = cf, size = size }
     return cf, size
@@ -43645,6 +44396,30 @@ home:Button({
 })
 
 log("stage 3: home tab")
+
+--// -------------------------------------------------------------- Join Game ---
+local joinTab = Window:Tab({ Title = "Join Game", Icon = "arrow-right-left" })
+
+for _, entry in ipairs(FNAF_PLACES) do
+    local target = entry
+    joinTab:Button({
+        Title = target.label,
+        Desc = target.place == game.PlaceId
+            and "You are already in this place"
+            or ("Direct teleport to place " .. target.place),
+        Icon = "external-link",
+        Callback = function()
+            if target.place == game.PlaceId then
+                notify("Join Game", "Already in " .. target.label .. ".", 3)
+                return
+            end
+            local ok, err = pcall(function()
+                TeleportService:Teleport(target.place, LocalPlayer)
+            end)
+            notify("Join Game", ok and ("Joining " .. target.label .. "…") or tostring(err), 4)
+        end,
+    })
+end
 
 --// --------------------------------------------------------------- Movement --
 local movement = Window:Tab({ Title = "Movement", Icon = "move" })
