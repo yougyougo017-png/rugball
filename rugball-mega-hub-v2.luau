@@ -39665,6 +39665,10 @@ local function useBedroomDoor(on)
     return fireRemote("updatePlayerDoorStateEvent", on)
 end
 
+-- Only the under-200-local rule is why this is scoped; the three exported
+-- helpers below are used by the FNAF 4 controls and the auto-defense loop.
+local faceBedroomSide, useBedroomDoorSide, flashBedroomLight
+do
 local function useBedroomLight(on)
     return fireRemote("updatePlayerLightStateEvent", on)
 end
@@ -39684,7 +39688,7 @@ end
 
 -- The server checks the character's facing direction against the door look
 -- part, so put the character at the door and turn it towards the hallway.
-local function faceBedroomSide(side)
+function faceBedroomSide(side)
     local prox = bedroomSidePart(side, "prox")
     local look = bedroomSidePart(side, "look")
     local hrp = getHRP()
@@ -39694,7 +39698,7 @@ local function faceBedroomSide(side)
     return true
 end
 
-local function useBedroomDoorSide(side, on)
+function useBedroomDoorSide(side, on)
     if not faceBedroomSide(side) then
         return false, "No " .. tostring(side) .. " bedroom door was found."
     end
@@ -39703,7 +39707,7 @@ local function useBedroomDoorSide(side, on)
     return ok, err
 end
 
-local function flashBedroomLight(side)
+function flashBedroomLight(side)
     if not faceBedroomSide(side) then
         return false, "No " .. tostring(side) .. " bedroom door was found."
     end
@@ -39711,6 +39715,7 @@ local function flashBedroomLight(side)
     task.wait(1.2)
     useBedroomLight(false)
     return true
+end
 end
 
 local function breakerAttrs()
@@ -39976,6 +39981,11 @@ end
 -- devices / camera system / ventilation / reboot all. The error attributes
 -- only mirror the panel; clearing them locally never rebooted anything
 -- server-side, so this clicks the panel's own controls instead.
+--
+-- Everything that only the panel helpers below use is scoped in a do-block.
+-- Luau allows 200 live locals per function; this file is close to that limit.
+local fnaf3ActiveSystems, fnaf3CollectButtons, fnaf3PanelVisible, fnaf3RestartSystems
+do
 local FNAF3_SYSTEMS = {
     { key = "audioError", label = "audio devices", short = "A" },
     { key = "cameraError", label = "camera system", short = "C" },
@@ -39997,7 +40007,7 @@ local function fnaf3AttrBool(name)
     return ok and (value == true or value == "true" or value == 1 or value == "1")
 end
 
-local function fnaf3ActiveSystems()
+function fnaf3ActiveSystems()
     local list = {}
     for _, system in ipairs(FNAF3_SYSTEMS) do
         if fnaf3AttrBool(system.key) then
@@ -40065,7 +40075,7 @@ local function fnaf3PanelScore(object)
     return score
 end
 
-local function fnaf3CollectButtons()
+function fnaf3CollectButtons()
     local list = {}
     local seen = {}
 
@@ -40224,7 +40234,7 @@ local function fnaf3ClickDetector(detector)
     return fired > 0
 end
 
-local function fnaf3PanelVisible(buttons)
+function fnaf3PanelVisible(buttons)
     for _, entry in ipairs(buttons or fnaf3CollectButtons()) do
         if entry.visible and (entry.text:find("system restart menu", 1, true)
             or entry.text:find("reboot all", 1, true)) then
@@ -40376,7 +40386,7 @@ end
 
 -- Only one restart may walk the panel at a time; the toggle callback and the
 -- auto loop can otherwise double-click it.
-local function fnaf3RestartSystems(force, individual)
+function fnaf3RestartSystems(force, individual)
     if fnaf3RestartBusy then
         return true, "A reboot is already in progress."
     end
@@ -40386,6 +40396,7 @@ local function fnaf3RestartSystems(force, individual)
     if ok then return result, detail end
     print("[FNAF3 Auto] restart error: " .. tostring(result))
     return false, "Restart failed: " .. tostring(result)
+end
 end
 
 local function nearestObjective(includeDone)
@@ -41527,6 +41538,10 @@ local function restoreLighting()
 end
 
 --// ----------------------------------------------------------------- loops ---
+-- The loops are 14 top-level locals if declared here. Luau caps one function at
+-- 200 local registers, so keep them inside startLoops() and spawn them from
+-- there; nothing outside the loops needs to reference them by name.
+local function startLoops()
 local function powerLoop()
     while running do
         task.wait(0.15)
@@ -41784,6 +41799,22 @@ local function statusLoop()
     end
 end
 
+    task.spawn(powerLoop)
+    task.spawn(pacifyLoop)
+    task.spawn(musicBoxLoop)
+    task.spawn(maskLoop)
+    task.spawn(flashlightLoop)
+    task.spawn(fnaf2TaskLoop)
+    task.spawn(fnaf2GeneratorLoop)
+    task.spawn(ventLoop)
+    task.spawn(breakerLoop)
+    task.spawn(animatronicFlagLoop)
+    task.spawn(defenseLoop)
+    task.spawn(objectiveLoop)
+    task.spawn(mouseLoop)
+    task.spawn(statusLoop)
+end
+
 --// ------------------------------------------------------------ connections ---
 Connections[#Connections + 1] = LocalPlayer.CharacterAdded:Connect(function()
     table.clear(noclipOriginal)
@@ -41939,6 +41970,7 @@ local function addToggle(tab, title, desc, icon, value, callback)
 end
 
 --// ------------------------------------------------------------------- Home ---
+do
 local home = Window:Tab({ Title = "Home", Icon = "house" })
 
 local profileValues = { autoProfileLabel }
@@ -42171,7 +42203,10 @@ if GAME.kind == "lobby" then
     end
 end
 
+end
+
 --// --------------------------------------------------------------- Movement ---
+do
 local movement = Window:Tab({ Title = "Movement", Icon = "move" })
 
 addToggle(movement, "Speed", "Override WalkSpeed (client-side)", "gauge", false, function(value)
@@ -42362,7 +42397,10 @@ espTab:Slider({
     Callback = function(value) State.esp.maxDist = value end,
 })
 
+end
+
 --// --------------------------------------------------------- Game Controls ---
+do
 local controls = Window:Tab({ Title = "Game Controls", Icon = "settings-2" })
 
 if #getPowerAttrs() > 0 then
@@ -42844,7 +42882,10 @@ if GAME.key == "FNAF2" then
     end)
 end
 
+end
+
 --// ----------------------------------------------------------------- Remotes ---
+do
 local remotesTab = Window:Tab({ Title = "Remotes", Icon = "terminal" })
 
 local NOISY = {
@@ -42941,7 +42982,10 @@ addButton(remotesTab, "List Remotes", "Prints the available RemoteEvents to the 
     notify("Remotes", "Lists printed to the executor console.", 3)
 end)
 
+end
+
 --// ------------------------------------------------------------------- Misc ---
+do
 local misc = Window:Tab({ Title = "Misc", Icon = "settings" })
 
 addButton(misc, "Copy Job ID", "Useful for rejoin scripts", "copy", function()
@@ -42990,6 +43034,8 @@ addButton(misc, "Unload Toolkit", "Stops loops, removes ESP, overlay and the men
     print("[FNAFMulti] Unloaded.")
     cleanup()
 end)
+
+end
 
 --// -------------------------------------------------------------------- API ---
 pcall(function()
@@ -43131,20 +43177,7 @@ refreshAnims(true)
 buildWaypoints()
 fnaf2CaptureBattery()
 fnaf2CaptureTasks()
-task.spawn(powerLoop)
-task.spawn(pacifyLoop)
-task.spawn(musicBoxLoop)
-task.spawn(maskLoop)
-task.spawn(flashlightLoop)
-task.spawn(fnaf2TaskLoop)
-task.spawn(fnaf2GeneratorLoop)
-task.spawn(ventLoop)
-task.spawn(breakerLoop)
-task.spawn(animatronicFlagLoop)
-task.spawn(defenseLoop)
-task.spawn(objectiveLoop)
-task.spawn(mouseLoop)
-task.spawn(statusLoop)
+startLoops()
 
 notify("FNAF Toolkit", string.format(
     "%s loaded. RightShift opens the menu.", GAME.short), 7)
